@@ -1,0 +1,193 @@
+#!/usr/bin/env python3
+"""
+ANALYSE: Warum Heiratseinträge jetzt nicht mehr funktionieren
+und wie man es behebt
+"""
+
+print("""
+╔════════════════════════════════════════════════════════════════════════════════╗
+║         PROBLEM: Heiratseinträge mit unbekannten Namen funktionieren nicht     ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+TEST-ERGEBNIS:
+━━━━━━━━━━━━━━
+✅ Test 1 (Hans Cappel und Walpern)              → PASS
+✅ Test 2 (Simon Lautz und Elchen Esel)         → PASS
+❌ Test 3 (Philipp Utz und Giddert)             → FAIL
+
+SYMPTOM:
+━━━━━━━
+Neuer Heiratseintrag wird nicht erkannt!
+  Bräutigam: Philipp Utz
+  Braut: Giddert  ← UNBEKANNTER VORNAME!
+
+DEBUG-Output zeigt:
+  "KEIN Trenner gefunden und kein Braut-Indikator!"
+
+GRUND:
+━━━━━━
+"Giddert" ist NICHT in WEIBLICHE_VORNAMEN Liste:
+  - Heirats-Funktion sucht nach bekannten Vornamen als Indikator
+  - Wenn nicht gefunden → keine Trennung in Bräutigam/Braut
+  - Resultat: Alles wird als Bräutigam interpretiert
+
+
+VERGLEICH MIT BEGRÄBNISSEN:
+━━━━━━━━━━━━━━━━━━━━━━━━━
+BEGRÄBNISSE: "Eyda, Werner Scherers hinterlassene Wittwe"
+  • "Eyda" war NICHT in WEIBLICHE_VORNAMEN
+  • ABER: Funktion hatte FALLBACK-PATTERN für unbekannte Namen
+  • RESULT: ✅ Funktioniert trotzdem!
+
+HEIRATEN: "Philipp Utz, weilandt Enders Utx verlassen ehlicher Sohn alhier... 
+           Giddert, weilandt Lorentz Alpshäusers..."
+  • "Giddert" ist NICHT in WEIBLICHE_VORNAMEN
+  • ABER: Funktion hat KEINERLEI FALLBACK für Braut-Erkennung
+  • RESULT: ❌ Völliger Abbruch!
+
+
+LÖSUNG:
+━━━━━━
+
+NICHT eine gemeinsame Extraktionsfunktion (zu unterschiedlich)!
+
+SONDERN: GEMEINSAME HILFSFUNKTIONEN für:
+  1. Namen-Fallback-Erkennung (2-Wort-Pattern)
+  2. Braut-Indikator-Fallback (mit "weilandt" Unterstützung)
+
+ARCHITEKTUR:
+┌─────────────────────────────────────────────────────────────────┐
+│ HILFSFUNKTIONEN (gemeinsam)                                     │
+├─────────────────────────────────────────────────────────────────┤
+│ • _extract_fallback_person_name(words)                          │
+│   → Versucht [Wort1] [Wort2] zu erkennen                       │
+│   → Umgeht Vornamen-Listen                                      │
+│                                                                  │
+│ • _find_female_marriage_separator(words)                        │
+│   → Findet Trenner zwischen Bräutigam und Braut                │
+│   → Nutzt fallback Pattern wenn bekannte Vornamen fehlen       │
+│                                                                  │
+│ • _extract_ort_and_beruf(words_list)                          │
+│   → Extrahiert Ort und Beruf unabhängig                        │
+│                                                                  │
+│ • _extract_stand(words_list)                                   │
+│   → Extrahiert Stand-Wörter (Sohn, Tochter, Witwe, etc.)      │
+└─────────────────────────────────────────────────────────────────┘
+         ↓                              ↓
+┌──────────────────────┐      ┌──────────────────────┐
+│ _extract_burial_fields  │      │ _extract_marriage_fields │
+│ (Begräbnisse ⚰)     │      │ (Heiraten ∞)        │
+│───────────────────────│      │──────────────────────│
+│ • nutzt Hilfsfunktionen     │ • nutzt Hilfsfunktionen │
+│ • hat Witwe-Speziallogik    │ • teilt in Bräutigam/ Braut│
+│ • gibt burial-dict zurück   │ • gibt marriage-dict ret. │
+└──────────────────────┘      └──────────────────────┘
+
+
+INKREMENTELLE VERBESSERUNG FÜR HEIRATEN:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+1. FALLBACK-BRAUT-ERKENNUNG ohne bekannte Vornamen:
+   
+   AKTUELL:
+   ────────
+   Sucht: bekannte Vornamen als Braut-Indikator
+   
+   GEWÜNSCHT:
+   ──────────
+   IF kein Braut-Indikator gefunden:
+     - Suche Muster: "und [Wort1] [Wort2] ..."
+     - Oder: "..." (Punkt/Komma am Ende des Bräutigam-Teils)
+     - Oder: "..." (Ort/weilandt nach Stand könnte Braut-Teil sein)
+
+
+2. WEILANDT-PATTERN bei Heiraten:
+   
+   Pattern: [Vorname], weilandt [Vater-Vorname] [Vater-Nachname] 
+            verlassen ehlicher/ehliche [Stand] alhier...
+            [Braut-Vorname], weilandt [Braut-Vater] ...
+
+   Besonderheit: "verlassen" = verstorben (hessisch für "hinterlassen")
+
+
+3. STAND-ERKENNUNG bei beiden Personen:
+   
+   BRÄUTIGAM-Stand: "ehlicher Sohn", "ehliche Tochter"
+   BRAUT-Stand: "ehliche Tochter", "verlassen Wittwe"
+
+
+KONKRETE IMPLEMENTIERUNG:
+━━━━━━━━━━━━━━━━━━━━━━
+
+SCHRITT 1: Fallback-Trennung hinzufügen
+──────────────────────────────────────
+In _extract_marriage_fields(), NACH der Standard-Trenner-Suche:
+
+    # FALLBACK: Wenn kein Trenner gefunden, suche Braut ohne Vornamen-Liste
+    if trenner_pos == -1 and len(words) > 2:
+        # Pattern: "Bräutigam-Teil ... Braut-Teil" → trenner am Punkt
+        # ODER: Stand-Worte überspringen und schaue darunter
+        # ODER: "Punkt, [Wort] [Wort] ..." oder "alhier [Wort]"
+        
+        # Einfacher Fallback: Suchne aufeinander folgende Worte 
+        # die NICHT in IGNORIERE_WOERTERN sind
+        # als potentiellen Braut-Anfang
+
+
+SCHRITT 2: "Weilandt" Erkennung hinzufügen
+────────────────────────────────────────
+    # "weilandt [Vater] [Vater-Nachname] verlassen [Stand]"
+    # → Erkenne Vater auch wenn Vorname unbekannt
+
+    if "weilandt" in [w.lower() for w in words]:
+        # Aktuelle Logik bleibt
+        # ABER: auch wenn no_known_vorname → nutze fallback
+        pass
+
+
+SCHRITT 3: Fallback-Namen bei bekannten Vornamen als zweite Wahl
+─────────────────────────────────────────────────────────────────
+    # Wenn nach Trennung kein Braut-Vorname gefunden:
+    # Versuche 2-Wort-Pattern statt Abbruch
+
+
+ZUSAMMENFASSUNG DER CHANGES:
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Aktueller Zustand:
+  ❌ Heiraten mit unbekannten Namen: NICHT MÖGLICH
+  ✅ Begräbnisse mit unbekannten Namen: MÖGLICH
+
+Gewünschter Zustand:
+  ✅ Heiraten mit unbekannten Namen: MÖGLICH
+  ✅ Begräbnisse mit unbekannten Namen: MÖGLICH
+  
+Dazu nötig:
+  • _extract_marriage_fields() um Fallback-Logik erweitern
+  • Evtl. 1-2 Hilfs-Funktionen auslagern (optional)
+
+Nicht nötig:
+  ❌ Komplette gemeinsame Extraktionsfunktion
+    (Felder sind zu unterschiedlich)
+""")
+
+print("""
+╔════════════════════════════════════════════════════════════════════════════════╗
+║                         EMPFEHLUNG FÜR UMSETZUNG                              ║
+╚════════════════════════════════════════════════════════════════════════════════╝
+
+PHASE 1: Quick-Fix für neuen Eintrag (1-2 Stunden)
+────────────────────────────────────────────────
+□ Fallback-Trennung in _extract_marriage_fields() hinzufügen
+□ "Weilandt" Erkennung bei Heiraten
+□ Teste mit dem neuen Eintrag (Philipp/Giddert)
+□ Stelle sicher, dass alte Tests noch passen
+
+PHASE 2: Refactoring (optional, 2-3 Stunden)
+──────────────────────────────────────────
+□ Hilfsfunktionen auslagern für DRY-Prinzip
+□ Gemeinsame Name-Fallback-Funktion
+□ Gemeinsame Ort/Beruf/Stand-Extraktion
+
+Ob Phase 2 nötig ist: besprechen Sie nach Phase 1!
+""")

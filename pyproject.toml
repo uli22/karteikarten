@@ -7,6 +7,7 @@ requires-python = ">=3.13"
 dependencies = [
     "easyocr>=1.7.2",
     "google-cloud-vision>=3.11.0",
+    "openpyxl>=3.1.5",
     "pillow>=12.1.0",
     "pytesseract>=0.3.13",
 ]

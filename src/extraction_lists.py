@@ -10,7 +10,34 @@ Dieses Modul enthält alle Listen und Mappings für:
 - Zu ignorierende Wörter
 """
 
-SOURCES = [
+def get_sources_with_adjusted_paths():
+    """
+    Gibt die SOURCES-Liste mit angepassten media_path zurück.
+    Die Pfade werden basierend auf der Config angepasst.
+    """
+    import re
+
+    from .config import get_config
+    
+    config = get_config()
+    media_drive = config.media_drive
+    
+    adjusted_sources = []
+    for source in _SOURCES_TEMPLATE:
+        source_copy = source.copy()
+        if source_copy.get("media_path"):
+            # Ersetze Laufwerksbuchstaben (z.B. "E:" durch config.media_drive)
+            original_path = source_copy["media_path"]
+            # Pattern: Laufwerksbuchstabe am Anfang (z.B. "E:\\")
+            adjusted_path = re.sub(r'^[A-Z]:', media_drive, original_path)
+            source_copy["media_path"] = adjusted_path
+        adjusted_sources.append(source_copy)
+    
+    return adjusted_sources
+
+
+# Original SOURCES als Template (wird nicht direkt verwendet)
+_SOURCES_TEMPLATE = [
     {
         "source": "Wetzlar Kirchenbuchkartei Gb Hb Sb 1798-1831 Gb Hb Sb 1613-1798 (unsortiert) Ortsregister (nach Hauptstädten) Gb, Hb, Sb 1564-1831",
         "id": "S1",
@@ -99,6 +126,13 @@ SOURCES = [
         "media_ID": "EKiR_408_002_Gb"
     },
     {
+        "source": "Wetzlar KbHb 1608-1693 lutherisch",
+        "id": "S35",
+        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbHb 1608-1693 lutherisch\\",
+        "media_type": "kirchenbuchseiten",
+        "media_ID": "EKiR_408_020_Hb"
+    },
+    {
         "source": "Wetzlar KbSb 1613-1693 lutherisch",
         "id": "S36",
         "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbSb 1613-1693 lutherisch\\",
@@ -124,7 +158,7 @@ SOURCES = [
     {
         "source": "WETZLAR KbGb 1688-1744 lutherisch",
         "id": "S16",
-        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbGb 1688-1744 lutherisch\\",
+        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbGb 1688-1744 KbKb 1688-1735 lutherisch\\",
         "media_type": "kirchenbuchseiten",
         "media_ID": "EKiR_408_003_Gb"
     },
@@ -138,56 +172,64 @@ SOURCES = [
     {
         "source": "WETZLAR KbGb 1811-1820 lutherisch",
         "id": None,
-        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbGb 1811-1820 lutherisch\\",
+        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbGb 1811-1820 KbKb 1813-1820 lutherisch\\",
         "media_type": "kirchenbuchseiten",
         "media_ID": "EKiR_408_005_Gb"
     }
 ]
+
+# SOURCES wird dynamisch erzeugt mit angepassten Pfaden basierend auf Config
+SOURCES = get_sources_with_adjusted_paths()
 
 # =============================================================================
 # VORNAMEN
 # =============================================================================
 
 WEIBLICHE_VORNAMEN = [
-    "Agnes", "Ann", "Anna", "An-Elisabeth",
+    "Agnes", "Ann", "Anna", "An-Elisabeth", "Annamagdt",
     "Appolonia", "Appoloniaa", "Appoloniae", "Appoloniaf", "Appoloniah", 
     "Appoloniai", "Appoloniao", "Appoloniap", "Appoloniar", "Appoloniat", 
     "Appoloniau", "Appoloniaz", "Appollonia", 
     "Barbara", "Barben", 
-    "Cathrina", "Catharina", "Christina", 
-    "Elisabeth", "Enchen", "Engel", "Eva", 
-    "Gertrud", 
-    "Juliana", 
-    "Katharina", 
-    "Magdalena", "Margaretha", "Margreth", "Maria", 
-    "Regina", 
-    "Sara", "Sophia", "Susanna", 
-    "Ursula"
+    "Cattarein", "Cathrina", "Catharina", "Cattarina", "Catharein", "Christina", "Creinmagt","Creinchen", "Causa",
+    "Dorothea", "Dorotheja",
+    "Elisabeth", "Elisabetha", "Elchen", "Elschen", "Elsbeth", "Elssbeth", "Eleonora", "Enchen", "Engel", "Eva", "Eyda", "Eyla", "Elss",
+    "Felicitas", "Francoys",
+    "Gertrud", "Gertraut", "Gerdraut", "Gela", "Giddert", "Gilchen", "Gritchen",
+    "Juliana", "Justina",
+    "Katharina",
+    "Leisa", 
+    "Magdalena", "Margaretha", "Margret", "Margreth", "Maria", 
+    "Rachell", "Regina", 
+    "Sara", "Sabina", "Sophia", "Susanna", "Susan",
+    "Ursula", "Ursell",
+    "Walpern",
 ]
 
 MAENNLICHE_VORNAMEN = [
-    "Abraham", "Adam", "Adolff", "Adrian", "Andreas", "Aegidius", "Albert",
-    "Anton", "Antoni", "Antony", "Antonii", "Antonius", "Anthonius","Alexander","Anthonii",
-    "August", 
-    "Balthasar", "Burckgart", "Balther", "Braun",
-    "Caspar", "Christian", "Christoph", "Christophorus", "Conrad", "Crafft", 
-    "Daniel", "David",
-    "Eberhart", "Ebert", "Emrich", "Enders", "Ernst", 
-    "Franz", "Frantz", "Friedrich", "Friderich",
-    "Georg", "George", "Gebert", "Görg",
-    "Hans", "Hanß", "Heinrich", "Henrich", "Hieronymus",
-    "Jacob", "Jean", "Joh.", "Johann", "Johannes", "Joannes", "Jonas", "Joes", "Jost", "Jurge", 
+    "Abraham", "Adam", "Adolff", "Adrian", "Andreas", "Andres", "Andreae", "Aegidius", "Albert",
+    "Anton", "Antoni", "Antony", "Antonii", "Antonius", "Anthonius","Alexander","Anthonii", "Arnold", "August", 
+    "Balthasar", "Balthasaris", "Burckgart", "Balther",  "Baltzer", "Braun", "Bernhard", "Bernhardt",
+    "Carlen", "Carl", "Carle", "Caspar", "Christian", "Christoph", "Christophel", "Christophorus", "Claus", "Conrad", "Conradt", "Curt", "Crafft", "Chasper",
+    "Daniel", "Daniell", "David", "Davidt", "Dietrich","Dieterich", "Diln",
+    "Eberhard", "Eberhart", "Ebert", "Eckardt", "Eckhardt", "Elias", "Emrich", "Enders", "Enderß", "Ernst", 
+    "Franz", "Frantz", "Friedrich", "Friderich", "Friderich",
+    "Gaebhart", "Gebert", "Georg", "George", "Gebert", "Görg", "Gerhardt",
+    "Hans", "Hanss", "Hanß", "Heinrich", "Henrich", "Hieronymus", "Herman",
+    "Isaak",
+    "Jacob", "Jean", "Joan", "Joachim", "Jochim", "Joh", "Joh.", "Johan", "Johann", "Johannes", "Joannes", "Jonas", "Joes", "Jost",  "Just", "Jurge", "Jörg", "jörg", "Jorg",
     "Karl", 
-    "Leonhard", "Ludwig", 
-    "Martin", "Matthias", "Matthäus", "Maximilian", "Michael", 
-    "Nikolaus", 
+    "Leonhard", "Ludwig", "Lorentz", 
+    "Martin", "Matthias", "Matthäus", "Maximilian", "Michael", "Michel", 
+    "Nikolaus", "Niclas",
     "Otto", 
-    "Paul", "Peter", "Philipp", "Philips",
-    "Rudolf", 
+    "Paul", "Peter", "Philip", "Philipp", "Philips", "Paulus",
+    "Reinhard", "Reinhart", "Rudolf", "Ruland",
     "Samuel", "Sebastian", "Simon", "Stephan", 
-    "Thomas", "Theophilus", "Theophili",
+    "Theis", "Theiss", "Theiß", "Thomas", "Theophilus", "Theophili", "Theophil", "Tongess",
+    "Ulrich",
     "Valentin", "Veldten", "Velten", 
-    "Wilhelm",
+    "Weigand", "Wilhelm",
     "Zacharias", "Zerben",
 ]
 
@@ -201,7 +243,17 @@ STAND_MAPPING = {
     "witwe": "Wittwe",
     "wittib": "Wittwe",
     "wittwe": "Wittwe",
+    "wittbe": "Wittwe",
     "witbe": "Wittwe",
+    "widwe": "Wittwe",
+    "vidua": "Wittwe",
+    "nachgelassene witwe": "Wittwe",
+    "nachgelassene wittwe": "Wittwe",
+    "hinterlassene wittib": "Wittwe",
+    "hinterlassene wittwe": "Wittwe",
+    "hinterlassene witwe": "Wittwe",
+    "gewesene hausfrau": "Wittwe",
+    "gewesener hausfrau": "Wittwe",
 
     # Wittwer/Witwer
     "witwer": "Wittwer",
@@ -212,17 +264,31 @@ STAND_MAPPING = {
     "frau": "Hausfrau",
     "fraw": "Hausfrau",
     "hausfrau": "Hausfrau",
+    "haußfrau": "Hausfrau",
     "hausfraw": "Hausfrau",
+    "hausfr": "Hausfrau",  # Abkürzung
+    "hausfr.": "Hausfrau",  # Abkürzung mit Punkt
+    "haußfr": "Hausfrau",  # Abkürzung alte Schreibweise
+    "haußfr.": "Hausfrau",  # Abkürzung alte Schreibweise mit Punkt
     "uxor": "Hausfrau",
     
     # Tochter
     "tochter": "Tochter",
+    "dochter": "Tochter",
+    "tochterlein": "Tochter",  # ohne Umlaut
     "töchterlein": "Tochter",
+    "döchterlein": "Tochter",
+    "verlassener tochter": "verlassene Tochter",
+    "verlassene tochter": "verlassene Tochter",
+    "hinterlassene tochter": "hinterlassene Tochter",
+    "relicta filia": "hinterlassene Tochter",  # lat.: hinterlassene Tochter
+    "filia": "Tochter",                         # lat.: Tochter
     
     # Sohn
     "sohn": "Sohn",
     "sohnlein": "Sohn",
     "söhnlein": "Sohn",
+    "son": "Sohn",
     
     # Eidam (Schwiegersohn)
     "eidam": "Eidam",
@@ -238,6 +304,7 @@ STAND_MAPPING = {
 
     # Stiefsohn
     "stiefsohn": "Stiefsohn",
+    "stiffson": "Stiefsohn",  # historische Schreibweise
     
     # Enkel/Enkelin
     "enkel": "Enkel",
@@ -249,10 +316,23 @@ STAND_MAPPING = {
     
     # Mädchen
     "medtgen": "Mädchen",
+    "fraulein": "Fräulein",
+    "fräulein": "Fräulein",
+    "fraülein": "Fräulein",
 }
 
 # Liste aller Stand-Synonyme (für Prüfung ob Wort ein Stand ist)
 STAND_SYNONYME = list(STAND_MAPPING.keys())
+
+# Liste der Stände, bei denen der erkannte Name zum Partner gehört
+# (z.B. "Johan Eberhard Frinck ein Töchterlein" -> Johan Eberhard Frinck = Partner/Vater)
+PARTNER_STÄNDE = [
+    "tochter", "dochter", "tochterlein", "töchterlein", "döchterlein",
+    "sohn", "sohnlein", "söhnlein", "son",
+    "kind", "wochenkind",
+    "witwe", "wittib", "wittwe", "witbe", "widwe", "vidua",
+    "witwer", "wittwer"
+]
 
 # =============================================================================
 # ORTS-PRÄPOSITIONEN
@@ -282,7 +362,9 @@ BERUFE = [
     "Schreiner", "Schreinern", "Schreiners",
     "Schneider", "Schneidern", "Schneiders",
     "Schmied", "Schmiede", "Schmieds",
-    "Bäcker", "Bäckern", "Bäckers",
+    "Bäcker", "Bäckern", "Bäckers", "becker",  # kleingeschrieben für historische Schreibweise
+    "Bürger", "Bürgern", "Bürgers", "bürger",  # kleingeschrieben für historische Schreibweise
+    "Kannengießer",
     "Koch", "Kochen", "Kochs",
     "Metzger", "Metzgern", "Metzgers",
     "Müller", "Müllern", "Müllers",
@@ -298,6 +380,7 @@ BERUFE = [
     "Gerber", "Gerbern", "Gerbers",
     "Sattler", "Sattlern", "Sattlers",
     "Seiler", "Seilern", "Seilers",
+    "Schuhmacher", "schuemacher",  # historische Schreibweise
     "Glaser", "Glasern", "Glasers",
     "Töpfer", "Töpfern", "Töpfers",
     "Schlosser", "Schlossern", "Schlossers",
@@ -315,7 +398,16 @@ BERUFE = [
     "Knecht", "Knechte", "Knechts",
     "Magd", "Mägde",
     "Diener", "Dienern", "Dieners",
-    "Dienerin", "Dienerinnen"
+    "Dienerin", "Dienerinnen",
+    "Kindfraw", "Kindfrau",  # Hebamme
+    "Bruder", "Brüder",
+    "Schöpff", "Schöpf", "Schöpffen",  # Schöffe
+    "Rathsverwandter", "Rathsverwandte", "Rathsfreundt",
+    "Not. Caes. publ.",
+    "Advoc. Cam.",
+    "Magister",
+    "M.",  # Abkürzung für Magister
+    "Wüllenknecht",
 ]
 
 # =============================================================================
@@ -343,9 +435,15 @@ KEINE_BERUFE = [
 
 ANREDEN = [
     "herrn", 
+    "hern",  # Schreibvariante von "Herrn"
     "herr",
     "h",
-    "h."
+    "h.",
+    "m",
+    "m.",  # Magister
+    "Jungfr.",
+    "Jfr.",
+    "Jfr",
 ]
 
 # =============================================================================
@@ -371,12 +469,53 @@ IGNORIERE_WOERTER = [
     "sel.", 
     "selig", 
     "seelig", 
+    "weiland",
+    "weilandt",
+    "weyland",
+    "weil.",
     "hinterlassene", 
     "hinterlassen", 
     "hinterl.", 
     "hinterl", 
     "verlassen", 
-    "verlassene"
+    "verlassene",
+    "sein",  # "sein Hausfraw" - Pronomen vor Stand
+    "den",  # "Den 28. Januarii" - gehört zum Datum
+    "dem",
+    "der",
+    "am",   # "am 19. Martii" - Präposition vor Datum
+    "u",    # "und" Abkürzung zwischen Berufen
+    "u.",
+    "und",
+    # Hochzeits-Stopwords (gehören nicht zu Namen)
+    "hielten",
+    "hilten",
+    "hilt",
+    "hochzeit",
+    "Hochzeit",
+    "copulirt",
+    "copuliret",
+    "copulati",
+    "getraut",
+    "getrauet",
+    "proclamirt",
+    "pclamirt",
+    "feria",  # "feria 3tia Pasch" - Wochentag
+    # Monatsnamen (können kein Personenname sein)
+    "januar", "januarii", "january",
+    "februar", "februarii", "february",
+    "mertz", "martii", "march", "märz",
+    "april", "aprilis",
+    "may", "maii", "mai",
+    "juni", "junii", "june",
+    "juli", "julii", "july",
+    "august", "augusti",
+    "september", "septembris",
+    "october", "octobris", "oktober",
+    "november", "novembris", "novemb",
+    "december", "decembris", "dezember",
+    # Jahresbezeichnung
+    "ao", "anno"
 ]
 
 # =============================================================================
@@ -385,8 +524,10 @@ IGNORIERE_WOERTER = [
 
 STAND_PRAEFIXE = [
     "hinterlassener",
-    "hinterl.",
-    "hinterl",
+    "hinterlassene",
     "hinterlassen",
-    "verlassen"
+    "hinterl.",
+    "hinterl"
+    # HINWEIS: "verlassen" wird bei Witwe/Witwer ignoriert (in IGNORIERE_WOERTER)
+    # Bei Tochter/Sohn bleibt es als eigenständiges Präfix erhalten
 ]

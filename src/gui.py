@@ -1,5 +1,8 @@
 ﻿"""Grafische Benutzeroberfläche für die Karteikartenerkennung."""
 
+import csv
+import re
+import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
@@ -7,12 +10,15 @@ from typing import List, Optional
 
 from PIL import Image, ImageTk
 
+from .config import get_config
 from .database import KarteikartenDB
 from .extraction_lists import (ANREDEN, ARTIKEL, BERUFE, BERUFS_EINLEITUNG,
                                IGNORIERE_WOERTER, KEINE_BERUFE,
                                MAENNLICHE_VORNAMEN, ORTS_PRAEPOSITIONEN,
-                               SOURCES, STAND_MAPPING, STAND_PRAEFIXE,
-                               STAND_SYNONYME, WEIBLICHE_VORNAMEN)
+                               PARTNER_STÄNDE, SOURCES, STAND_MAPPING,
+                               STAND_PRAEFIXE, STAND_SYNONYME,
+                               WEIBLICHE_VORNAMEN)
+from .gedcom_exporter import GedcomExporter
 from .ocr_engine import OCREngine
 
 
@@ -100,8 +106,15 @@ class KarteikartenGUI:
         self.root.title("Wetzlar Karteikartenerkennung")
         self.root.geometry("1000x800")
         
-        self.base_path = Path(base_path)
-        self.image_folder_var = tk.StringVar(value=str(base_path))  # NEU: Variable für Verzeichnis
+        # Config laden
+        self.config = get_config()
+        
+        configured_base_path = self.config.image_base_path.strip() if self.config.image_base_path else ""
+        active_base_path = configured_base_path if configured_base_path else base_path
+        self.base_path = Path(active_base_path)
+        self.image_folder_var = tk.StringVar(value=str(active_base_path))
+        if not configured_base_path:
+            self.config.image_base_path = str(self.base_path)
         self.start_file = start_file
         self.current_index = 0
         self.image_files: List[Path] = []
@@ -113,14 +126,25 @@ class KarteikartenGUI:
         self.ocr_method = 'easyocr'
         self.credentials_path = None
         
-        # Datenbank initialisieren
-        self.db = KarteikartenDB()
+        # Datenbank initialisieren (konfigurierbarer Pfad mit robusten Fallbacks)
+        db_path = self._resolve_initial_db_path()
+        self.db = KarteikartenDB(str(db_path))
+        self.active_db_path = str(Path(db_path).resolve())
+        print(f"Aktive DB: {self.active_db_path}")
+        if not (self.config.db_path or "").strip():
+            self.config.db_path = self.active_db_path
         
         # Aktueller DB-Record (None = nicht gespeichert, ID = bereits in DB)
         self.current_db_record_id = None
         
         # Sortierrichtung pro Spalte (True = aufsteigend, False = absteigend)
         self.sort_reverse = {}
+        
+        # Zuletzt sortierte Spalte
+        self._last_sorted_column = None
+        
+        # Progressbar für Batch-Operationen
+        self.db_progress = None
         
         # Batch-Scan Abbruch-Flag
         self.batch_scan_cancelled = False
@@ -132,6 +156,1687 @@ class KarteikartenGUI:
         if self.image_files:
             self._display_current_card()
 
+    def _resolve_initial_db_path(self) -> Path:
+        """Ermittelt den initialen DB-Pfad mit Fallbacks für Dev- und EXE-Betrieb."""
+        configured_path = (self.config.db_path or "").strip()
+        if configured_path:
+            configured = Path(configured_path).expanduser()
+            if configured.exists():
+                return configured
+            # Wenn explizit konfiguriert, verwende ihn auch wenn die Datei noch nicht existiert.
+            return configured
+
+        db_name = "karteikarten.db"
+        candidates: List[Path] = []
+
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).resolve().parent
+            candidates.extend([
+                exe_dir.parent / db_name,
+                exe_dir / db_name,
+                Path.cwd() / db_name,
+            ])
+        else:
+            project_root = Path(__file__).resolve().parent.parent
+            candidates.extend([
+                project_root / db_name,
+                Path.cwd() / db_name,
+            ])
+
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+
+        return candidates[0]
+
+    def _switch_database(self, new_db_path: Path) -> None:
+        """Schaltet die aktive Datenbank um und aktualisiert abhängige UI-Elemente."""
+        new_db_path = new_db_path.expanduser().resolve()
+
+        new_db = KarteikartenDB(str(new_db_path))
+
+        old_conn = getattr(self.db, "conn", None)
+        if old_conn:
+            try:
+                old_conn.close()
+            except Exception:
+                pass
+
+        self.db = new_db
+        self.active_db_path = str(new_db_path)
+        self.current_db_record_id = None
+
+        if hasattr(self, "db_path_info_label"):
+            self.db_path_info_label.config(text=f"Aktive DB: {self.active_db_path}")
+
+        if hasattr(self, "tree"):
+            self._refresh_db_list()
+
+        if self.current_image:
+            self._check_db_status()
+
+    def _extract_marriage_fields(self, text: str) -> dict:
+        """
+        Extrahiert Felder aus einem Heiratseintrag.
+        
+        Struktur:
+        1. Zitation: ev. Kb. Wetzlar ∞ YYYY.MM.DD p. X Nr. Y
+        2. Bräutigam: [Vorname] [Nachname] [Vater-Vorname] [Vater-Nachname]s, [Beruf des Vaters], [Ort], [Status]
+        3. Trenner: "und", "undt", "mitt"
+        4. Braut: [Anrede] [Vorname(n)], [Vater-Vorname] [Vater-Nachname]s [Beruf], [Ort], [Status]
+        5. Ende: "hielten Hochzeit", "copulirt", etc.
+        
+        Returns:
+            Dict mit extrahierten Feldern
+        """
+        import re
+        
+        result = {
+            'vorname': None,  # Bräutigam Vorname
+            'nachname': None,  # Bräutigam Nachname
+            'partner': None,  # Braut Vorname(n)
+            'beruf': None,
+            'ort': None,  # Bräutigam Ort
+            'stand': None,  # Braut Stand (z.B. "gewesene hausfrau" = Witwe)
+            'braeutigam_stand': None,  # Bräutigam Stand
+            'braeutigam_vater': None,
+            'braut_vater': None,
+            'braut_nachname': None,
+            'braut_ort': None,
+            'todestag': None,  # Hochzeitsdatum im Format YYYY.MM.DD (verwendet dasselbe Feld wie Todestag)
+            'seite': None,
+            'nummer': None,
+        }
+        
+        # 1. Zitation extrahieren (verwendet das gleiche Pattern wie _format_citation_selected)
+        # Pattern: (ev. Kb. Wetzlar)? ∞ YYYY.MM.DD p. Seite Nr. Nummer
+        # Flexibel für verschiedene Schreibweisen (mit/ohne Punkte, mit/ohne Leerzeichen)
+        # P oder p, mit optionalem Komma vor Nr.
+        zitation_pattern = r"^\s*(ev\.?\s*Kb\.?\s*Wetzlar)\s*([⚰∞\u26B0])\s*(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?\s*[Pp]\.?\s*(\d+)\.?\s*,?\s*Nr\.?\s*(\d+)\.?\s*"
+        
+        # KEINE Stopwörter mehr - wir analysieren den gesamten Text und nutzen nur den Trenner
+        # Die alte Stopword-Logik schnitt den Text zu früh ab (vor "mitt"/"und")
+        
+        # Extrahiere Zitation vom Anfang
+        print(f"DEBUG Heirat: Eingabe-Text = {repr(text[:150])}")
+        m = re.match(zitation_pattern, text, re.IGNORECASE)
+        if m:
+            # Nach der Zitation beginnt der relevante Text
+            after_zitation = text[m.end():].strip()
+            # Hochzeitsdatum extrahieren (Gruppen 3, 4, 5 = Jahr, Monat, Tag)
+            jahr = m.group(3)
+            monat = m.group(4).zfill(2)  # Führende 0 hinzufügen falls nötig
+            tag = m.group(5).zfill(2)    # Führende 0 hinzufügen falls nötig
+            result['todestag'] = f"{jahr}.{monat}.{tag}"  # Verwende todestag-Feld für Hochzeitsdatum
+            # Seite extrahieren (Gruppe 6)
+            if m.group(6):
+                result['seite'] = int(m.group(6))
+            # Nummer extrahieren (Gruppe 7)
+            if m.group(7):
+                result['nummer'] = int(m.group(7))
+            print(f"DEBUG Heirat: Zitation erkannt bis Position {m.end()}")
+            print(f"DEBUG Heirat: Zitation war: {repr(text[:m.end()])}")
+            print(f"DEBUG Heirat: Hochzeitsdatum (in todestag) = {result['todestag']}")
+            print(f"DEBUG Heirat: Seite = {result.get('seite')}, Nummer = {result.get('nummer')}")
+            print(f"DEBUG Heirat: Text nach Zitation: {repr(after_zitation[:100])}")
+        else:
+            # Kein Match - versuche ohne Prefix
+            after_zitation = text.strip()
+            print(f"DEBUG Heirat: WARNUNG - Keine Zitation erkannt, verwende vollen Text")
+        
+        # Verwende den gesamten Text nach der Zitation (kein Stopword-Filter mehr)
+        relevant_text = after_zitation
+        
+        print(f"DEBUG Heirat: relevant_text (nach Stopword-Filter) = {repr(relevant_text[:200])}")
+        
+        # Splitte in Wörter - ignoriere alle Satzzeichen (Punkte, Kommas, Semikolons etc.)
+        # Ersetze alle Satzzeichen durch Leerzeichen
+        text_clean = relevant_text
+        for char in '.,;:!?()[]{}"\'-+':
+            text_clean = text_clean.replace(char, ' ')
+        
+        # Splitte an Leerzeichen und filtere leere Strings
+        words = [w.strip() for w in text_clean.split() if w.strip()]
+        
+        # Entferne Zitations-Wörter die versehentlich mit durch sind
+        zitation_woerter = ['ev', 'Kb', 'kb', 'Wetzlar', 'p', 'Nr', 'nr', '∞']
+        words = [w for w in words if w not in zitation_woerter and w.lower() not in [z.lower() for z in zitation_woerter]]
+        
+        # Entferne reine Zahlen am Anfang (Reste aus Zitation: Jahr, Monat, Tag, Seite, Nummer)
+        # Filtere solange bis erstes Wort kein reines Zahlen-Wort ist
+        while words and words[0].isdigit():
+            print(f"DEBUG Heirat: Filtere Zitations-Zahl am Anfang: {words[0]}")
+            words = words[1:]
+        
+        # Trunkiere words beim ersten "copul*"-Wort (copuliert/copulirt = Hochzeit vollzogen,
+        # danach kommen keine relevanten Namensdaten mehr)
+        copul_idx = next((i for i, w in enumerate(words) if w.lower().startswith('copul')), None)
+        if copul_idx is not None:
+            print(f"DEBUG Heirat: 'copul*' bei Position {copul_idx} ('{words[copul_idx]}') - trunkiere words")
+            words = words[:copul_idx]
+        
+        print(f"DEBUG Heirat: words (nach Filter) = {words[:30]}")
+        
+        # Hilfsfunktion: Entferne Genitiv-Endungen
+        def remove_genitiv_s(name):
+            """Entfernt Genitiv-Endungen von Nachnamen (Zahns → Zahn, Baussen → Bauss)"""
+            if not name or len(name) <= 2:
+                return name
+            # Genitiv-Endungen: -s, -en, -es
+            if name.endswith('en') and len(name) > 3:
+                # Baussen → Bauss
+                return name[:-2]
+            elif name.endswith('es') and len(name) > 3:
+                # Schmidtes → Schmidt
+                return name[:-2]
+            elif name.endswith('s'):
+                # Prüfe ob es wirklich Genitiv ist (nicht bei Namen wie "Peters", "Jonas")
+                # Einfache Heuristik: Wenn vorletzter Buchstabe Konsonant, dann Genitiv
+                if name[-2] not in 'aeiouäöü':
+                    return name[:-1]
+            return name
+        
+        # Listen laden
+        weibliche_vornamen = WEIBLICHE_VORNAMEN
+        maennliche_vornamen = MAENNLICHE_VORNAMEN
+        anreden = ANREDEN
+        ignoriere_woerter = IGNORIERE_WOERTER
+
+        # OCR-robuste Namensnormalisierung fuer Vergleiche (z.B. Hanẞ vs Hanß)
+        def norm_name_token(token: str) -> str:
+            return str(token).strip().replace('ẞ', 'ß').lower()
+
+        maennliche_vornamen_norm = {norm_name_token(v) for v in maennliche_vornamen}
+        
+        # Erweitere ignore-Liste um typische Füllwörter
+        # NICHT Sohn/Tochter - das sind Stand-Angaben!
+        ignore_extended = set(ignoriere_woerter) | {
+            'gewesener', 'gewesenen', 'gewesene',
+            'hinterlassener', 'hinterlassenen', 'hinterlassene', 'hinterl',
+            'ehel', 'ehelicher', 'ehelichen', 'eheliche',
+            'hielten', 'hilten', 'hilt', 'hochzeit'
+        }
+        
+        # Suche Trenner-Position (und, undt, mitt)
+        # Strategie: Finde das "und" VOR "Jungfr." oder einem weiblichen Vornamen
+        # da "Wittwer und Bürger" Teil des Bräutigams ist
+        trenner_pos = -1
+        trenner_woerter = ['und', 'undt', 'mitt', 'mit', 'cum']
+        
+        # Suche zuerst nach "Jungfr.", "Jfr." o.ä. oder weiblichen Vornamen
+        # Hinweis: Punkte wurden bereits entfernt, daher "Jfr." → "jfr" im words-Array
+        braut_start_keywords = ['jungfr', 'jungfrau', 'jfr'] + [v.lower() for v in weibliche_vornamen]
+        braut_indicator_pos = -1
+        
+        for i, w in enumerate(words):
+            if w.lower() in braut_start_keywords:
+                braut_indicator_pos = i
+                print(f"DEBUG Heirat: Braut-Indikator '{w}' gefunden bei Position {i}")
+                break
+        
+        # Wenn Braut-Indikator gefunden, suche rückwärts nach dem letzten Trenner davor
+        if braut_indicator_pos != -1:
+            for i in range(braut_indicator_pos - 1, -1, -1):
+                if words[i].lower() in trenner_woerter:
+                    trenner_pos = i
+                    print(f"DEBUG Heirat: Trenner '{words[i]}' gefunden bei Position {i} (vor Braut-Indikator)")
+                    break
+        
+        # Fallback: Suche einfach das erste "und"
+        if trenner_pos == -1:
+            for i, w in enumerate(words):
+                if w.lower() in trenner_woerter:
+                    trenner_pos = i
+                    print(f"DEBUG Heirat: Trenner '{w}' gefunden bei Position {i} (Fallback)")
+                    break
+        
+        # Spezialfall: "Son" oder "Sohn" + weiblicher Vorname = impliziter Trenner
+        # Beispiel: "Hanssen Son Elsbeth" → Trenner vor "Elsbeth"
+        if trenner_pos == -1 and braut_indicator_pos != -1:
+            for i in range(braut_indicator_pos - 1, -1, -1):
+                if words[i].lower() in ['son', 'sohn', 'stiffson']:
+                    # Prüfe ob danach (bei i+1) ein weiblicher Vorname folgt
+                    if i + 1 < len(words) and words[i + 1].lower() in braut_start_keywords:
+                        trenner_pos = i + 1  # Trenne VOR dem weiblichen Vornamen
+                        print(f"DEBUG Heirat: Impliziter Trenner nach '{words[i]}' bei Position {i+1} (Sohn-Stand + weiblicher Vorname)")
+                        break
+        
+        # Letzter Fallback: Wenn immer noch kein Trenner gefunden, aber Braut-Indikator existiert
+        # → Trenne direkt vor dem Braut-Indikator
+        if trenner_pos == -1 and braut_indicator_pos != -1:
+            trenner_pos = braut_indicator_pos
+            print(f"DEBUG Heirat: Kein Trenner-Wort gefunden, trenne vor Braut-Indikator bei Position {braut_indicator_pos}")
+        
+        if trenner_pos == -1:
+            print("DEBUG Heirat: KEIN Trenner gefunden und kein Braut-Indikator!")
+            return result
+        
+        # Teil 1: Bräutigam (vor Trenner)
+        brautigam_words = words[:trenner_pos]
+        print(f"DEBUG Heirat: brautigam_words = {brautigam_words}")
+        
+        # Teil 2: Braut (nach Trenner)
+        # Wenn trenner_pos auf einen Trenner zeigt (und, undt), überspringe ihn
+        # Wenn trenner_pos auf den Braut-Indikator zeigt, starte dort (nicht überspringen)
+        if trenner_pos < len(words) and words[trenner_pos].lower() in trenner_woerter:
+            braut_words = words[trenner_pos + 1:]  # Trenner überspringen
+        else:
+            braut_words = words[trenner_pos:]  # Ab Braut-Indikator
+        print(f"DEBUG Heirat: braut_words = {braut_words}")
+        
+        # === Bräutigam-Teil analysieren ===
+        # Struktur: [Vorname(n)] [Nachname] [Vater-Vorname] [Vater-Nachname]s ...
+        # Beispiel: Johann Peter verdrieß, Christoff verdriessen
+        
+        # ZUERST: Erkenne Berufe um zu vermeiden, dass Berufs-Wörter als Vater-Namen interpretiert werden
+        beruf_word_indices = set()  # Speichere Indizes der Berufs-Wörter
+        
+        # Prüfe ob ein Beruf aus BERUFE vorhanden ist (auch mehrwortig wie "Not. Caes. publ.")
+        brautigam_text = ' '.join(brautigam_words)
+        for beruf_kandidat in BERUFE:
+            if beruf_kandidat in brautigam_text:
+                # Finde die Position und Wort-Indizes
+                result['beruf'] = beruf_kandidat
+                # Finde welche Wörter zu diesem Beruf gehören
+                beruf_woerter = beruf_kandidat.split()
+                for i in range(len(brautigam_words) - len(beruf_woerter) + 1):
+                    if ' '.join(brautigam_words[i:i+len(beruf_woerter)]) == beruf_kandidat:
+                        beruf_word_indices = set(range(i, i + len(beruf_woerter)))
+                        print(f"DEBUG Heirat: Beruf = {result['beruf']} bei Indizes {list(beruf_word_indices)}")
+                        break
+                break
+        
+        idx = 0
+        # Überspringe Anreden und Füllwörter
+        while idx < len(brautigam_words) and (brautigam_words[idx].lower() in anreden or brautigam_words[idx] in ignore_extended):
+            idx += 1
+        
+        # Sammle Bräutigam Vornamen (kann Doppelname sein: Johann Peter)
+        vorname_parts = []
+        while idx < len(brautigam_words) and brautigam_words[idx] in maennliche_vornamen:
+            vorname_parts.append(brautigam_words[idx])
+            idx += 1
+        
+        # Wenn keine bekannten Vornamen gefunden, nimm erstes Wort
+        if not vorname_parts and idx < len(brautigam_words):
+            vorname_parts.append(brautigam_words[idx])
+            idx += 1
+        
+        if vorname_parts:
+            result['vorname'] = ' '.join(vorname_parts)
+            print(f"DEBUG Heirat: Bräutigam Vorname = {result['vorname']}")
+        
+        # Überspringe Füllwörter
+        while idx < len(brautigam_words) and brautigam_words[idx] in ignore_extended:
+            idx += 1
+        
+        # Nächstes Wort: Könnte Nachname oder Vater-Vorname sein
+        if idx < len(brautigam_words):
+            word_next = brautigam_words[idx]
+            
+            # Stand-Wörter für Bräutigam (zur Mustererkennung)
+            brautigam_stand_woerter = ['sohn', 'söhnlein', 'sohnlein', 'son', 'wittwer', 'wittiber', 'witwer']
+            
+            # Prüfe ob es ein bekannter männlicher Vorname ist (dann ist es Vater-Vorname)
+            if word_next in maennliche_vornamen:
+                # Das ist der Vater-Vorname
+                result['braeutigam_vater'] = word_next
+                print(f"DEBUG Heirat: Bräutigam Vater = {result['braeutigam_vater']}")
+                idx += 1
+                
+                # Überspringe Füllwörter
+                while idx < len(brautigam_words) and brautigam_words[idx] in ignore_extended:
+                    idx += 1
+                
+                # Nächstes Wort sollte Vater-Nachname (Genitiv) sein
+                if idx < len(brautigam_words):
+                    result['nachname'] = remove_genitiv_s(brautigam_words[idx])
+                    print(f"DEBUG Heirat: Bräutigam Nachname (von Vater) = {result['nachname']}")
+                    idx += 1
+            else:
+                # Prüfe Muster: [Nachname] [Vater-Vorname] [Vater-Nachname-Genitiv] [Stand]
+                # z.B. "Jorg Henckel Donges Henkels Sohn"
+                # Suche ob ein Stand-Wort irgendwo später im Bräutigam-Teil vorkommt
+                stand_found = False
+                for check_word in brautigam_words[idx:]:
+                    if check_word.lower() in brautigam_stand_woerter:
+                        stand_found = True
+                        break
+                
+                # Wenn bereits ein Beruf erkannt wurde, überspringe die Vater-Logik
+                if beruf_word_indices:
+                    # Beruf wurde bereits erkannt, word_next ist der Nachname
+                    result['nachname'] = word_next
+                    print(f"DEBUG Heirat: Bräutigam Nachname = {result['nachname']} (Beruf bereits erkannt, keine Vater-Verarbeitung)")
+                    idx += 1
+                # Wenn Stand-Wort gefunden: Muster [Nachname] [Vater-Vorname] [Vater-Nachname-Genitiv] [Stand]
+                elif stand_found:
+                    # word_next = eigener Nachname
+                    result['nachname'] = word_next
+                    print(f"DEBUG Heirat: Bräutigam Nachname (eigen) = {result['nachname']}")
+                    idx += 1
+                    
+                    # Überspringe Füllwörter
+                    while idx < len(brautigam_words) and brautigam_words[idx] in ignore_extended:
+                        idx += 1
+                    
+                    # Nächstes Wort: Vater-Vorname
+                    if idx < len(brautigam_words):
+                        result['braeutigam_vater'] = brautigam_words[idx]
+                        print(f"DEBUG Heirat: Bräutigam Vater = {result['braeutigam_vater']}")
+                        idx += 1
+                        
+                        # Überspringe Füllwörter
+                        while idx < len(brautigam_words) and brautigam_words[idx] in ignore_extended:
+                            idx += 1
+                        
+                        # Nächstes Wort: Vater-Nachname (Genitiv) - ändert result['nachname'] NICHT
+                        if idx < len(brautigam_words):
+                            # Entferne Genitiv-s vom Vater-Nachname, aber behalte Bräutigam-Nachname
+                            vater_nachname_genitiv = brautigam_words[idx]
+                            print(f"DEBUG Heirat: Vater-Nachname (Genitiv) = {vater_nachname_genitiv}")
+                            idx += 1
+                else:
+                    # Kein Stand-Wort gefunden: ursprüngliche Logik
+                    # Prüfe ob nächstes Wort existiert
+                    idx_peek = idx + 1
+                    while idx_peek < len(brautigam_words) and brautigam_words[idx_peek] in ignore_extended:
+                        idx_peek += 1
+                    
+                    # Wenn es ein weiteres Wort gibt
+                    if idx_peek < len(brautigam_words):
+                        word_after = brautigam_words[idx_peek]
+                        
+                        # Prüfe noch ein Wort weiter für komplexe Pattern wie "Fritz Andreae Fritzen"
+                        idx_peek2 = idx_peek + 1
+                        while idx_peek2 < len(brautigam_words) and brautigam_words[idx_peek2] in ignore_extended:
+                            idx_peek2 += 1
+                        
+                        word_after2 = brautigam_words[idx_peek2] if idx_peek2 < len(brautigam_words) else None
+                        
+                        # Pattern: [Nachname] [VaterVorname] [VaterNachname]s
+                        # z.B. Fritz Andreae Fritzen
+                        if word_after2 and word_after2.endswith('s') and len(word_after2) > 2:
+                            result['nachname'] = word_next  # Fritz
+                            result['braeutigam_vater'] = word_after  # Andreae
+                            result['nachname'] = remove_genitiv_s(word_after2)  # Fritzen -> Fritz (überschreibt)
+                            print(f"DEBUG Heirat: Bräutigam Nachname = {word_next} -> Korrigiert zu {result['nachname']} (von Vater)")
+                            print(f"DEBUG Heirat: Bräutigam Vater = {result['braeutigam_vater']}")
+                            idx = idx_peek2 + 1
+                        # Wenn word_after ein männlicher Vorname ist: word_next = Nachname, word_after = Vater-Vorname
+                        elif word_after in maennliche_vornamen:
+                            result['nachname'] = word_next
+                            print(f"DEBUG Heirat: Bräutigam Nachname = {result['nachname']}")
+                            idx = idx_peek + 1
+                            result['braeutigam_vater'] = word_after
+                            print(f"DEBUG Heirat: Bräutigam Vater = {result['braeutigam_vater']}")
+                            
+                            # Überspringe Füllwörter
+                            while idx < len(brautigam_words) and brautigam_words[idx] in ignore_extended:
+                                idx += 1
+                            
+                            # Nächstes sollte Vater-Nachname (Genitiv) sein
+                            if idx < len(brautigam_words):
+                                result['nachname'] = remove_genitiv_s(brautigam_words[idx])
+                                print(f"DEBUG Heirat: Bräutigam Nachname korrigiert (von Vater) = {result['nachname']}")
+                                idx += 1
+                        # Wenn word_after mit 's' endet (Genitiv): word_next = Vater-Vorname
+                        elif word_after.endswith('s') and len(word_after) > 2:
+                            result['braeutigam_vater'] = word_next
+                            result['nachname'] = remove_genitiv_s(word_after)
+                            print(f"DEBUG Heirat: Bräutigam Vater = {result['braeutigam_vater']}")
+                            print(f"DEBUG Heirat: Bräutigam Nachname (von Vater) = {result['nachname']}")
+                            idx = idx_peek + 1
+                        else:
+                            # Fallback: word_next ist Nachname
+                            result['nachname'] = word_next
+                            print(f"DEBUG Heirat: Bräutigam Nachname (Fallback) = {result['nachname']}")
+                            idx += 1
+                    else:
+                        # Nur ein Wort übrig: Das ist der Nachname
+                        result['nachname'] = word_next
+                        print(f"DEBUG Heirat: Bräutigam Nachname (nur 1 Wort) = {result['nachname']}")
+                        idx += 1
+        
+        # Erkenne "Bürger" als Beruf im Bräutigam-Teil
+        for i, w in enumerate(brautigam_words):
+            if w.lower() == 'bürger' and not result['beruf']:
+                result['beruf'] = 'Bürger'
+                print(f"DEBUG Heirat: Beruf = Bürger")
+                break
+        
+        # Suche "alhier" oder "alhie" für Ort im Bräutigam-Teil (bedeutet Wetzlar)
+        # Auch Pattern: "Bürger [Beruf] alhier" -> Beruf extrahieren
+        for i, w in enumerate(brautigam_words):
+            if w.lower() in ['alhier', 'alhie']:
+                result['ort'] = 'Wetzlar'
+                print(f"DEBUG Heirat: Bräutigam Ort ({w}) = Wetzlar")
+                # Prüfe ob davor ein Beruf steht (zwischen "Bürger" und "alhier")
+                # Pattern: ... Bürger Müller alhier
+                if i >= 2 and brautigam_words[i-2].lower() == 'bürger':
+                    potential_beruf = brautigam_words[i-1]
+                    # Prüfe ob es ein bekannter Beruf oder ein sinnvoller Beruf ist
+                    if potential_beruf in BERUFE or potential_beruf[0].isupper():
+                        result['beruf'] = potential_beruf
+                        print(f"DEBUG Heirat: Beruf (vor alhier) = {result['beruf']}")
+                elif i >= 1:
+                    # Pattern: ... Bürger alhier (kein Beruf dazwischen)
+                    if brautigam_words[i-1].lower() != 'bürger':
+                        # Wort davor könnte Beruf sein
+                        potential_beruf = brautigam_words[i-1]
+                        if potential_beruf in BERUFE:
+                            result['beruf'] = potential_beruf
+                            print(f"DEBUG Heirat: Beruf (vor alhier, ohne Bürger) = {result['beruf']}")
+                break
+        
+        # Suche "zu [Ort]" oder "von [Ort]" oder "in [Ort]" im Bräutigam-Teil
+        # ABER: "in domo" ist Hochzeitsort, kein Wohnort!
+        if not result['ort']:
+            for i, w in enumerate(brautigam_words):
+                if w.lower() in ['zu', 'von', 'in'] and i + 1 < len(brautigam_words):
+                    next_word = brautigam_words[i + 1]
+                    # Ignoriere "in domo" (Hochzeitsort, nicht Wohnort)
+                    if w.lower() == 'in' and next_word.lower() == 'domo':
+                        continue
+                    result['ort'] = next_word
+                    print(f"DEBUG Heirat: Bräutigam Ort ({w}) = {result['ort']}")
+                    break
+        
+        # Berufserkennung wurde bereits oben durchgeführt (vor der Nachname/Vater-Logik)
+        
+        # Suche Stand-Angaben im Bräutigam-Teil (z.B. "Wittwer", "Sohn", "Stiefsohn")
+        # Wichtig: Zuerst vollständige Wörter aus STAND_MAPPING prüfen (ganze Wörter), 
+        # dann erst Teilstring-Suche als Fallback
+        for word in brautigam_words:
+            word_lower = word.lower()
+            if word_lower in STAND_MAPPING:
+                result['braeutigam_stand'] = STAND_MAPPING[word_lower]
+                print(f"DEBUG Heirat: Bräutigam Stand = {result['braeutigam_stand']} (gefunden: '{word}')")
+                break
+        
+        # Fallback: Teilstring-Suche (nur wenn noch kein Stand gefunden)
+        if not result.get('braeutigam_stand'):
+            brautigam_text_lower = ' '.join(brautigam_words).lower()
+            braeutigam_stand_patterns = [
+                ('wittwer', 'Wittwer'),
+                ('wittiber', 'Wittwer'),
+                ('witwer', 'Wittwer'),
+                ('sohn', 'Sohn'),
+                ('son', 'Sohn'),
+            ]
+            
+            for pattern, normalized in braeutigam_stand_patterns:
+                if pattern in brautigam_text_lower:
+                    result['braeutigam_stand'] = normalized
+                    print(f"DEBUG Heirat: Bräutigam Stand = {result['braeutigam_stand']} (gefunden: '{pattern}' - Fallback)")
+                    break
+        
+        # === Braut-Teil analysieren ===
+        # Struktur: [Anrede] [Vorname(n)] [Vater-Vorname] [Vater-Nachname]s ...
+        idx = 0
+        # Überspringe Anreden (Jungfr., Jfr., jung/r, jfr etc.) und Füllwörter
+        # Jede Variante die mit "jung" beginnt ist eine Abkürzung für "Jungfrau" (OCR-robust)
+        _anreden_lower = {a.lower() for a in anreden}
+        while idx < len(braut_words) and (
+            braut_words[idx].lower() in _anreden_lower or
+            braut_words[idx].lower().startswith('jung') or
+            braut_words[idx].lower() in ['jfr'] or
+            braut_words[idx] in ignore_extended
+        ):
+            idx += 1
+        
+        # Sammle alle Vornamen bis zum nächsten männlichen Vornamen oder Füllwort
+        # (Braut kann mehrere Vornamen haben: Christiana Anna Ottilie)
+        partner_parts = []
+        _weibliche_lower = {v.lower() for v in weibliche_vornamen}
+        while idx < len(braut_words):
+            word = braut_words[idx]
+            # Stoppe bei Zahlen
+            if word.isdigit():
+                break
+            # Stoppe bei Füllwörtern
+            if word in ignore_extended:
+                idx += 1
+                continue
+            # Stoppe bei bekannten maennlichen Vornamen (= Vater)
+            if norm_name_token(word) in maennliche_vornamen_norm:
+                break
+            # Wörter auf "-in" (weibliche Berufsform/Nachname-Form, z.B. Weißgerberin, Verdriessin)
+            # nach mind. einem gesammelten Vornamen = Braut-Nachname, nicht weiterer Vorname
+            if (partner_parts
+                    and word.lower().endswith('in')
+                    and len(word) > 3
+                    and word not in weibliche_vornamen
+                    and word.lower() not in _weibliche_lower):
+                result['braut_nachname'] = word
+                print(f"DEBUG Heirat: Braut Nachname = {result['braut_nachname']} ('-in'-Endung erkannt)")
+                idx += 1
+                break
+
+            # Stoppe bei Wörtern die wie Nachnamen aussehen (enden auf Genitiv: -s, -en, -es)
+            # ABER: nur wenn danach noch ein Wort folgt (sonst ist es Teil des Nachnamens selbst)
+            has_genitiv_ending = (
+                (word.endswith('en') and len(word) > 3) or
+                (word.endswith('es') and len(word) > 3) or
+                (word.endswith('s') and len(word) > 2)
+            ) and word not in weibliche_vornamen
+            
+            if has_genitiv_ending:
+                # Prüfe ob danach noch mindestens ein Wort kommt (außer Stopwords)
+                next_idx = idx + 1
+                while next_idx < len(braut_words) and braut_words[next_idx] in ignore_extended:
+                    next_idx += 1
+                if next_idx < len(braut_words):
+                    # Es folgt noch ein Wort → aktuelles Wort ist Genitiv-Nachname
+                    break
+                # Kein weiteres Wort → aktuelles Wort ist der Braut-Nachname selbst
+            # Ansonsten: sammle als Teil des Braut-Vornamens
+            partner_parts.append(word)
+            idx += 1
+        
+        if partner_parts:
+            partner_name = ' '.join(partner_parts)
+            # Entferne Kommas und andere Satzzeichen am Ende
+            partner_name = partner_name.rstrip(',.;:')
+            
+            # Prüfe ob letztes Wort ein Nachname sein könnte (kein bekannter Vorname und keine Zahl)
+            # Beispiel: "Anna Güttin" → "Anna" = Partner, "Güttin" = Braut Nachname
+            partner_words = partner_name.split()
+            if (len(partner_words) > 1 
+                and partner_words[-1] not in weibliche_vornamen 
+                and not partner_words[-1].isdigit()):
+                # Letztes Wort ist vermutlich der Nachname
+                result['braut_nachname'] = partner_words[-1]
+                result['partner'] = ' '.join(partner_words[:-1])
+                print(f"DEBUG Heirat: Braut Vorname = {result['partner']}")
+                print(f"DEBUG Heirat: Braut Nachname = {result['braut_nachname']} (aus Partner extrahiert)")
+            else:
+                result['partner'] = partner_name
+                print(f"DEBUG Heirat: Braut Vorname = {result['partner']}")
+        
+        # Überspringe Füllwörter
+        while idx < len(braut_words) and braut_words[idx] in ignore_extended:
+            idx += 1
+        
+        # Nach Vornamen: Unterscheide zwei Fälle
+        # Fall A: [Vater-Vorname] [Vater-Nachname-Genitiv] - normale Struktur
+        # Fall B: [Braut-Nachname-Genitiv] [Vater-Nachname-Genitiv] - bei Witwen ohne Vater-Vorname
+        # 
+        # Strategie: Prüfe ob nächstes Wort ein männlicher Vorname ist
+        if idx < len(braut_words):
+            current_word = braut_words[idx]
+            
+            # Fall A: Männlicher Vorname → Vater-Vorname
+            if norm_name_token(current_word) in maennliche_vornamen_norm:
+                # Sammle alle männlichen Vornamen als Vater-Vorname
+                vater_vorname_parts = []
+                while idx < len(braut_words) and norm_name_token(braut_words[idx]) in maennliche_vornamen_norm:
+                    vater_vorname_parts.append(braut_words[idx])
+                    idx += 1
+                
+                if vater_vorname_parts:
+                    result['braut_vater'] = ' '.join(vater_vorname_parts)
+                    print(f"DEBUG Heirat: Braut Vater = {result['braut_vater']}")
+                
+                # Überspringe Füllwörter
+                while idx < len(braut_words) and braut_words[idx] in ignore_extended:
+                    idx += 1
+                
+                # Nächstes Wort = Vater-Nachname (im Genitiv)
+                # Nur setzen wenn nicht schon per -in-Endung belegt
+                if idx < len(braut_words):
+                    vater_nn = remove_genitiv_s(braut_words[idx])
+                    if not result.get('braut_nachname'):
+                        result['braut_nachname'] = vater_nn
+                        print(f"DEBUG Heirat: Braut Nachname = {result['braut_nachname']} (von Vater)")
+                    else:
+                        print(f"DEBUG Heirat: Vater-Nachname '{vater_nn}' ignoriert, braut_nachname bereits gesetzt ({result['braut_nachname']})")
+                    idx += 1
+            
+            # Fall B: Kein männlicher Vorname → Könnte Braut-Nachname oder Vater-Nachname sein
+            else:
+                # Prüfe ob es zwei Wörter mit Genitiv-Endung gibt
+                # Pattern: [Braut-Nachname-Genitiv] [Vater-Nachname-Genitiv]
+                idx_peek = idx + 1
+                while idx_peek < len(braut_words) and braut_words[idx_peek] in ignore_extended:
+                    idx_peek += 1
+                
+                next_word = braut_words[idx_peek] if idx_peek < len(braut_words) else None
+                
+                # Wenn beide Wörter Genitiv-Endungen haben → Fall B (Witwe mit 2 Nachnamen)
+                if next_word and (
+                    (current_word.endswith('en') and len(current_word) > 3) or
+                    (current_word.endswith('es') and len(current_word) > 3) or
+                    (current_word.endswith('s') and len(current_word) > 2)
+                ) and (
+                    (next_word.endswith('en') and len(next_word) > 3) or
+                    (next_word.endswith('es') and len(next_word) > 3) or
+                    (next_word.endswith('s') and len(next_word) > 2)
+                ):
+                    # Beide haben Genitiv-Endungen → erstes ist Braut-Nachname, zweites ist Vater-Nachname
+                    if not result['braut_nachname']:  # Nur wenn nicht schon aus Partner extrahiert
+                        result['braut_nachname'] = remove_genitiv_s(current_word)
+                        print(f"DEBUG Heirat: Braut Nachname = {result['braut_nachname']} (Ehemann, Witwe)")
+                    result['braut_vater'] = remove_genitiv_s(next_word)
+                    print(f"DEBUG Heirat: Braut Vater = {result['braut_vater']} (nur Nachname)")
+                    idx = idx_peek + 1
+                else:
+                    # Nur ein Genitiv-Wort → das ist Vater-Nachname (normale Struktur ohne Vater-Vorname)
+                    # ABER: Keine reinen Zahlen als Nachname
+                    if not current_word.isdigit():
+                        if not result.get('braut_nachname'):
+                            result['braut_nachname'] = remove_genitiv_s(current_word)
+                            print(f"DEBUG Heirat: Braut Nachname = {result['braut_nachname']} (von Vater, kein Vorname)")
+                        else:
+                            print(f"DEBUG Heirat: Vater-Nachname '{current_word}' ignoriert, braut_nachname bereits gesetzt ({result['braut_nachname']})")
+                    idx += 1
+        
+        # Suche "zu [Ort]" oder "von [Ort]" oder "in [Ort]" für Braut-Ort
+        # ABER: "in domo" ist Hochzeitsort, kein Wohnort!
+        for i in range(len(braut_words) - 1):
+            if braut_words[i].lower() in ['zu', 'von', 'in']:
+                next_word = braut_words[i + 1]
+                # Ignoriere "in domo" (Hochzeitsort, nicht Wohnort)
+                if braut_words[i].lower() == 'in' and next_word.lower() == 'domo':
+                    continue
+                result['braut_ort'] = next_word
+                print(f"DEBUG Heirat: Braut Ort = {result['braut_ort']}")
+                break
+        
+        # "alhier" oder "alhie" bedeutet Wetzlar für Braut-Ort
+        if not result['braut_ort']:
+            for i, w in enumerate(braut_words):
+                if w.lower() in ['alhier', 'alhie']:
+                    result['braut_ort'] = 'Wetzlar'
+                    print(f"DEBUG Heirat: Braut Ort ({w}) = Wetzlar")
+                    break
+                    break
+        
+        # Suche Stand-Angaben (z.B. "gewesene hausfrau", "Wittib", "hinterlassene Wittwe", "Tochter")
+        # Kombinationen wie "gewesene hausfrau" erkennen
+        braut_text_lower = ' '.join(braut_words).lower()
+        
+        # Verwende STAND_MAPPING für Stand-Erkennung
+        # Sortiere nach Länge (längste zuerst), um spezifischere Matches zu bevorzugen
+        for stand_key in sorted(STAND_MAPPING.keys(), key=len, reverse=True):
+            if stand_key in braut_text_lower:
+                result['stand'] = STAND_MAPPING[stand_key]
+                print(f"DEBUG Heirat: Stand = {result['stand']} (gefunden: '{stand_key}')")
+                break
+        
+        return result
+
+    def _extract_burial_fields(self, text: str) -> dict:
+        """
+        Zentrale Funktion zur Extraktion von Feldern aus einem Begräbnis-Eintrag.
+        
+        Diese Funktion wird von beiden Tabs (OCR-Tab und Datenbank-Tab) verwendet,
+        um eine konsistente Erkennung zu gewährleisten.
+        
+        Args:
+            text: Der zu analysierende Text (nach Zitation)
+            
+        Returns:
+            Dict mit extrahierten Feldern: vorname, nachname, partner, beruf, stand, todestag, ort, geb_jahr_gesch
+        """
+        import re
+        
+        result = {
+            'vorname': None,
+            'nachname': None,
+            'partner': None,
+            'beruf': None,
+            'stand': None,
+            'todestag': None,
+            'ort': None,
+            'geb_jahr_gesch': None,
+            'seite': None,
+            'nummer': None
+        }
+        
+        # 1. Zitation-Pattern
+        zitation_pattern = r"^(ev\.\s*Kb\.\s*Wetzlar)?[ .]*[⚰\u26B0]?[ .]*(\d{4}[ .]?\d{2}[ .]?\d{2})[ .]*p\.?[ .]?(\d+)[ .]*(Nr\.?|No\.?)[ .]?(\d+)[ .]*"
+        stopwords = ["Text", "Tex", "Tex.", "begraben", "begr.", "begr ", "Begr.", "Begr "]
+        
+        # Suche das Ende der Zitation
+        stop_idx = len(text)
+        for sw in stopwords:
+            idx = text.lower().find(sw.lower())
+            if idx != -1 and idx < stop_idx:
+                stop_idx = idx
+        zitation_text = text[:stop_idx]
+        
+        # Zitation extrahieren
+        m = re.match(zitation_pattern, zitation_text)
+        
+        if m:
+            after_zitation = zitation_text[m.end():].strip()
+            # Todestag extrahieren
+            result['todestag'] = m.group(2).replace(" ", ".").replace(".", ".")
+            # Seite extrahieren (Gruppe 3)
+            if m.group(3):
+                result['seite'] = int(m.group(3))
+            # Nummer extrahieren (Gruppe 5)
+            if m.group(5):
+                result['nummer'] = int(m.group(5))
+        else:
+            after_zitation = zitation_text.strip()
+        
+        # 2. Wörter nach Zitation splitten
+        # Satzzeichen entfernen (Kommata, Punkte, Semikolons etc.) bevor gesplittet wird
+        bereinigte_zeile = re.sub(r"[,;.!?]", " ", after_zitation)
+        words = re.split(r"\s+", bereinigte_zeile)
+        words = [w for w in words if w]
+        
+        # Speichere die Original-Großschreibung für später
+        words_original_case = words.copy()
+        
+        # WICHTIG: Normalisiere Großbuchstaben für Vornamen-Vergleiche
+        # "jacob" → "Jacob", damit sie mit den Namen-Listen übereinstimmen
+        words = [w[0].upper() + w[1:] if len(w) > 0 else w for w in words]
+        
+        if not words:
+            return result
+        
+        # Verwende importierte Listen
+        weibliche_vornamen = WEIBLICHE_VORNAMEN
+        maennliche_vornamen = MAENNLICHE_VORNAMEN
+        stand_synonyme = STAND_SYNONYME
+        ort_prae = ORTS_PRAEPOSITIONEN
+        beruf_einleitung = BERUFS_EINLEITUNG
+        anreden = ANREDEN
+        ignoriere_woerter = IGNORIERE_WOERTER
+        
+        # Hilfsfunktion für frau-Anrede
+        def ist_frau_anrede(idx_aktuell):
+            if idx_aktuell >= len(words) or words[idx_aktuell].lower() != "frau":
+                return False
+            if idx_aktuell + 1 < len(words):
+                next_word = words[idx_aktuell + 1]
+                if next_word in weibliche_vornamen or next_word in maennliche_vornamen:
+                    return True
+                if next_word.lower() not in stand_synonyme:
+                    return True
+            return False
+        
+        # Hilfsfunktion: Entferne Genitiv-Endungen
+        def entferne_genitiv(wort):
+            """Entfernt Genitiv-Endungen -s, -is, -en, -i, -ii, -tts von einem Wort."""
+            # Namen die auf -s enden behalten: Hans, etc.
+            if wort in maennliche_vornamen or wort in weibliche_vornamen:
+                return wort  # Vorname, nicht ändern
+            
+            # Kurze Namen (2-3 Zeichen) auf -s: "Bos", "Has" etc. behalten
+            if len(wort) <= 3 and wort.endswith('s'):
+                return wort  # Wahrscheinlich echter Nachname
+            
+            # Lateinische Genitive wie "Petri" NICHT ändern (enden auf -tri, -pri, -ri)
+            if wort.endswith(('tri', 'pri', 'ri')) and len(wort) > 3:
+                return wort  # Lateinischer Name, nicht ändern
+            
+            # Namen auf -chen/-lein sind Diminutive, keine Genitive
+            if wort.endswith(('chen', 'lein')):
+                return wort  # Diminutiv, nicht ändern
+            
+            # Double-s am Ende
+            if wort.endswith('ss') and len(wort) > 4:
+                return wort[:-1]
+            
+            if wort.endswith('is'):
+                return wort[:-2]
+            elif wort.endswith('ii'):  # Doppel-i: "Kaulii" -> "Kauli"
+                return wort[:-1]
+            elif wort.endswith('i') and len(wort) > 2:  # Einfach-i: "Wilhelmi" -> "Wilhelm", "Theophili" -> "Theophil"
+                return wort[:-1]
+            elif wort.endswith('en') and len(wort) > 3:
+                return wort[:-2]
+            elif wort.endswith('s') and len(wort) > 2:
+                return wort[:-1]
+            return wort
+        
+        # 3. Extraktion
+        idx = 0
+        vorname_start_idx = -1
+        vorname = None
+        nachname = None
+        partner = None
+        beruf = None
+        ist_weiblich = False  # Gender-Tracking für Partner-Erkennung
+        stand = None
+        ort = None
+        
+        # Vorname suchen
+        while idx < len(words):
+            w = words[idx]
+            if w in weibliche_vornamen or w in maennliche_vornamen:
+                vorname_start_idx = idx
+                vorname = w
+                ist_weiblich = w in weibliche_vornamen
+                idx += 1
+                # KEINE Doppelnamen sammeln beim ersten Durchlauf!
+                # Doppelnamen werden später bei Partner-Erkennung korrekt zugeordnet:
+                # - Unterschiedliche Geschlechter: Name 2 = Partner
+                # - Gleiche Geschlechter + Partner-Stand (Sohn/Tochter): Name 2+ = Partner-Namen
+                # - Gleiche Geschlechter + kein Stand: Name 2+ = Doppelname des Verstorbenen
+                # Ignoriere-Wörter überspringen
+                while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                    idx += 1
+                break
+            idx += 1
+
+        # Wenn kein Vorname in den Listen gefunden wurde, Index zurücksetzen,
+        # damit nachfolgende Fallbacks (z.B. Ort, Stand) trotzdem laufen.
+        if not vorname:
+            idx = 0
+        
+        # Nachname
+        if vorname and vorname_start_idx > 0:
+            # Prüfe ob words[0] nicht in IGNORIERE_WOERTER oder ANREDEN ist
+            if words[0].lower() not in ignoriere_woerter and words[0].lower() not in anreden:
+                nachname = words[0]
+
+        # Fallback für unbekannte Namen (nicht in Vornamen-Listen):
+        # Pattern: [Vorname] [Nachname] ...
+        # Beispiel: "Clas Sprengel, ein Bürger in der Rosengassen ..."
+        if not vorname and not nachname and len(words) >= 2:
+            weibliche_stand_marker = {"witwe", "wittib", "wittwe", "witbe", "widwe", "hausfrau", "haußfrau"}
+            has_weiblicher_stand = any(w.lower() in weibliche_stand_marker for w in words)
+
+            # Nicht anwenden, wenn es ein Witwe/Hausfrau-Kontext ist –
+            # dafür gibt es weiter unten eine spezialisierte Logik.
+            if has_weiblicher_stand:
+                pass
+            else:
+                first_word = words[0]
+                second_word = words[1]
+
+                if (
+                    first_word.lower() not in ignoriere_woerter and
+                    first_word.lower() not in anreden and
+                    first_word.lower() not in stand_synonyme and
+                    first_word.lower() not in ort_prae and
+                    not first_word.isdigit() and
+                    second_word.lower() not in ignoriere_woerter and
+                    second_word.lower() not in anreden and
+                    second_word.lower() not in stand_synonyme and
+                    second_word.lower() not in ort_prae and
+                    not second_word.isdigit()
+                ):
+                    vorname = first_word
+                    nachname = entferne_genitiv(second_word)
+                    vorname_start_idx = 0
+        
+        # === PARTNER + NACHNAME ERKENNUNG ===
+        # Diese Logik läuft IMMER nach Vorname-Erkennung (nicht als elif!)
+        if vorname:
+            # **SCHRITT 1: Partner-Vorname**
+            if idx < len(words):
+                next_word = words[idx]
+                
+                # Weiblich → suche männlich oder anderes weiblich
+                if ist_weiblich and next_word in maennliche_vornamen:
+                    # Unterschiedliche Geschlechter: männlicher Name = Partner!
+                    partner = next_word
+                    idx += 1
+                    # Sammle weitere männliche Vornamen beim Partner
+                    while idx < len(words) and words[idx] in maennliche_vornamen:
+                        partner += " " + words[idx]
+                        idx += 1
+                    # Ignoriere-Wörter überspringen
+                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                        idx += 1
+                
+                elif ist_weiblich and next_word in weibliche_vornamen:
+                    # Gleiche Geschlechter: Weitere weibliche Namen = Partner-Namen (nicht Doppelname!)
+                    partner = next_word
+                    idx += 1
+                    # Sammle weitere weibliche Vornamen
+                    while idx < len(words) and words[idx] in weibliche_vornamen:
+                        partner += " " + words[idx]
+                        idx += 1
+                    # Ignoriere-Wörter überspringen
+                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                        idx += 1
+                
+                # Männlich → suche weiblich oder anderes männlich
+                elif not ist_weiblich and next_word in weibliche_vornamen:
+                    # Unterschiedliche Geschlechter: weiblicher Name = Partner!
+                    partner = next_word
+                    idx += 1
+                    # Sammle weitere weibliche Vornamen
+                    while idx < len(words) and words[idx] in weibliche_vornamen:
+                        partner += " " + words[idx]
+                        idx += 1
+                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                        idx += 1
+                
+                elif not ist_weiblich and next_word in maennliche_vornamen:
+                    # Gleiche Geschlechter: Weitere männliche Namen = Partner-Namen
+                    partner = next_word
+                    idx += 1
+                    # Sammle weitere männliche Vornamen
+                    while idx < len(words) and words[idx] in maennliche_vornamen:
+                        partner += " " + words[idx]
+                        idx += 1
+                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                        idx += 1
+            
+            # **SCHRITT 2: Nachname (kann Genitiv sein)**
+            # Setze Nachname nur wenn er noch nicht gesetzt wurde
+            if not nachname and idx < len(words):
+                w = words[idx]
+                
+                if (w.lower() not in anreden and
+                    w.lower() not in ignoriere_woerter and
+                    w.lower() not in [s.lower() for s in stand_synonyme] and 
+                    w.lower() not in ort_prae and 
+                    w.lower() not in beruf_einleitung and
+                    w not in weibliche_vornamen and 
+                    w not in maennliche_vornamen and
+                    not w.isdigit() and
+                    w.lower() not in ARTIKEL):  # Artikel überspringen
+                    
+                    # Das ist der Nachname (möglicherweise im Genitiv)
+                    nachname = entferne_genitiv(w)
+                    idx += 1
+                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                        idx += 1
+        
+        # SONDERFALL: Partner-Erkennung für uxor/Hausfrau ohne eigenen Vornamen
+        # Wenn kein eigener Vorname, aber männliche Vornamen im Text vor Stand
+        # NUR wenn Partner noch nicht gesetzt ist!
+        if not vorname and not partner and idx < len(words):
+            # Suche nach männlichen Vornamen für Partner
+            temp_idx = 0
+            partner_vornamen = []
+            partner_vornamen_indices = []  # Speichere die Positionen der Partner-Vornamen
+            while temp_idx < len(words):
+                w = words[temp_idx]
+                # Überspringe Anreden und ignoriere-Wörter
+                if w.lower() in anreden or w.lower() in ignoriere_woerter:
+                    temp_idx += 1
+                    continue
+                if w in maennliche_vornamen:
+                    partner_vornamen.append(w)
+                    partner_vornamen_indices.append(temp_idx)
+                    temp_idx += 1
+                    # Sammle weitere männliche Vornamen als Doppelname für Partner
+                    while temp_idx < len(words) and words[temp_idx] in maennliche_vornamen:
+                        partner_vornamen.append(words[temp_idx])
+                        partner_vornamen_indices.append(temp_idx)
+                        temp_idx += 1
+                    # Überspringe Anreden/Ignoriere-Wörter
+                    while temp_idx < len(words) and (words[temp_idx].lower() in anreden or words[temp_idx].lower() in ignoriere_woerter):
+                        temp_idx += 1
+                    # Weiter zum Stand suchen
+                    continue
+                elif w.lower() in stand_synonyme:
+                    # Stand gefunden, Partner-Namen zusammensetzen
+                    if partner_vornamen:
+                        partner = " ".join(partner_vornamen)
+                        # Nachname: Wort direkt nach den letzten Partner-Vornamen
+                        if partner_vornamen_indices:
+                            last_partner_idx = partner_vornamen_indices[-1]
+                            search_idx = last_partner_idx + 1
+                            
+                            # Überspringe weitere Anreden/Ignoriere-Wörter nach Partner-Vornamen
+                            while search_idx < len(words) and (words[search_idx].lower() in anreden or words[search_idx].lower() in ignoriere_woerter):
+                                search_idx += 1
+                            
+                            if search_idx < len(words):
+                                potential_nachname = words[search_idx]
+                                if (potential_nachname.lower() not in stand_synonyme and
+                                    potential_nachname.lower() not in anreden and
+                                    potential_nachname not in maennliche_vornamen and
+                                    potential_nachname not in weibliche_vornamen):
+                                    nachname = entferne_genitiv(potential_nachname)
+                    break
+                else:
+                    temp_idx += 1
+        
+        # Genitiv-Endungen von Nachnamen entfernen und Groß-/Kleinschreibung normalisieren
+        if nachname:
+            nachname = entferne_genitiv(nachname)
+            # Normalisiere: Erster Buchstabe groß, Rest wie es ist
+            if nachname:
+                nachname = nachname[0].upper() + nachname[1:] if len(nachname) > 1 else nachname.upper()
+        
+        # === BERUF ZUERST ERKENNEN (vor Stand-Fallback) ===
+        # 1. Sammle Berufe, aber NUR wenn sie in bestimmtem Kontext stehen:
+        #    - Mit Artikel davor ("der Müller")
+        #    - Mit "ein" davor ("ein Müller")
+        #    - Mehrere Berufe hintereinander (z.B. "bürger u. becker")
+        berufe_liste = []
+        
+        # 1a. Prüfe Artikel + Beruf
+        for i in range(len(words)-1):
+            if words[i].lower() in ARTIKEL:
+                if words[i+1] in BERUFE or words[i+1].lower() in [b.lower() for b in BERUFE]:
+                    if words[i+1].lower() == "becker":
+                        berufe_liste.append("Bäcker")
+                    elif words[i+1].lower() == "bürger":
+                        berufe_liste.append("Bürger")
+                    elif words[i+1].lower() == "schuemacher":
+                        berufe_liste.append("Schuhmacher")
+                    else:
+                        berufe_liste.append(words[i+1])
+        
+        # 1b. Prüfe "ein" + Beruf
+        for i in range(len(words)-1):
+            if words[i].lower() in beruf_einleitung:
+                next_word_lower = words[i+1].lower()
+                if next_word_lower not in stand_synonyme and next_word_lower not in KEINE_BERUFE:
+                    if words[i+1] in BERUFE or words[i+1].lower() in [b.lower() for b in BERUFE]:
+                        if words[i+1].lower() == "becker":
+                            berufe_liste.append("Bäcker")
+                        elif words[i+1].lower() == "bürger":
+                            berufe_liste.append("Bürger")
+                        elif words[i+1].lower() == "schuemacher":
+                            berufe_liste.append("Schuhmacher")
+                        else:
+                            berufe_liste.append(words[i+1])
+                    else:
+                        berufe_liste.append(words[i+1])
+        
+        # 1c. Prüfe auf mehrere Berufe (durch "u", "u." oder "und" getrennt)
+        # Durchlaufe words und suche nach Muster: Beruf + Verbinder + Beruf
+        i = 0
+        while i < len(words):
+            if words[i] in BERUFE or words[i].lower() in [b.lower() for b in BERUFE]:
+                # Potenzieller Beruf gefunden
+                if i + 2 < len(words) and words[i+1].lower() in ["u", "und", "undt"]:
+                    # Prüfe ob nach Verbinder auch ein Beruf kommt
+                    if words[i+2] in BERUFE or words[i+2].lower() in [b.lower() for b in BERUFE]:
+                        # Mehrere Berufe! Sammle beide
+                        if words[i].lower() == "becker":
+                            berufe_liste.append("Bäcker")
+                        elif words[i].lower() == "bürger":
+                            berufe_liste.append("Bürger")
+                        elif words[i].lower() == "schuemacher":
+                            berufe_liste.append("Schuhmacher")
+                        else:
+                            berufe_liste.append(words[i])
+                        
+                        if words[i+2].lower() == "becker":
+                            berufe_liste.append("Bäcker")
+                        elif words[i+2].lower() == "bürger":
+                            berufe_liste.append("Bürger")
+                        elif words[i+2].lower() == "schuemacher":
+                            berufe_liste.append("Schuhmacher")
+                        else:
+                            berufe_liste.append(words[i+2])
+                        i += 3
+                        continue
+            i += 1
+        
+        # 1d. Prüfe auf akademische Titel und Berufsbezeichnungen nach Nachname
+        # Pattern: Nachname, Titel und Beruf (z.B. "Seip, I.U.D. und Syndicus")
+        # Suche nach Wörtern mit Punkten (I.U.D., M., H.M., etc.) die vor "und" stehen
+        if nachname and not berufe_liste:
+            for i in range(len(words)):
+                w = words[i]
+                # Prüfe ob Wort Punkte enthält (akademischer Titel) ODER es ist ein bekannter Titel
+                # ODER es ist IUD (I.U.D. nach Punkt-Entfernung)
+                is_title = ('.' in w or 
+                           w in ['Magister', 'Doctor', 'Professor', 'Syndicus', 'Syndikus'] or
+                           w.upper() in ['IUD', 'HM', 'MD'])  # Titel ohne Punkte
+                
+                if is_title:
+                    # Sammle alle Wörter ab hier bis zu einem Stopp-Wort
+                    beruf_parts = [w]
+                    j = i + 1
+                    while j < len(words):
+                        next_w = words[j]
+                        # Stoppe bei bekannten Stopp-Wörtern
+                        if next_w.lower() in ['den', 'der', 'begraben', 'begr', 'starb', 'gestorben', 'anno', 'alters', 'alt']:
+                            break
+                        # Sammle "und"/"undt" und das folgende Wort
+                        if next_w.lower() in ['und', 'u', 'undt']:
+                            if j + 1 < len(words):
+                                beruf_parts.append(next_w)
+                                beruf_parts.append(words[j + 1])
+                                j += 2
+                            else:
+                                break
+                        else:
+                            j += 1
+                    
+                    if len(beruf_parts) > 0:
+                        berufe_liste.append(' '.join(beruf_parts))
+                        break
+        
+        # Berufe zusammenführen
+        beruf = " ".join(berufe_liste) if berufe_liste else None
+        
+        # SONDERFALL: Doppelname + Beruf → zweiter Name ist wahrscheinlich Nachname
+        # Wenn: Vorname hat 2+ Wörter UND (kein Nachname ODER Nachname ist ein Beruf) UND Beruf vorhanden
+        if vorname and ' ' in vorname and beruf:
+            nachname_ist_beruf = nachname and (nachname in BERUFE or nachname.lower() in [b.lower() for b in BERUFE])
+            if not nachname or nachname_ist_beruf:
+                teile = vorname.split()
+                if len(teile) == 2:
+                    # Prüfe ob beide Teile Vornamen sind (gleicher Gender)
+                    teil1_weiblich = teile[0] in weibliche_vornamen
+                    teil1_maennlich = teile[0] in maennliche_vornamen
+                    teil2_weiblich = teile[1] in weibliche_vornamen
+                    teil2_maennlich = teile[1] in maennliche_vornamen
+                    
+                    if (teil1_weiblich and teil2_weiblich) or (teil1_maennlich and teil2_maennlich):
+                        # Beide gleicher Gender → zweiter könnte Nachname sein
+                        vorname = teile[0]
+                        nachname = teile[1]
+        
+        # Stand
+        # WICHTIG: Prüfe auch im Original-Text (before_zitation) für Varianten wie "haußfraw"
+        # da die Bereinigung Kommas entfernt und die Struktur ändert
+        for i in range(idx, len(words)):
+            stand_prefix = ""
+            if words[i].lower() in STAND_PRAEFIXE:
+                stand_prefix = words[i] + " "
+                j = i + 1
+            elif words[i].lower() == "ein" and i + 1 < len(words) and words[i + 1].lower() in stand_synonyme:
+                stand_prefix = ""
+                j = i + 1
+            else:
+                j = i
+            
+            if j < len(words) and words[j].lower() in stand_synonyme:
+                word_lower = words[j].lower()
+                stand = STAND_MAPPING.get(word_lower, words[j].capitalize())
+                if stand_prefix:
+                    stand = stand_prefix + stand
+                idx = j + 1
+                break
+        
+        # Fallback: Suche im Original-Text nach Stand-Wörtern (inkl. Schreibvarianten)
+        # Dies fängt Fälle wie "haußfraw" ab, die durch Komma-Entfernung verloren gehen könnten
+        if not stand:
+            text_lower = after_zitation.lower()
+            for stand_key, stand_value in STAND_MAPPING.items():
+                if stand_key in text_lower:
+                    stand = stand_value
+                    break
+        
+        # === GENDER-VALIDIERUNG DES STAND ===
+        # WICHTIG: Weibliche Vornamen gehören zu weiblichen Ständen (Tochter, Wittwe)
+        #          Männliche Vornamen gehören zu männlichen Ständen (Sohn, Vater, Witwer)
+        # Wenn Stand und Vorname-Geschlecht nicht übereinstimmen, korrigiere Stand!
+        if stand and vorname:
+            stand_lower = stand.lower()
+            
+            # Definiere Gender-Paare für Stand-Korrektionen
+            stand_gender_pairs = {
+                # Weiblich ↔ Männlich
+                "tochter": "sohn",
+                "dochter": "sohn", 
+                "tochterlein": "sohnlein",
+                "töchterlein": "söhnlein",
+                "döchterlein": "söhnlein",
+                "witwe": "witwer",
+                "wittib": "wittwer",
+                "wittwe": "wittwer",
+                "witbe": "witwer",
+                "widwe": "witwer",
+                "vidua": "witwer",
+            }
+            
+            # Vertausche die Paare für Rückwärts-Lookup
+            reverse_pairs = {v: k for k, v in stand_gender_pairs.items()}
+            
+            # Identifiziere Stand-Basis (z.B. "witwe", "sohn")
+            stand_base = stand_lower.split()[-1] if ' ' in stand_lower else stand_lower
+            
+            # Bestimme das Geschlecht des erkannten Vornamens
+            vorname_is_female = ist_weiblich
+            
+            # Bestimme das Geschlecht des aktuellen Stands
+            stand_is_female = stand_base in [
+                "tochter", "dochter", "tochterlein", "töchterlein", "döchterlein",
+                "witwe", "wittib", "wittwe", "witbe", "widwe", "vidua", "hausfrau", "haußfrau"
+            ]
+            
+            # Wenn Geschlechter nicht übereinstimmen, korrigiere Stand
+            if vorname_is_female != stand_is_female:
+                # Suche den korrekten Gender-Variant
+                if stand_base in stand_gender_pairs:
+                    # Weiblich detektiert, aber Stand männlich → nutze weiblichen Stand
+                    if vorname_is_female:
+                        # Halte weiblichen Stand, ändere nichts
+                        pass
+                    else:
+                        # Männlicher Vorname, aber weiblicher Stand → ersetze mit männlichem Stand
+                        correct_stand = stand_gender_pairs[stand_base]
+                        stand = STAND_MAPPING.get(correct_stand, correct_stand.capitalize())
+                
+                elif stand_base in reverse_pairs:
+                    # Männlich detektiert, aber Stand weiblich → nutze männlichen Stand
+                    if vorname_is_female:
+                        # Weiblicher Vorname, aber männlicher Stand → ersetze mit weiblichem Stand
+                        correct_stand = reverse_pairs[stand_base]
+                        stand = STAND_MAPPING.get(correct_stand, correct_stand.capitalize())
+                    else:
+                        # Halte männlichen Stand, ändere nichts
+                        pass
+        
+        # Falls kein Stand: Setze Standard-Stand basierend auf Geschlecht
+        # Männlicher Vorname ohne Stand → "Vater"
+        # Weiblicher Vorname ohne Stand → bleibt leer (könnte ledige Person sein)
+        if not stand:
+            if vorname and not ist_weiblich:
+                # Männlicher Vorname → Standard ist "Vater"
+                stand = "Vater"
+        
+        # === PARTNER-STAND-LOGIK ===
+        if stand:
+            stand_lower = stand.lower()
+            stand_base = stand_lower.split()[-1] if ' ' in stand_lower else stand_lower
+            
+            if stand_base in PARTNER_STÄNDE:
+                # SONDERFALL: Bei Witwe/Witwer mit "weilandt/seel" im Text
+                is_witwe_pattern = stand_base in ["witwe", "wittib", "wittwe", "witbe", "widwe", "witwer", "wittwer"]
+                has_weilandt_pattern = any(w.lower() in ["weilandt", "weiland", "weyland", "seel", "seel.", "sel", "sel.", "seelig"] for w in words)
+                
+                if is_witwe_pattern and has_weilandt_pattern:
+                    # Bei diesem Muster bleibt der Vorname erhalten (ist eigener Name)
+                    # AUSNAHME: Wenn der erkannte Vorname männlich ist, ist er der Partner!
+                    # Wenn Partner bereits erkannt wurde (z.B. durch frühe Partner-Erkennung),
+                    # behalte ihn bei und suche nur nach Nachname
+                    
+                    # SONDERFALL: Männlicher Vorname bei Witwe/weiland → Partner!
+                    if vorname and not ist_weiblich and not partner:
+                        # Der erkannte "Vorname" ist eigentlich der Partner
+                        partner = vorname
+                        vorname = None
+                    
+                    # Suche die Position von weilandt/seel (immer, auch wenn partner schon gesetzt)
+                    weilandt_idx = -1
+                    for i, w in enumerate(words):
+                        if w.lower() in ["weilandt", "weiland", "weyland", "seel", "seel.", "sel", "sel.", "seelig"]:
+                            weilandt_idx = i
+                            break
+                    
+                    if not partner and weilandt_idx >= 0:
+                        # Suche NACH weilandt/seel nach Partner
+                        j = weilandt_idx + 1
+                        # Überspringe Anreden nach weilandt/seel
+                        while j < len(words) and words[j].lower() in ["herrn", "hern", "herr", "h", "h."] + [w.lower() for w in ignoriere_woerter]:
+                            j += 1
+                        
+                        # Partner-Vorname (evtl. in Genitiv)
+                        if j < len(words) and words[j] in maennliche_vornamen:
+                            partner_vorname = words[j]
+                            # Entferne Genitiv-Endungen (-s, -is)
+                            if partner_vorname.endswith('is') and len(partner_vorname) > 3:
+                                partner_vorname = partner_vorname[:-2]
+                            elif partner_vorname.endswith('s') and len(partner_vorname) > 2:
+                                if partner_vorname[-2] not in 'aeiouäöü':
+                                    partner_vorname = partner_vorname[:-1]
+                            
+                            # Partner-Nachname (auch in Genitiv)
+                            if j + 1 < len(words):
+                                partner_nachname = words[j + 1]
+                                # Entferne Genitiv-Endungen
+                                if partner_nachname.endswith('is') and len(partner_nachname) > 3:
+                                    partner_nachname = partner_nachname[:-2]
+                                    nachname = partner_nachname
+                                elif partner_nachname.endswith('s') and len(partner_nachname) > 2:
+                                    if partner_nachname[-2] not in 'aeiouäöü':
+                                        partner_nachname = partner_nachname[:-1]
+                                        nachname = partner_nachname
+                                    else:
+                                        nachname = partner_nachname
+                                else:
+                                    nachname = partner_nachname
+                            
+                            if not partner:  # NUR wenn Partner noch nicht gesetzt
+                                partner = partner_vorname
+                        else:
+                            # ALTERNATIVE: Wenn nach weilandt/seel nichts gefunden, suche VOR weilandt/seel
+                            # Dies ist der Fall bei "Catharina, Jost Diderichs selig verlassen Witwe"
+                            # Gehe rückwärts von weilandt_idx und suche männlichen Vornamen
+                            if not partner:  # NUR wenn Partner noch nicht gesetzt
+                                for k in range(weilandt_idx - 1, -1, -1):
+                                    if words[k] in maennliche_vornamen:
+                                        partner = words[k]
+                                        # Prüfe auf Nachname nach dem Partner-Vornamen
+                                        if k + 1 < weilandt_idx:
+                                            next_word = words[k + 1]
+                                            if next_word.lower() not in [w.lower() for w in ignoriere_woerter]:
+                                                nachname = entferne_genitiv(next_word)
+                                        break
+                else:
+                    # NEUE LOGIK: Prüfe Geschlecht der Vornamen
+                    # Bei Tochter mit weiblichen Vornamen = eigener Name (KEINE Partner-Logik!)
+                    # Bei Tochter mit männlichen Vornamen = Vater-Name (Partner-Logik!)
+                    # Bei Sohn generell = Vater-Name (Partner-Logik!), außer explizit anders markiert
+                    is_tochter = stand_base in ["tochter", "dochter", "töchterlein", "döchterlein"]
+                    is_sohn = stand_base in ["sohn", "son", "söhnlein", "sohnlein"]
+                    
+                    apply_partner_logic = True  # Standard: Partner-Logik
+                    
+                    if is_tochter and ist_weiblich:
+                        # AUSNAHME: Tochter mit weiblichem Vornamen → Das ist die Tochter selbst!
+                        apply_partner_logic = False
+                    
+                    if apply_partner_logic:
+                        # SONDERFALL bei Sohn: Wenn bereits Vorname UND Nachname gesetzt sind,
+                        # suche nach weiterem männlichen Vornamen (= Vater)
+                        # Pattern: "Just Roder, Caspar Roders Sohn"
+                        sohn_special_case = False  # Flag für Sohn-Sonderfall
+                        if is_sohn and vorname and nachname and not partner:
+                            # Suche nach männlichem Vornamen NACH dem bereits erkannten Vornamen
+                            for i in range(len(words)):
+                                w = words[i]
+                                # Überspringe den bereits erkannten Vornamen
+                                if w == vorname:
+                                    continue
+                                # Suche weiteren männlichen Vornamen
+                                if w in maennliche_vornamen:
+                                    partner = w
+                                    sohn_special_case = True  # Merke dass Sohn-Sonderfall zutrifft
+                                    # Suche nach Partner-Nachname im Genitiv nach dem Partner-Vornamen
+                                    # Finde Position des Partners
+                                    partner_idx = i
+                                    if partner_idx + 1 < len(words):
+                                        next_word = words[partner_idx + 1]
+                                        # Prüfe ob es ein Nachname sein könnte (endet auf 's' = Genitiv)
+                                        if (next_word.endswith('s') and 
+                                            next_word.lower() not in stand_synonyme and
+                                            next_word.lower() not in ignoriere_woerter and
+                                            next_word not in maennliche_vornamen):
+                                            # Entferne Genitiv-s vom Partner-Nachname
+                                            partner_nachname = entferne_genitiv(next_word)
+                                            # Verwende Partner-Nachname nur wenn er vom eigenen Nachname abweicht
+                                            # oder überschreibe wenn eigener Nachname leer war
+                                            if not nachname or nachname != partner_nachname:
+                                                # Eigener Nachname bleibt, aber wir haben Info über Vater
+                                                pass  # Nachname bleibt wie er ist
+                                    break
+                        
+                        # Der erkannte Name gehört zum Partner/Vater/Mutter
+                        # Bei ALLEN Partner-Ständen: Partner = nur Vorname(n)
+                        # Nachname ist Familienname und bleibt erhalten
+                        partner_bereits_gesetzt = bool(partner)  # Merke ob Partner bereits gesetzt war
+                        
+                        if not partner:  # NUR wenn Partner noch nicht gesetzt
+                            if vorname:
+                                partner = vorname
+                            elif nachname:
+                                partner = nachname
+                        
+                        # NUR Vorname löschen wenn Partner aus Vorname gesetzt wurde
+                        # AUSNAHME: Bei Sohn-Sonderfall (eigener Vorname + Vater-Vorname) bleibt Vorname erhalten!
+                        # Wenn Partner bereits durch frühe Partner-Erkennung gesetzt war, Vorname behalten!
+                        if not partner_bereits_gesetzt and not sohn_special_case:
+                            vorname = None
+        
+        # SONDERFALL: Hausfrau/Witwe mit männlichem Vornamen UND Genitiv-Namen
+        # Pattern: [Frauen-Vorname] [Männer-Vorname] [Männer-Nachname-Genitiv] [Hausfrau]
+        # Beispiel: "Barbara Herman Hunoltts Hausfraw"
+        # → Erkennung: Barbara (Vorname), Herman (Partner), Hunoltt (Nachname)
+        weibliche_stände = ["hausfrau", "haußfrau", "wittwe", "wittib", "wittwe", "witbe", "widwe"]
+        
+        if stand and stand.lower() in weibliche_stände and vorname and ist_weiblich:
+            # Bei Hausfrau-Muster: Re-erkenne Partner und Nachname
+            # WICHTIGES Muster: [Weiblicher Vorname] [Männlicher Vorname = Partner] [Nachname-Genitiv]
+            
+            # Starten nach dem Vorname
+            search_start = vorname_start_idx + 1
+            
+            # Überspringe weitere weibliche Vornamen (falls Doppelname der Frau)
+            while search_start < len(words) and words[search_start] in weibliche_vornamen:
+                search_start += 1
+            
+            # Überspringe Ignoriere-Wörter
+            while search_start < len(words) and words[search_start].lower() in ignoriere_woerter:
+                search_start += 1
+            
+            # Nächstes Wort prüfen:
+            if search_start < len(words):
+                next_word = words[search_start]
+                
+                # FALL 1: Männlicher Vorname → Das ist der Partner (Ehemann)!
+                if next_word in maennliche_vornamen:
+                    partner = next_word
+                    search_start += 1
+                    
+                    # Sammle weitere männliche Vornamen als Doppelname des Partners
+                    while search_start < len(words) and words[search_start] in maennliche_vornamen:
+                        partner += " " + words[search_start]
+                        search_start += 1
+                    
+                    # Überspringe Ignoriere-Wörter
+                    while search_start < len(words) and words[search_start].lower() in ignoriere_woerter:
+                        search_start += 1
+                    
+                    # Nächstes Wort = Nachname (im Genitiv)
+                    if search_start < len(words):
+                        potential_nachname = words[search_start]
+                        if (potential_nachname.lower() not in stand_synonyme and
+                            potential_nachname.lower() not in anreden and
+                            potential_nachname.lower() not in ort_prae and
+                            not potential_nachname.isdigit()):
+                            # Das ist der Nachname (im Genitiv)
+                            nachname = entferne_genitiv(potential_nachname)
+                
+                # FALL 2: Kein männlicher Vorname, aber Genitiv-Name → Alter Logik (Nachname dann Partner)
+                elif (next_word.lower() not in stand_synonyme and
+                      next_word.lower() not in anreden and
+                      next_word.lower() not in ort_prae and
+                      not next_word.isdigit()):
+                    # Das könnte Nachname sein
+                    nachname = next_word
+                    search_start += 1
+                    
+                    # Überspringe Ignoriere-Wörter
+                    while search_start < len(words) and words[search_start].lower() in ignoriere_woerter:
+                        search_start += 1
+                    
+                    # Nächstes Wort = Partner-Nachname (Genitiv)
+                    if search_start < len(words):
+                        potential_partner = words[search_start]
+                        has_genitiv = (
+                            (potential_partner.endswith('s') and len(potential_partner) > 2) or
+                            (potential_partner.endswith('en') and len(potential_partner) > 3) or
+                            (potential_partner.endswith('tts') and len(potential_partner) > 4)
+                        )
+                        
+                        if has_genitiv and potential_partner.lower() not in stand_synonyme:
+                            partner = potential_partner  # Wird später durch entferne_genitiv bearbeitet
+        
+        # FALLBACK: Wenn Hausfrau aber kein Partner gefunden, suche rückwärts
+        if stand and stand.lower() in weibliche_stände and vorname and not partner:
+            # idx wurde nach Stand-Erkennung gesetzt, also idx-1 ist der Index NACH dem Stand-Wort
+            # Wir suchen von idx-2 rückwärts (den Stand-Wort überspringend)
+            
+            # Finde den Index des Stand-Wortes
+            stand_idx = idx - 1  # idx wurde auf j+1 gesetzt nach Stand-Erkennung
+            
+            # Rückwärts-Suche: ONLY von Stand-Wort bis zum Anfang
+            # (nicht über den Stand hinaus, wo andere Verben/Wörter stehen)
+            for i in range(stand_idx - 1, -1, -1):
+                w = words[i]
+                # Prüfe ob es ein potenzieller Genitiv-Name ist (endet auf Genitiv-Endung)
+                has_genitiv = (
+                    (w.endswith('s') and len(w) > 2) or
+                    (w.endswith('en') and len(w) > 3) or
+                    (w.endswith('tts') and len(w) > 4)
+                )
+                
+                if has_genitiv and w.lower() not in stand_synonyme and w not in anreden and w != nachname:
+                    # Das könnte Partner-Nachname sein (wird später durch entferne_genitiv bearbeitet)
+                    partner = w  # NICHT entferne_genitiv hier - wird am Ende einmal aufgerufen!
+                    break
+        
+        # SONDERFALL: Vorname NACH dem Stand (z.B. "töchterlein ... Anna Maria" oder "Wittib Elisabetha")
+        # Suche nach weiblichen Vornamen nach dem Stand für Tochter- und Witwe-Fälle
+        if stand and not vorname:
+            stand_lower = stand.lower()
+            stand_base = stand_lower.split()[-1] if ' ' in stand_lower else stand_lower
+            is_tochter = stand_base in ["tochter", "dochter", "tochterlein", "töchterlein", "döchterlein"]
+            is_witwe = stand_base in ["witwe", "wittib", "wittwe", "witbe", "widwe"]
+            
+            if is_tochter or is_witwe:
+                # Suche nach weiblichen Vornamen NACH dem Stand
+                for i in range(len(words)):
+                    if words[i].lower() in stand_synonyme:
+                        # Stand gefunden, suche danach nach weiblichen Vornamen
+                        j = i + 1
+                        # Überspringe "von X. Jahren" etc.
+                        while j < len(words) and (words[j].lower() in ["von", "von der"] or words[j].isdigit() or words[j].lower() in ["jahren", "jahr"]):
+                            j += 1
+                        
+                        # Prüfe auf weibliche Vornamen
+                        if j < len(words) and words[j] in weibliche_vornamen:
+                            vorname = words[j]
+                            j += 1
+                            # Doppelname
+                            if j < len(words) and words[j] in weibliche_vornamen:
+                                vorname += " " + words[j]
+                            break
+        
+        # FALLBACK: Witwe/Hausfrau OHNE erkannte Vornamen (nicht in Listen)
+        # Pattern: [Name1] [Name2] [Nachname-Genitiv] [Präfix] [Witwe/Hausfrau]
+        # Beispiel: "Eyda, Werner Scherers hinterlassene Wittwe"
+        # → vorname: Eyda, partner: Werner, nachname: Scherer
+        if stand and not vorname and not partner:
+            stand_lower = stand.lower()
+            stand_base = stand_lower.split()[-1] if ' ' in stand_lower else stand_lower
+            is_witwe_hausfrau = stand_base in ["witwe", "wittib", "wittwe", "witbe", "widwe", "hausfrau", "haußfrau"]
+            
+            if is_witwe_hausfrau:
+                # Finde Position des Stands in words
+                stand_idx = -1
+                for i in range(len(words)):
+                    if words[i].lower() in stand_synonyme:
+                        stand_idx = i
+                        break
+                
+                if stand_idx >= 3:  # Brauchen mindestens 3 Wörter davor: [Name1] [Name2] [Genitiv]
+                    # Gehe rückwärts vom Stand
+                    # Überspringe Präfixe wie "hinterlassene", "verlassene"
+                    check_idx = stand_idx - 1
+                    while check_idx >= 0 and words[check_idx].lower() in STAND_PRAEFIXE:
+                        check_idx -= 1
+                    
+                    # Jetzt sollte check_idx auf einem Genitiv-Namen zeigen
+                    if check_idx >= 0:
+                        potential_genitiv = words[check_idx]
+                        has_genitiv = (
+                            (potential_genitiv.endswith('s') and len(potential_genitiv) > 2) or
+                            (potential_genitiv.endswith('en') and len(potential_genitiv) > 3) or
+                            (potential_genitiv.endswith('tts') and len(potential_genitiv) > 4)
+                        )
+                        
+                        if has_genitiv and potential_genitiv.lower() not in stand_synonyme:
+                            # Das ist wahrscheinlich der Nachname (im Genitiv)
+                            nachname = entferne_genitiv(potential_genitiv)
+                            check_idx -= 1
+                            
+                            # Nächstes Wort rückwärts = Partner-Vorname
+                            if check_idx >= 0:
+                                partner = words[check_idx]
+                                check_idx -= 1
+                                
+                                # Nächstes Wort rückwärts = Vorname der Witwe
+                                if check_idx >= 0:
+                                    vorname = words[check_idx]
+                                    ist_weiblich = True  # Witwe ist immer weiblich
+        
+        # Ort
+        for i in range(idx, len(words)):
+            if i + 1 < len(words) and words[i].lower() == "in" and words[i+1].lower() == "der":
+                if i + 2 < len(words):
+                    ort = words[i+2]
+                    idx = i + 3
+                    break
+            elif words[i].lower() in ort_prae:
+                if i + 1 < len(words):
+                    potential_ort = words[i+1]
+                    # Prüfe ob es keine Zahl ist (z.B. "von 25 jahr")
+                    if not potential_ort.isdigit():
+                        ort = potential_ort
+                        idx = i + 2
+                    break
+        
+        # Genitiv-Endungen von Partner-Namen entfernen
+        if partner:
+            partner = entferne_genitiv(partner)
+        
+        # === RESTORE ORIGINAL CASE ===
+        # Erstelle ein Mapping von kapitalisierter → Original-Case
+        def restore_original_case(value, words_cap, words_orig):
+            """Ersetze kapitalisierte Wörter mit ihrer Original-Schreibweise."""
+            if not value:
+                return value
+            
+            result_parts = []
+            value_words = value.split()
+            
+            for vw in value_words:
+                # Finde das Wort in der kapitalizierten Liste
+                found = False
+                for i, cw in enumerate(words_cap):
+                    if cw == vw:
+                        # Verwende die Original-Schreibweise
+                        result_parts.append(words_orig[i])
+                        words_cap = words_cap[:i] + words_cap[i+1:]
+                        words_orig = words_orig[:i] + words_orig[i+1:]
+                        found = True
+                        break
+                
+                if not found:
+                    # Nicht gefunden (z.B. nach Genitiv-Entfernung), verwende wie-es-ist
+                    result_parts.append(vw)
+            
+            return " ".join(result_parts)
+        
+        # Wende Original-Case auf vorname, nachname, partner an
+        if vorname:
+            vorname = restore_original_case(vorname, words.copy(), words_original_case.copy())
+        if nachname:
+            nachname = restore_original_case(nachname, words.copy(), words_original_case.copy())
+        if partner:
+            partner = restore_original_case(partner, words.copy(), words_original_case.copy())
+
+        # Ergebnisse in result-Dict speichern
+        result['vorname'] = vorname
+        result['nachname'] = nachname
+        result['partner'] = partner
+        result['beruf'] = beruf
+        result['stand'] = stand
+        result['ort'] = ort
+        
+        # === ALTERS-EXTRAKTION UND GEBURTSJAHR-BERECHNUNG ===
+        # Pattern für Altersangaben: "aetat[is|isis]? \d+", "aet. \d+", "alt[er[s]]? \d+ jahr", "anno aetatis \d+"
+        # Beispiele: "aetatis 1. jahr", "aet. 72", "aetatisis anno 74", "alt 29 ann", "alter 76 jahr", "alters 20 anni"
+        # Flexibel: erlaubt "aetat", "aet.", "aetat anno", "anno aetatis", "aetatis", "aetatisis anno", "alt", "alter", "alters", etc.
+        # Zeiteinheiten: jahr, ann/anni (Jahr), wochen, tag, monat, mens/mensis (Monat)
+        alter_jahre = None
+        geb_jahr_gesch = None
+        
+        alter_pattern = r'(?:aetat(?:is|isis)?|aet\.?|alters?)\s*(?:anno)?\s*(?:aetatis(?:is)?)?\s*[.:]*\s*(\d+)(?:[.,]?\s*(\d+)?)?\s*(?:jahr|ann(?:i)?|wochen|tag|monat|mens(?:is)?)?'
+        
+        # Suche im gesamten Text (nicht nur after_zitation)
+        alter_match = re.search(alter_pattern, text, re.IGNORECASE)
+        if alter_match:
+            alter_jahre = int(alter_match.group(1))
+            
+            # Berechne geschätztes Geburtsjahr wenn Todesdatum vorhanden
+            if result.get('todestag') and alter_jahre is not None:
+                try:
+                    # Extrahiere Jahr aus Todesdatum (Format: YYYY.MM.DD oder YYYY MM DD)
+                    jahr_match = re.match(r'(\d{4})', result['todestag'])
+                    if jahr_match:
+                        todes_jahr = int(jahr_match.group(1))
+                        geb_jahr_gesch = todes_jahr - alter_jahre
+                except (ValueError, AttributeError):
+                    pass
+        
+        result['geb_jahr_gesch'] = geb_jahr_gesch
+        
+        return result
+
     def _run_recognition_selected(self):
         """Führt die strukturierte Erkennung für die ausgewählten Datensätze im Datenbank-Tab durch (unterscheidet Typ Begräbnis/Hochzeit)."""
         import re
@@ -140,10 +1845,19 @@ class KarteikartenGUI:
             messagebox.showwarning("Keine Auswahl", "Bitte wählen Sie mindestens einen Eintrag aus der Liste aus.")
             return
 
+        # Progressbar initialisieren
+        total = len(selection)
+        self.db_progress['maximum'] = total
+        self.db_progress['value'] = 0
+
         errors = []
         updated = 0
         unrecognized_words = set()  # Sammlung aller nicht erkannten Wörter
-        for item in selection:
+        for idx, item in enumerate(selection):
+            # Progressbar aktualisieren
+            self.db_progress['value'] = idx
+            self.root.update_idletasks()
+            
             values = self.tree.item(item)['values']
             record_id = values[0]
             typ = values[4] if len(values) > 4 else None
@@ -156,397 +1870,61 @@ class KarteikartenGUI:
             text = row[0]
 
             # --- Begräbnis-Erkennung ---
-            # DEBUG: Testfall Jonas Palleroths hinterl. Sohn ...
-            if (
-                text.strip().startswith("ev. Kb. Wetzlar ⚰ 1694.04.27 p. 1 Nr. 12 Jonas Palleroths hinterl. Sohn begr.a:23. Apr, alt 27ann. 1694 B21.5.57")
-                or text.strip().startswith("Ann Engel Schülerin begraben d. 4. Febr.alters 58 jahr 71698 R")
-                or (typ and typ.lower().startswith("begr"))
-            ):
-                # 1. Zitation am Anfang erkennen (ev. Kb. Wetzlar ⚰ 1698.02.04 p. 114 Nr. 6 ...)
-                # Erlaubt: Punkte/Leerzeichen variabel, Zahlen unterschiedlich, Stopwörter: Text, begraben, begr., begr
-                # Pattern erlaubt: p.2, p 2, p. 2, Nr.10, Nr 10, Nr. 10
-                zitation_pattern = r"^(ev\.\s*Kb\.\s*Wetzlar)?[ .]*[⚰\u26B0]?[ .]*(\d{4}[ .]?\d{2}[ .]?\d{2})[ .]*p\.?[ .]?(\d+)[ .]*Nr\.?[ .]?(\d+)[ .]*"
-                stopwords = ["Text", "begraben", "begr.", "begr ", "Begr.", "Begr "]
-                # Suche das Ende der Zitation
-                stop_idx = len(text)
-                for sw in stopwords:
-                    idx = text.lower().find(sw.lower())
-                    if idx != -1 and idx < stop_idx:
-                        stop_idx = idx
-                zitation_text = text[:stop_idx]
-                rest_text = text[stop_idx:]
-                # Zitation extrahieren
-                m = re.match(zitation_pattern, zitation_text)
-                vorname = nachname = partner = beruf = stand = todestag = ort = None
+            # Verwende zentrale Erkennungsfunktion für konsistente Ergebnisse
+            if (typ and typ.lower().startswith("begr")) or '⚰' in text or '\u26B0' in text:
+                # Nutze zentrale Begräbnis-Extraktion (gleiche Logik wie OCR-Tab)
+                fields = self._extract_burial_fields(text)
                 
-                # DEBUG: Ausgabe für Debugging
-                print(f"DEBUG: zitation_text = {repr(zitation_text[:100])}")
-                print(f"DEBUG: Pattern matched = {m is not None}")
+                vorname = fields['vorname']
+                nachname = fields['nachname']
+                partner = fields['partner']
+                beruf = fields['beruf']
+                stand = fields['stand']
+                todestag = fields['todestag']
+                ort = fields['ort']
+                geb_jahr_gesch = fields.get('geb_jahr_gesch')
                 
-                if m:
-                    # Zitation gefunden, restlicher Text nach Zitation
-                    print(f"DEBUG: Match end position = {m.end()}")
-                    print(f"DEBUG: Matched part = {repr(zitation_text[:m.end()])}")
-                    after_zitation = zitation_text[m.end():].strip()
-                else:
-                    after_zitation = zitation_text.strip()
-                
-                print(f"DEBUG: after_zitation = {repr(after_zitation)}")
-
-                # 2. Wörter nach Zitation in Liste splitten (bis zum Stopwort)
-                words = re.split(r"[ ,.;\n\r]+", after_zitation)
-                words = [w for w in words if w]
-                print(f"DEBUG: words = {words}")
-
-                # Verwende importierte Listen aus extraction_lists.py
-                weibliche_vornamen = WEIBLICHE_VORNAMEN
-                maennliche_vornamen = MAENNLICHE_VORNAMEN
-                stand_synonyme = STAND_SYNONYME
-                ort_prae = ORTS_PRAEPOSITIONEN
-                beruf_einleitung = BERUFS_EINLEITUNG
-                anreden = ANREDEN
-                ignoriere_woerter = IGNORIERE_WOERTER
-                
-                # Hilfsfunktion: Prüfe ob "frau" als Anrede zu behandeln ist
-                def ist_frau_anrede(idx_aktuell):
-                    """Prüft ob 'frau' an aktueller Position eine Anrede ist (vor Namen)."""
-                    if idx_aktuell >= len(words) or words[idx_aktuell].lower() != "frau":
-                        return False
-                    # 'frau' ist Anrede wenn danach ein Vorname oder potentieller Nachname folgt
-                    if idx_aktuell + 1 < len(words):
-                        next_word = words[idx_aktuell + 1]
-                        # Ist nächstes Wort ein Vorname?
-                        if next_word in weibliche_vornamen or next_word in maennliche_vornamen:
-                            return True
-                        # Ist nächstes Wort kein Stand-Wort? Dann vermutlich Nachname
-                        if next_word.lower() not in stand_synonyme:
-                            return True
-                    return False
-                
-                # Extraktion
-                idx = 0
-                vorname_start_idx = -1  # Position wo Vorname gefunden wurde
-                used_words = set()  # Tracke welche Wörter verwendet wurden
-                
-                # Sonderfall 1a: "Herr [männl. Vorname(n)] [Nachname] hinterlassene Wittib/Wittwe" = Witwe des genannten Mannes
-                # Beispiel: "Herr Hans Conrad Verdriessen hinterlassene Wittib" → Partner: Hans Conrad, Nachname: Verdriessen, Stand: Wittwe
-                idx_check = 0
-                hinterlassene_wittwe_pattern = False
-                if idx_check < len(words) and words[idx_check].lower() in anreden:
-                    # Schaue voraus ob "hinterlassene" + Wittwe/Wittib im Text vorkommt (erweiterte Reichweite)
-                    for k in range(idx_check + 1, min(len(words), idx_check + 8)):
-                        if words[k].lower() in ["hinterlassene", "hinterlassen"]:
-                            # Prüfe ob danach Wittwe/Wittib kommt
-                            if k + 1 < len(words) and words[k + 1].lower() in ["wittib", "wittwe", "witwe", "witbe"]:
-                                hinterlassene_wittwe_pattern = True
-                                print(f"DEBUG 1a: hinterlassene_wittwe_pattern erkannt bei Position {k}")
-                                break
-                    
-                    print(f"DEBUG 1a: Anrede '{words[idx_check]}' gefunden, hinterlassene_wittwe_pattern={hinterlassene_wittwe_pattern}")
-                    
-                    if hinterlassene_wittwe_pattern and idx_check + 1 < len(words):
-                        print(f"DEBUG 1a: Nächstes Wort: '{words[idx_check + 1]}', ist männlicher Vorname: {words[idx_check + 1] in maennliche_vornamen}")
-                        
-                        if words[idx_check + 1] in maennliche_vornamen:
-                            # Sammle männliche Vornamen (kann Doppelname sein: Hans Conrad)
-                            partner_vornamen = []
-                            j = idx_check + 1
-                            while j < len(words) and words[j] in maennliche_vornamen:
-                                partner_vornamen.append(words[j])
-                                print(f"DEBUG 1a: Vorname hinzugefügt: '{words[j]}'")
-                                j += 1
-                            
-                            # Nächstes Wort sollte Nachname sein
-                            if j < len(words) and words[j] not in maennliche_vornamen + weibliche_vornamen and words[j].lower() not in stand_synonyme:
-                                partner = " ".join(partner_vornamen)
-                                nachname = words[j]
-                                vorname = None  # Kein Vorname für die Witwe
-                                vorname_start_idx = -1
-                                idx = j + 1
-                                print(f"DEBUG 1a: ERFOLG - Partner: '{partner}', Nachname: '{nachname}'")
-                                # Überspringe "hinterlassene"
-                                while idx < len(words) and words[idx].lower() in ignoriere_woerter:
-                                    idx += 1
-                
-                # Sonderfall 1b: "Herrn [männl. Vorname] [Nachname] [Stand]" = Kind/Angehöriger
-                # Beispiel: "Herrn Theophili Haupt tochterlein" → Partner: Theophilus, Nachname: Haupt, Stand: Töchterlein
-                # Der männliche Vorname (oft im Genitiv) ist der Vater/Ehemann, nicht das Subjekt
-                if not nachname:  # Nur wenn nicht bereits durch Sonderfall 1a behandelt
-                    idx_check = 0
-                    if idx_check < len(words) and words[idx_check].lower() in anreden:
-                        if idx_check + 1 < len(words) and words[idx_check + 1] in maennliche_vornamen:
-                            if idx_check + 2 < len(words):
-                                # Prüfe ob danach ein Nachname (kein Vorname, kein Stand-Wort) kommt
-                                potential_nachname = words[idx_check + 2]
-                                if potential_nachname not in weibliche_vornamen + maennliche_vornamen and potential_nachname.lower() not in stand_synonyme:
-                                    # Dies ist das Muster: Herrn [Vater] [Nachname] [Stand]
-                                    partner_raw = words[idx_check + 1]
-                                    # Entferne Genitiv-Endung (i, ii, is, us → us)
-                                    if partner_raw.endswith("i") and partner_raw not in ["Antoni", "Antonii"]:
-                                        # Theophili → Theophilus
-                                        partner = partner_raw[:-1] + "us"
-                                    elif partner_raw.endswith("ii"):
-                                        partner = partner_raw[:-2] + "us"
-                                    else:
-                                        partner = partner_raw
-                                    
-                                    nachname = potential_nachname
-                                    idx = idx_check + 3
-                                    vorname = None  # Kein Vorname für das Kind/den Angehörigen
-                                    vorname_start_idx = -1
-                
-                # Sonderfall 2: Vorname suchen (nur wenn nicht bereits durch Sonderfall 1 behandelt)
-                if not nachname:  # Nur wenn noch kein Nachname gesetzt
-                    idx = 0
-                    # Vorname: erstes Wort, das in Vornamenlisten ist
-                    while idx < len(words):
-                        w = words[idx]
-                        if w in weibliche_vornamen or w in maennliche_vornamen:
-                            vorname_start_idx = idx  # Merke Position des Vornamens
-                            vorname = w
-                            used_words.add(idx)
-                            idx += 1
-                            # Prüfe auf Doppelnamen (z.B. Ann Engel, Hans George)
-                            if idx < len(words) and words[idx] in weibliche_vornamen + maennliche_vornamen:
-                                vorname += " " + words[idx]
-                                used_words.add(idx)
-                                idx += 1
-                            # Überspringe zu ignorierende Wörter (seel, sel., etc.)
-                            while idx < len(words) and words[idx].lower() in ignoriere_woerter:
-                                used_words.add(idx)
-                                idx += 1
-                            break
-                        idx += 1
-                
-                # Sonderfall 3: Nachname steht VOR Vorname (z.B. "Müller Anna ein Medtgen")
-                # Wenn Vorname nicht am Anfang steht (idx > 0), ist das erste Wort der Nachname
-                # ABER: Nicht wenn das erste Wort Teil der Zitation ist (ev., Kb., p., Nr., etc.)
-                zitation_woerter = ["ev", "ev.", "kb", "kb.", "wetzlar", "p", "p.", "nr", "nr.", "text"]
-                if vorname and vorname_start_idx > 0:
-                    first_word_lower = words[0].lower().rstrip('.')
-                    # Nur als Nachname setzen wenn es KEIN Zitation-Wort ist
-                    if first_word_lower not in zitation_woerter:
-                        nachname = words[0]
-                        used_words.add(0)
-                    # Bereits Nachname gesetzt oder übersprungen, überspringe normale Nachname-Erkennung
-                
-                # Wenn noch kein Nachname gesetzt, normale Nachname-Erkennung
-                if vorname and not nachname:
-                    # Bei weiblichem Vornamen: Spezialbehandlung für Partner
-                    if any(v in vorname for v in weibliche_vornamen):
-                        # Suche nach "Herrn" oder "Herr"
-                        if idx < len(words) and words[idx].lower() in anreden:
-                            idx += 1  # Überspringe Anrede
-                            # Nächstes Wort sollte männlicher Vorname sein
-                            if idx < len(words) and words[idx] in maennliche_vornamen:
-                                partner = words[idx]
-                                idx += 1
-                                # Nächstes Wort ist Nachname (evtl. Genitiv mit 's' am Ende)
-                                if idx < len(words):
-                                    nachname_raw = words[idx]
-                                    # Entferne Genitiv-s wenn vorhanden
-                                    if nachname_raw.endswith("s") and len(nachname_raw) > 2:
-                                        nachname = nachname_raw[:-1]
-                                    else:
-                                        nachname = nachname_raw
-                                    idx += 1
-                            # Fahre mit Stand-Erkennung fort
-                        else:
-                            # Normaler Fall: Nachname nach Vorname
-                            while idx < len(words):
-                                w = words[idx]
-                                # Überspringe Anreden und zu ignorierende Wörter
-                                if w.lower() in anreden or w.lower() in ignoriere_woerter:
-                                    idx += 1
-                                    continue
-                                # Artikel: Nur überspringen wenn KEIN Beruf folgt ("der Schreiner" = Beruf!)
-                                if w.lower() in ARTIKEL:
-                                    if idx + 1 < len(words) and words[idx + 1] in BERUFE:
-                                        # "der Schreiner" -> kein Nachname, wird später als Beruf erkannt
-                                        break
-                                    else:
-                                        # Normaler Artikel ohne Beruf -> überspringen
-                                        idx += 1
-                                        continue
-                                # Spezialfall: "frau" nur überspringen wenn es Anrede ist (vor Namen)
-                                if w.lower() == "frau" and ist_frau_anrede(idx):
-                                    idx += 1
-                                    continue
-                                if w.lower() not in [s.lower() for s in stand_synonyme] and w.lower() not in ort_prae and w.lower() not in beruf_einleitung:
-                                    nachname = w
-                                    idx += 1
-                                    # Überspringe zu ignorierende Wörter
-                                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
-                                        idx += 1
-                                    break
-                                idx += 1
-                            # Partner: falls nach weiblichem Vornamen ein männlicher Vorname folgt
-                        if idx < len(words) and words[idx] in maennliche_vornamen:
-                            partner = words[idx]
-                            idx += 1
-                            # Partner-Nachname
-                            if idx < len(words):
-                                partner += " " + words[idx]
-                                idx += 1
-                            # Überspringe zu ignorierende Wörter
-                            while idx < len(words) and words[idx].lower() in ignoriere_woerter:
-                                idx += 1
-                    else:
-                        # Männlicher Vorname: normale Nachname-Erkennung
-                        while idx < len(words):
-                            w = words[idx]
-                            # Überspringe Anreden
-                            if w.lower() in anreden:
-                                idx += 1
-                                continue
-                            # Artikel: Nur überspringen wenn KEIN Beruf folgt ("der Schreiner" = Beruf!)
-                            if w.lower() in ARTIKEL:
-                                if idx + 1 < len(words) and words[idx + 1] in BERUFE:
-                                    # "der Schreiner" -> kein Nachname, wird später als Beruf erkannt
-                                    break
-                                else:
-                                    # Normaler Artikel ohne Beruf -> überspringen
-                                    idx += 1
-                                    continue
-                            # Spezialfall: "frau" nur überspringen wenn es Anrede ist (vor Namen)
-                            if w.lower() == "frau" and ist_frau_anrede(idx):
-                                idx += 1
-                                continue
-                            if w.lower() not in [s.lower() for s in stand_synonyme] and w.lower() not in ort_prae and w.lower() not in beruf_einleitung:
-                                nachname = w
-                                idx += 1
-                                # Überspringe Wörter aus ignoriere_woerter Liste
-                                while idx < len(words) and words[idx].lower() in ignoriere_woerter:
-                                    idx += 1
-                                break
-                            idx += 1
-                # Stand: nächstes Wort, das in Stand-Synonymen ist, ggf. mit Präfix davor
-                # Präfixe: "hinterlassener", "ein" (bei "ein Medtgen", "ein Kind"), etc.
-                for i in range(idx, len(words)):
-                    # Prüfe auf Stand-Präfixe
-                    stand_prefix = ""
-                    if words[i].lower() in STAND_PRAEFIXE:
-                        stand_prefix = words[i] + " "
-                        j = i + 1
-                    # Prüfe auf "ein" + Stand-Synonym (z.B. "ein Medtgen")
-                    elif words[i].lower() == "ein" and i + 1 < len(words) and words[i + 1].lower() in stand_synonyme:
-                        stand_prefix = ""  # "ein" nicht als Präfix übernehmen
-                        j = i + 1
-                    else:
-                        j = i
-                    # Stand-Synonym prüfen
-                    if j < len(words) and words[j].lower() in stand_synonyme:
-                        # Normalisiere Stand über STAND_MAPPING
-                        word_lower = words[j].lower()
-                        stand = STAND_MAPPING.get(word_lower, words[j].capitalize())
-                        
-                        # Füge Präfix hinzu wenn vorhanden
-                        if stand_prefix:
-                            stand = stand_prefix + stand
-                        idx = j + 1
-                        break
-                
-                # Falls kein Stand gefunden und "begraben" im Text, setze Stand auf "Vater"
-                if not stand and ("begraben" in text.lower() or "begr" in text.lower()):
-                    stand = "Vater"
-                    
-                # Beruf: nach "ein <Beruf>" oder "der/die/das <Beruf>" suchen
-                # ABER: "ein Medtgen", "ein Kind" etc. sind Stand, kein Beruf!
-                # AUCH: "ein sieches" (Adjektiv) ist kein Beruf!
-                # WICHTIG: "der Schreiner" = Beruf, aber "Schreiner" ohne Artikel = Nachname
-                # WICHTIG: Suche durch ALLE Wörter, nicht nur ab idx (der durch andere Erkennungen verschoben wurde)
-                for i in range(len(words)-1):
-                    # Fall 1: "ein <Beruf>"
-                    if words[i].lower() in beruf_einleitung:
-                        next_word_lower = words[i+1].lower()
-                        # Prüfe ob das Wort nach "ein" ein Stand-Synonym ist
-                        if next_word_lower not in stand_synonyme and next_word_lower not in KEINE_BERUFE:
-                            beruf = words[i+1]
-                        break
-                    # Fall 2: "der/die/das <Beruf>" (Artikel + Wort aus BERUFE-Liste)
-                    elif words[i].lower() in ARTIKEL:
-                        if i + 1 < len(words) and words[i+1] in BERUFE:
-                            beruf = words[i+1]
-                            break
-                    
-                # Ort: nach Präpositionen suchen
-                # Behandle "in der" als zusammenhängende Präposition
-                for i in range(idx, len(words)):
-                    # Prüfe auf zweiteilige Präposition "in der"
-                    if i + 1 < len(words) and words[i].lower() == "in" and words[i+1].lower() == "der":
-                        if i + 2 < len(words):
-                            ort = words[i+2]
-                            idx = i + 3
-                            break
-                    # Einteilige Präpositionen
-                    elif words[i].lower() in ort_prae:
-                        if i + 1 < len(words):
-                            ort = words[i+1]
-                            idx = i + 2
-                            break
-                
-                # Todestag: aus Zitation extrahieren
-                todestag = None
-                m = re.match(zitation_pattern, zitation_text)
-                if m:
-                    todestag = m.group(2).replace(" ", ".").replace(".", ".")
-
-                # Sammle nicht erkannte Wörter
-                # Alle bekannten Listen zusammenführen
-                all_known_words = set()
-                all_known_words.update([w.lower() for w in weibliche_vornamen])
-                all_known_words.update([w.lower() for w in maennliche_vornamen])
-                all_known_words.update(stand_synonyme)
-                all_known_words.update([w.lower() for w in ort_prae])
-                all_known_words.update([w.lower() for w in beruf_einleitung])
-                all_known_words.update(anreden)
-                all_known_words.update(ignoriere_woerter)
-                all_known_words.update(STAND_PRAEFIXE)
-                all_known_words.update(KEINE_BERUFE)
-                
-                # Prüfe jedes Wort
-                for word in words:
-                    word_lower = word.lower()
-                    # Ignoriere sehr kurze Wörter, Zahlen, Sonderzeichen
-                    if len(word) < 2 or word.isdigit() or not word[0].isalpha():
-                        continue
-                    # Wenn nicht in bekannten Listen und nicht bereits zugeordnet
-                    if word_lower not in all_known_words:
-                        # Prüfe ob es in einem der extrahierten Felder vorkommt
-                        in_extracted = False
-                        for field in [vorname, nachname, partner, beruf, stand, ort]:
-                            if field and word in str(field):
-                                in_extracted = True
-                                break
-                        # Nur hinzufügen wenn nicht in extrahierten Feldern
-                        if not in_extracted:
-                            unrecognized_words.add(word)
-
-                # Debug-Ausgabe für Testfall
-                if text.strip().startswith("ev. Kb. Wetzlar ⚰ 1694.04.27 p. 1 Nr. 12 Jonas Palleroths hinterl. Sohn begr.a:23. Apr, alt 27ann. 1694 B21.5.57") or \
-                   text.strip().startswith("Ann Engel Schülerin begraben d. 4. Febr.alters 58 jahr 71698 R"):
-                    print("DEBUG-Extraktion für Testfall:")
-                    print(f"Vorname: {vorname}")
-                    print(f"Nachname: {nachname}")
-                    print(f"Partner: {partner}")
-                    print(f"Stand: {stand}")
-                    print(f"Beruf: {beruf}")
-                    print(f"Todestag: {todestag}")
-                    print(f"Ort: {ort}")
                 # Speichern
                 try:
                     cursor.execute("""
                         UPDATE karteikarten SET
-                            vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, todestag = ?, ort = ?, aktualisiert_am = CURRENT_TIMESTAMP
+                            vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, todestag = ?, ort = ?, geb_jahr_gesch = ?, aktualisiert_am = CURRENT_TIMESTAMP
                         WHERE id = ?
-                    """, (vorname, nachname, partner, beruf, stand, todestag, ort, record_id))
+                    """, (vorname, nachname, partner, beruf, stand, todestag, ort, geb_jahr_gesch, record_id))
                     self.db.conn.commit()
                     updated += 1
                 except Exception as e:
                     errors.append(f"ID {record_id}: Fehler beim Speichern: {e}")
             else:
-                # Platzhalter für andere Typen (z.B. Hochzeit)
-                errors.append(f"ID {record_id}: Typ '{typ}' wird noch nicht unterstützt.")
+                # --- Heirats-Erkennung ---
+                if typ and (typ.lower().startswith('heirat') or '∞' in text):
+                    # Nutze spezialisierte Heirats-Extraktion
+                    fields = self._extract_marriage_fields(text)
+                    
+                    # Speichern
+                    try:
+                        cursor.execute("""
+                            UPDATE karteikarten SET
+                                vorname = ?, nachname = ?, partner = ?, beruf = ?, ort = ?, stand = ?,
+                                braeutigam_stand = ?, braeutigam_vater = ?, braut_vater = ?, braut_nachname = ?, braut_ort = ?,
+                                todestag = ?,
+                                aktualisiert_am = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        """, (
+                            fields['vorname'], fields['nachname'], fields['partner'], 
+                            fields['beruf'], fields['ort'], fields['stand'],
+                            fields['braeutigam_stand'], fields['braeutigam_vater'], fields['braut_vater'], 
+                            fields['braut_nachname'], fields['braut_ort'],
+                            fields.get('todestag'),
+                            record_id
+                        ))
+                        self.db.conn.commit()
+                        updated += 1
+                    except Exception as e:
+                        errors.append(f"ID {record_id}: Fehler beim Speichern: {e}")
+                else:
+                    # Platzhalter für andere Typen
+                    errors.append(f"ID {record_id}: Typ '{typ}' wird noch nicht unterstützt.")
 
         # Speichere nicht erkannte Wörter in Datei
         if unrecognized_words:
@@ -571,11 +1949,15 @@ class KarteikartenGUI:
         
         if errors:
             msg += "\n\nFehler:\n" + "\n".join(errors)
+        
+        # Progressbar zurücksetzen
+        self.db_progress['value'] = 0
+        
         messagebox.showinfo("Feld-Extraktion abgeschlossen", msg)
         self._refresh_db_list()
 
     def _run_recognition_ocr_tab(self):
-        """Führt die Feld-Erkennung auf dem aktuellen Text im OCR-Tab durch."""
+        """Führt die Feld-Erkennung auf dem aktuellen Text im OCR-Tab durch (erkennt Begräbnisse und Heiraten)."""
         import re
 
         # Hole den aktuellen Text
@@ -585,190 +1967,116 @@ class KarteikartenGUI:
             return
         
         # Setze alle Felder zurück
-        for label in self.ocr_field_labels.values():
-            label.config(text="—", foreground="gray")
+        self._clear_ocr_field_labels()
         
-        # Verwende die gleiche Erkennungslogik wie _run_recognition_selected
-        # (Nur für Begräbnis-Typ, kann später erweitert werden)
+        # Erkenne den Typ (Begräbnis ⚰ oder Heirat ∞)
+        is_heirat = '∞' in text
+        is_begraebnis = '⚰' in text or '\u26B0' in text
         
-        # Zitation-Pattern
-        zitation_pattern = r"^(ev\.\s*Kb\.\s*Wetzlar)?[ .]*[⚰\u26B0]?[ .]*(\d{4}[ .]?\d{2}[ .]?\d{2})[ .]*p\.?[ .]?(\d+)[ .]*Nr\.?[ .]?(\d+)[ .]*"
-        stopwords = ["Text", "begraben", "begr.", "begr ", "Begr.", "Begr "]
+        # Falls beide Symbole oder keines vorhanden, versuche anhand Keywords zu erkennen
+        if (is_heirat and is_begraebnis) or (not is_heirat and not is_begraebnis):
+            if 'begraben' in text.lower() or 'begr' in text.lower():
+                is_begraebnis = True
+                is_heirat = False
+            elif 'heirat' in text.lower() or 'getraut' in text.lower() or 'und' in text.lower():
+                is_heirat = True
+                is_begraebnis = False
         
-        # Suche das Ende der Zitation
-        stop_idx = len(text)
-        for sw in stopwords:
-            idx = text.lower().find(sw.lower())
-            if idx != -1 and idx < stop_idx:
-                stop_idx = idx
-        zitation_text = text[:stop_idx]
-        
-        # Zitation extrahieren
-        m = re.match(zitation_pattern, zitation_text)
-        vorname = nachname = partner = beruf = stand = todestag = ort = None
-        
-        if m:
-            after_zitation = zitation_text[m.end():].strip()
-        else:
-            after_zitation = zitation_text.strip()
-        
-        # Wörter splitten
-        words = re.split(r"[ ,.;\n\r]+", after_zitation)
-        words = [w for w in words if w]
-        
-        if not words:
-            messagebox.showinfo("Keine Daten", "Keine Wörter zur Erkennung gefunden.")
+        # --- HEIRAT-ERKENNUNG ---
+        if is_heirat:
+            result = self._extract_marriage_fields(text)
+            
+            # Update UI mit erkannten Feldern
+            self._set_ocr_field_value('vorname', result.get('vorname'))
+            self._set_ocr_field_value('nachname', result.get('nachname'))
+            self._set_ocr_field_value('partner', result.get('partner'))
+            self._set_ocr_field_value('braut stand', result.get('stand'))
+            self._set_ocr_field_value('beruf', result.get('beruf'))
+            self._set_ocr_field_value('ort', result.get('ort'))
+            if 'seite' in self.ocr_field_labels and result.get('seite'):
+                self._set_ocr_field_value('seite', str(result.get('seite')))
+            if 'nummer' in self.ocr_field_labels and result.get('nummer'):
+                self._set_ocr_field_value('nummer', str(result.get('nummer')))
+            self._set_ocr_field_value('todestag', result.get('todestag'))
+            
+            # Heirat-spezifische Felder
+            if 'bräutigam stand' in self.ocr_field_labels:
+                self._set_ocr_field_value('bräutigam stand', result.get('braeutigam_stand'))
+            if 'bräutigam vater' in self.ocr_field_labels:
+                self._set_ocr_field_value('bräutigam vater', result.get('braeutigam_vater'))
+            if 'braut vater' in self.ocr_field_labels:
+                self._set_ocr_field_value('braut vater', result.get('braut_vater'))
+            if 'braut nachname' in self.ocr_field_labels:
+                self._set_ocr_field_value('braut nachname', result.get('braut_nachname'))
+            if 'braut ort' in self.ocr_field_labels:
+                self._set_ocr_field_value('braut ort', result.get('braut_ort'))
+            
+            # Speichere für spätere Nutzung
+            self._last_recognized_fields = result
+            
+            # WICHTIG: Prüfe ob Braut-Vorname (partner) erkannt wurde
+            if not result.get('partner'):
+                # Statuszeile im OCR-Tab mit Warnung aktualisieren
+                self.db_record_status.config(
+                    text="⚠️ WARNUNG: Kein weiblicher Vorname (Braut) erkannt! Bitte Vornamenliste prüfen.",
+                    foreground="red"
+                )
+                messagebox.showwarning(
+                    "Heirat-Erkennung unvollständig", 
+                    "Kein weiblicher Vorname (Braut) erkannt!\n\n"
+                    "Mögliche Ursachen:\n"
+                    "• Braut-Vorname nicht in Vornamenliste (extraction_lists.py)\n"
+                    "• Kein Trenner-Wort zwischen Bräutigam und Braut\n"
+                    "• OCR-Fehler im erkannten Text\n\n"
+                    "Bitte Text und Vornamenliste überprüfen."
+                )
+            else:
+                # Erfolgreiche Erkennung - Status zurücksetzen
+                self.db_record_status.config(text="", foreground="blue")
+                messagebox.showinfo("Erkennung", "Heirat-Felder erkannt.")
             return
         
-        # Verwende importierte Listen
-        weibliche_vornamen = WEIBLICHE_VORNAMEN
-        maennliche_vornamen = MAENNLICHE_VORNAMEN
-        stand_synonyme = STAND_SYNONYME
-        ort_prae = ORTS_PRAEPOSITIONEN
-        beruf_einleitung = BERUFS_EINLEITUNG
-        anreden = ANREDEN
-        ignoriere_woerter = IGNORIERE_WOERTER
-        
-        # Hilfsfunktion für frau-Anrede
-        def ist_frau_anrede(idx_aktuell):
-            if idx_aktuell >= len(words) or words[idx_aktuell].lower() != "frau":
-                return False
-            if idx_aktuell + 1 < len(words):
-                next_word = words[idx_aktuell + 1]
-                if next_word in weibliche_vornamen or next_word in maennliche_vornamen:
-                    return True
-                if next_word.lower() not in stand_synonyme:
-                    return True
-            return False
-        
-        # Extraktion (vereinfachte Version)
-        idx = 0
-        vorname_start_idx = -1
-        
-        # Vorname suchen
-        while idx < len(words):
-            w = words[idx]
-            if w in weibliche_vornamen or w in maennliche_vornamen:
-                vorname_start_idx = idx
-                vorname = w
-                idx += 1
-                # Doppelnamen
-                if idx < len(words) and words[idx] in weibliche_vornamen + maennliche_vornamen:
-                    vorname += " " + words[idx]
-                    idx += 1
-                # Ignoriere-Wörter überspringen
-                while idx < len(words) and words[idx].lower() in ignoriere_woerter:
-                    idx += 1
-                break
-            idx += 1
-        
-        # Nachname
-        if vorname and vorname_start_idx > 0:
-            nachname = words[0]
-        elif vorname:
-            # Einfache Nachname-Suche
-            while idx < len(words):
-                w = words[idx]
-                if w.lower() in anreden or w.lower() in ignoriere_woerter:
-                    idx += 1
-                    continue
-                # Artikel: Nur überspringen wenn KEIN Beruf folgt ("der Schreiner" = Beruf!)
-                if w.lower() in ARTIKEL:
-                    if idx + 1 < len(words) and words[idx + 1] in BERUFE:
-                        # "der Schreiner" -> kein Nachname, wird später als Beruf erkannt
-                        break
-                    else:
-                        # Normaler Artikel ohne Beruf -> überspringen
-                        idx += 1
-                        continue
-                if w.lower() == "frau" and ist_frau_anrede(idx):
-                    idx += 1
-                    continue
-                if w.lower() not in [s.lower() for s in stand_synonyme] and w.lower() not in ort_prae and w.lower() not in beruf_einleitung:
-                    nachname = w
-                    idx += 1
-                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
-                        idx += 1
-                    break
-                idx += 1
-        
-        # Stand
-        for i in range(idx, len(words)):
-            stand_prefix = ""
-            if words[i].lower() in STAND_PRAEFIXE:
-                stand_prefix = words[i] + " "
-                j = i + 1
-            elif words[i].lower() == "ein" and i + 1 < len(words) and words[i + 1].lower() in stand_synonyme:
-                stand_prefix = ""
-                j = i + 1
-            else:
-                j = i
-            
-            if j < len(words) and words[j].lower() in stand_synonyme:
-                word_lower = words[j].lower()
-                stand = STAND_MAPPING.get(word_lower, words[j].capitalize())
-                if stand_prefix:
-                    stand = stand_prefix + stand
-                idx = j + 1
-                break
-        
-        # Falls kein Stand und "begraben" im Text
-        if not stand and ("begraben" in text.lower() or "begr" in text.lower()):
-            stand = "Vater"
-        
-        # Beruf: nach "ein <Beruf>" oder "der/die/das <Beruf>" suchen
-        # WICHTIG: "der Schreiner" = Beruf, aber "Schreiner" ohne Artikel = Nachname
-        # WICHTIG: Suche durch ALLE Wörter, nicht nur ab idx
-        for i in range(len(words)-1):
-            # Fall 1: "ein <Beruf>"
-            if words[i].lower() in beruf_einleitung:
-                next_word_lower = words[i+1].lower()
-                if next_word_lower not in stand_synonyme and next_word_lower not in KEINE_BERUFE:
-                    beruf = words[i+1]
-                break
-            # Fall 2: "der/die/das <Beruf>" (Artikel + Wort aus BERUFE-Liste)
-            elif words[i].lower() in ARTIKEL:
-                if i + 1 < len(words) and words[i+1] in BERUFE:
-                    beruf = words[i+1]
-                    break
-        
-        # Ort
-        for i in range(idx, len(words)):
-            if i + 1 < len(words) and words[i].lower() == "in" and words[i+1].lower() == "der":
-                if i + 2 < len(words):
-                    ort = words[i+2]
-                    idx = i + 3
-                    break
-            elif words[i].lower() in ort_prae:
-                if i + 1 < len(words):
-                    ort = words[i+1]
-                    idx = i + 2
-                    break
-        
-        # Todestag aus Zitation
-        if m:
-            todestag = m.group(2).replace(" ", ".").replace(".", ".")
+        # --- BEGRÄBNIS-ERKENNUNG ---
+        # Nutze zentrale Begräbnis-Extraktion (gleiche Logik wie Datenbank-Tab)
+        fields = self._extract_burial_fields(text)
         
         # Update UI
-        self.ocr_field_labels['vorname'].config(text=vorname or "—", foreground="blue" if vorname else "gray")
-        self.ocr_field_labels['nachname'].config(text=nachname or "—", foreground="blue" if nachname else "gray")
-        self.ocr_field_labels['partner'].config(text=partner or "—", foreground="blue" if partner else "gray")
-        self.ocr_field_labels['stand'].config(text=stand or "—", foreground="blue" if stand else "gray")
-        self.ocr_field_labels['beruf'].config(text=beruf or "—", foreground="blue" if beruf else "gray")
-        self.ocr_field_labels['ort'].config(text=ort or "—", foreground="blue" if ort else "gray")
-        self.ocr_field_labels['todestag'].config(text=todestag or "—", foreground="blue" if todestag else "gray")
+        self._set_ocr_field_value('vorname', fields.get('vorname'))
+        self._set_ocr_field_value('nachname', fields.get('nachname'))
+        self._set_ocr_field_value('partner', fields.get('partner'))
+        if 'stand' in self.ocr_field_labels:
+            self._set_ocr_field_value('stand', fields.get('stand'))
+        if 'braut stand' in self.ocr_field_labels:
+            self._set_ocr_field_value('braut stand', None)
+        self._set_ocr_field_value('beruf', fields.get('beruf'))
+        self._set_ocr_field_value('ort', fields.get('ort'))
+        if 'seite' in self.ocr_field_labels and fields.get('seite'):
+            self._set_ocr_field_value('seite', str(fields.get('seite')))
+        if 'nummer' in self.ocr_field_labels and fields.get('nummer'):
+            self._set_ocr_field_value('nummer', str(fields.get('nummer')))
+        if 'todestag' in self.ocr_field_labels:
+            self._set_ocr_field_value('todestag', fields.get('todestag'))
+        if 'geb.jahr (gesch.)' in self.ocr_field_labels:
+            geb_jahr_text = str(fields.get('geb_jahr_gesch')) if fields.get('geb_jahr_gesch') else None
+            self._set_ocr_field_value('geb.jahr (gesch.)', geb_jahr_text)
+        # Neue Felder (nur für Heiraten, werden hier als leer angezeigt bei Begräbnissen)
+        if 'bräutigam stand' in self.ocr_field_labels:
+            self._set_ocr_field_value('bräutigam stand', None)
+        if 'bräutigam vater' in self.ocr_field_labels:
+            self._set_ocr_field_value('bräutigam vater', None)
+        if 'braut vater' in self.ocr_field_labels:
+            self._set_ocr_field_value('braut vater', None)
+        if 'braut nachname' in self.ocr_field_labels:
+            self._set_ocr_field_value('braut nachname', None)
+        if 'braut ort' in self.ocr_field_labels:
+            self._set_ocr_field_value('braut ort', None)
         
         # Speichere die erkannten Felder für spätere Nutzung
-        self._last_recognized_fields = {
-            'vorname': vorname,
-            'nachname': nachname,
-            'partner': partner,
-            'beruf': beruf,
-            'stand': stand,
-            'todestag': todestag,
-            'ort': ort
-        }
+        self._last_recognized_fields = fields
         
+        # Status zurücksetzen
+        self.db_record_status.config(text="", foreground="blue")
+        messagebox.showinfo("Erkennung", "Begräbnis-Felder erkannt.")
         # Status-Hinweis
         self.db_record_status.config(
             text="✓ Felder erkannt. Nutzen Sie 'DB aktualisieren', um die Änderungen zu speichern.",
@@ -777,8 +2085,8 @@ class KarteikartenGUI:
 
     def _update_db_fields(self):
         """Aktualisiert die erkannten Felder in der Datenbank."""
-        # Prüfe, ob Felder erkannt wurden
-        if not hasattr(self, '_last_recognized_fields'):
+        # Prüfe, ob Felder vorhanden sind
+        if not hasattr(self, 'ocr_field_vars') and not hasattr(self, '_last_recognized_fields'):
             messagebox.showwarning("Keine Felder", "Bitte zuerst Felder erkennen ('🧠 Felder erkennen').")
             return
         
@@ -792,18 +2100,94 @@ class KarteikartenGUI:
             return
         
         try:
-            fields = self._last_recognized_fields
+            fields = self._last_recognized_fields if hasattr(self, '_last_recognized_fields') else {}
+            vorname = self._get_ocr_field_value('vorname') or fields.get('vorname')
+            nachname = self._get_ocr_field_value('nachname') or fields.get('nachname')
+            partner = self._get_ocr_field_value('partner') or fields.get('partner')
+            beruf = self._get_ocr_field_value('beruf') or fields.get('beruf')
+            ort = self._get_ocr_field_value('ort') or fields.get('ort')
+            seite_value = self._get_ocr_field_value('seite') or fields.get('seite')
+            seite = int(seite_value) if seite_value else None
+            nummer_value = self._get_ocr_field_value('nummer') or fields.get('nummer')
+            nummer = int(nummer_value) if nummer_value else None
+            todestag = self._get_ocr_field_value('todestag') or fields.get('todestag')
+            stand = self._get_ocr_field_value('stand') or fields.get('stand')
+            braut_stand = self._get_ocr_field_value('braut stand') or fields.get('stand')
+            braeutigam_stand = self._get_ocr_field_value('bräutigam stand') or fields.get('braeutigam_stand')
+            braeutigam_vater = self._get_ocr_field_value('bräutigam vater') or fields.get('braeutigam_vater')
+            braut_vater = self._get_ocr_field_value('braut vater') or fields.get('braut_vater')
+            braut_nachname = self._get_ocr_field_value('braut nachname') or fields.get('braut_nachname')
+            braut_ort = self._get_ocr_field_value('braut ort') or fields.get('braut_ort')
+            kirchenbuchtext = self.kirchenbuch_text_display.get("1.0", tk.END).strip()
+            kirchenbuchtext = kirchenbuchtext if kirchenbuchtext else None
+            fid = self.fid_entry.get().strip()
+            fid = fid if fid else None
+            gramps = self.gramps_entry.get().strip()
+            gramps = gramps if gramps else None
+            geb_jahr_value = self._get_ocr_field_value('geb.jahr (gesch.)')
+            if geb_jahr_value:
+                try:
+                    geb_jahr_gesch = int(geb_jahr_value)
+                except ValueError:
+                    geb_jahr_gesch = None
+            else:
+                geb_jahr_gesch = fields.get('geb_jahr_gesch')
+
             cursor = self.db.conn.cursor()
-            cursor.execute("""
-                UPDATE karteikarten SET
-                    vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, todestag = ?, ort = ?, 
-                    aktualisiert_am = CURRENT_TIMESTAMP
-                WHERE id = ?
-            """, (
-                fields['vorname'], fields['nachname'], fields['partner'], 
-                fields['beruf'], fields['stand'], fields['todestag'], fields['ort'], 
-                self.current_db_record_id
-            ))
+            cursor.execute("SELECT ereignis_typ FROM karteikarten WHERE id = ?", (self.current_db_record_id,))
+            typ_row = cursor.fetchone()
+            ereignis_typ = typ_row[0] if typ_row else None
+            is_marriage = False
+            if ereignis_typ:
+                is_marriage = str(ereignis_typ).lower().startswith('heirat')
+            if not is_marriage:
+                is_marriage = any([
+                    braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort
+                ])
+            cursor = self.db.conn.cursor()
+            
+            # Prüfe ob es Heirats- oder Begräbnis-Felder sind
+            if is_marriage:
+                # Heirats-Update
+                cursor.execute("""
+                    UPDATE karteikarten SET
+                        vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, ort = ?, seite = ?, nummer = ?,
+                        braeutigam_stand = ?, braeutigam_vater = ?, braut_vater = ?, braut_nachname = ?, braut_ort = ?,
+                        kirchenbuchtext = ?,
+                        notiz = ?,
+                        gramps = ?,
+                        aktualisiert_am = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (
+                    vorname, nachname, partner,
+                    beruf, braut_stand or stand, ort, seite, nummer,
+                    braeutigam_stand, braeutigam_vater, braut_vater,
+                    braut_nachname, braut_ort,
+                    kirchenbuchtext,
+                    fid,
+                    gramps,
+                    self.current_db_record_id
+                ))
+            else:
+                # Begräbnis-Update
+                cursor.execute("""
+                    UPDATE karteikarten SET
+                        vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, todestag = ?, ort = ?, seite = ?, nummer = ?, geb_jahr_gesch = ?,
+                        kirchenbuchtext = ?,
+                        notiz = ?,
+                        gramps = ?,
+                        aktualisiert_am = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                """, (
+                    vorname, nachname, partner,
+                    beruf, stand, todestag, ort, seite, nummer,
+                    geb_jahr_gesch,
+                    kirchenbuchtext,
+                    fid,
+                    gramps,
+                    self.current_db_record_id
+                ))
+            
             self.db.conn.commit()
             
             # Update Status-Label
@@ -823,6 +2207,228 @@ class KarteikartenGUI:
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim Speichern in DB:\n{e}")
 
+    def _show_current_kirchenbuch(self):
+        """Zeigt das Kirchenbuchbild für die aktuell im OCR-Tab angezeigte Karteikarte an."""
+        # Extrahiere Typ, Jahr und Seite NUR aus dem erkannten Text
+        text = self.text_display.get("1.0", tk.END).strip()
+        
+        if not text:
+            messagebox.showwarning("Kein Text", "Bitte zuerst eine Karteikarte laden und Text erkennen.")
+            return
+        
+        import re
+        from pathlib import Path
+
+        # Versuche Typ, Jahr und Seite aus dem erkannten Text zu extrahieren
+        # Format: "ev. Kb. Wetzlar ⚰ 1687.05.13. p. 99 Nr. 1"
+        typ = None
+        jahr = None
+        seite = None
+        
+        # Erkenne Typ aus Symbol im Text
+        if "⚰" in text:
+            typ = "Begräbnis"
+        elif "∞" in text:
+            typ = "Heirat"
+        elif "Gb" in text or "gb" in text:
+            typ = "Taufe"
+        
+        # Extrahiere Jahr (4-stellige Zahl am Anfang der Datumsangabe)
+        jahr_match = re.search(r"(\d{4})\.\d{2}\.\d{2}", text)
+        if jahr_match:
+            jahr = int(jahr_match.group(1))
+        
+        # Extrahiere Seite (p. XX)
+        seite_match = re.search(r"p\.?\s*(\d+)", text, re.IGNORECASE)
+        if seite_match:
+            seite = int(seite_match.group(1))
+        
+        if not all([typ, jahr, seite]):
+            messagebox.showerror(
+                "Fehlende Informationen",
+                f"Konnte nicht alle benötigten Informationen extrahieren:\n\n"
+                f"Typ: {typ or 'nicht gefunden'}\n"
+                f"Jahr: {jahr or 'nicht gefunden'}\n"
+                f"Seite: {seite or 'nicht gefunden'}\n\n"
+                f"Bitte stellen Sie sicher, dass der Text die Zitation enthält,\n"
+                f"z.B.: 'ev. Kb. Wetzlar ⚰ 1687.05.13. p. 99 Nr. 1'"
+            )
+            return
+        
+        # Finde passende Quelle aus SOURCES
+        passende_quellen = []
+        for source in SOURCES:
+            if source.get("media_type") != "kirchenbuchseiten":
+                continue
+            if not source.get("media_ID") or not source.get("media_path"):
+                continue
+            
+            # Extrahiere Jahresbereich aus source name
+            source_name = source["source"]
+            jahr_match = re.search(r"(\d{4})-(\d{4})", source_name)
+            if jahr_match:
+                jahr_von = int(jahr_match.group(1))
+                jahr_bis = int(jahr_match.group(2))
+                
+                if jahr_von <= jahr <= jahr_bis:
+                    # Bestimme Typ-Kürzel
+                    typ_kuerzel = None
+                    if typ == "Begräbnis":
+                        typ_kuerzel = "Sb"
+                    elif typ == "Heirat":
+                        typ_kuerzel = "Hb"
+                    elif typ == "Taufe":
+                        typ_kuerzel = "Gb"
+                    
+                    media_id = source.get("media_ID", "")
+                    if typ_kuerzel and media_id.endswith(f"_{typ_kuerzel}"):
+                        passende_quellen.append(source)
+        
+        if not passende_quellen:
+            kb_quellen = [s for s in SOURCES if s.get("media_type") == "kirchenbuchseiten"]
+            quellen_info = "\n".join([f"  - {s['source']} (media_ID: {s.get('media_ID', 'N/A')})" for s in kb_quellen])
+            
+            # Bestimme gesuchtes Typ-Kürzel
+            typ_kuerzel = None
+            if typ == "Begräbnis":
+                typ_kuerzel = "Sb"
+            elif typ == "Heirat":
+                typ_kuerzel = "Hb"
+            elif typ == "Taufe" or typ == "Geburt":
+                typ_kuerzel = "Gb"
+            
+            messagebox.showerror(
+                "Keine Quelle gefunden",
+                f"Keine passende Kirchenbuch-Quelle für:\n"
+                f"Typ: {typ} (Suche nach: _{typ_kuerzel})\n"
+                f"Jahr: {jahr}\n"
+                f"Seite: {seite}\n\n"
+                f"Verfügbare Kirchenbuch-Quellen:\n{quellen_info}\n\n"
+                f"Hinweis: Jahr muss im Bereich der Quelle liegen\n"
+                f"und media_ID muss mit _{typ_kuerzel} enden."
+            )
+            return
+        
+        # Verwende erste passende Quelle
+        quelle = passende_quellen[0]
+        media_id = quelle["media_ID"]
+        ordner = Path(quelle["media_path"])
+        
+        if not ordner.exists():
+            messagebox.showerror(
+                "Ordner nicht gefunden",
+                f"Der Suchpfad existiert nicht:\n\n"
+                f"Quelle: {quelle['source']}\n"
+                f"Pfad: {ordner}"
+            )
+            return
+        
+        # Baue Dateiname nach EKiR-Format
+        media_id_prefix = media_id[:-3]  # Entferne "_Sb", "_Hb", "_Gb"
+        
+        # Unterstütze sowohl 3-stellige als auch 4-stellige Seitenzahlen
+        seite_str_3 = f"{seite:03d}"  # 3-stellig: 88 -> "088"
+        seite_str_4 = f"{seite:04d}"  # 4-stellig: 88 -> "0088"
+        
+        # Teste mehrere Patterns - für BEIDE Formate (3- und 4-stellig)
+        # Wichtig: Patterns müssen spezifisch sein, damit z.B. "0002" nicht auch "0022" findet!
+        patterns = [
+            # 4-stellige Varianten - mit Trennzeichen um False Positives zu vermeiden
+            f"{media_id_prefix}* S_{seite_str_4}-*.jpg",
+            f"{media_id_prefix}* S_*-{seite_str_4}.jpg",
+            f"{media_id_prefix}*_{seite_str_4}.jpg",
+            f"{media_id_prefix}*_{seite_str_4} Sterbebuch.jpg",
+            # 3-stellige Varianten - mit Trennzeichen um False Positives zu vermeiden
+            f"{media_id_prefix}* S_{seite_str_3}-*.jpg",
+            f"{media_id_prefix}* S_*-{seite_str_3}.jpg",
+            f"{media_id_prefix}*_{seite_str_3}.jpg",
+        ]
+        
+        # Teste alle Patterns
+        treffer = []
+        for pattern in patterns:
+            pattern_treffer = list(ordner.glob(pattern))
+            if pattern_treffer:
+                treffer.extend(pattern_treffer)
+        
+        # Duplikate entfernen (falls mehrere Patterns dieselbe Datei finden)
+        treffer = list(set(treffer))
+        
+        if not treffer:
+            # Zeige alle getesteten Patterns
+            alle_jpgs = list(ordner.glob("*.jpg"))
+            beispiel_dateien = "\n".join([f"  - {f.name}" for f in alle_jpgs[:10]])
+            
+            # Liste getestete Patterns
+            pattern_liste = "\n".join([f"  - {p}" for p in patterns])
+            
+            messagebox.showerror(
+                "Bild nicht gefunden",
+                f"Kein Bild gefunden für:\n"
+                f"Quelle: {quelle['source']}\n"
+                f"Media-ID: {media_id}\n"
+                f"Jahr: {jahr}\n"
+                f"Seite: {seite}\n\n"
+                f"Suchpfad: {ordner}\n\n"
+                f"Getestete Patterns:\n{pattern_liste}\n\n"
+                f"Beispiel-Dateien im Ordner ({len(alle_jpgs)} gesamt):\n{beispiel_dateien}"
+            )
+            return
+        
+        if len(treffer) > 1:
+            messagebox.showwarning(
+                "Mehrere Bilder gefunden",
+                f"Mehrere Bilder gefunden. Es wird das erste angezeigt:\n" +
+                "\n".join([t.name for t in treffer])
+            )
+        
+        pfad = treffer[0]
+        self._open_image_viewer(str(pfad))
+
+    def _open_current_card_in_irfanview(self):
+        """Öffnet die aktuell angezeigte Karteikarte in IrfanView."""
+        import shutil
+        import subprocess
+
+        if not self.current_image:
+            messagebox.showwarning("Keine Karteikarte", "Es ist aktuell keine Karteikarte geladen.")
+            return
+
+        image_path = Path(self.current_image)
+        if not image_path.exists():
+            messagebox.showerror("Datei nicht gefunden", f"Die Bilddatei wurde nicht gefunden:\n{image_path}")
+            return
+
+        candidates = []
+
+        # 1) IrfanView aus PATH ermitteln
+        for cmd in ("i_view64.exe", "i_view32.exe", "i_view64", "i_view32"):
+            resolved = shutil.which(cmd)
+            if resolved:
+                candidates.append(Path(resolved))
+
+        # 2) Typische Installationspfade prüfen
+        for path in (
+            Path(r"C:\Program Files\IrfanView\i_view64.exe"),
+            Path(r"C:\Program Files (x86)\IrfanView\i_view32.exe"),
+        ):
+            if path.exists() and path not in candidates:
+                candidates.append(path)
+
+        if not candidates:
+            messagebox.showerror(
+                "IrfanView nicht gefunden",
+                "IrfanView wurde nicht gefunden.\n\n"
+                "Bitte installieren Sie IrfanView oder stellen Sie sicher, dass\n"
+                "i_view64.exe / i_view32.exe im PATH verfügbar ist."
+            )
+            return
+
+        try:
+            subprocess.Popen([str(candidates[0]), str(image_path)], shell=False)
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Konnte IrfanView nicht starten:\n{e}")
+
             
     def _create_widgets(self):
         """Erstellt alle GUI-Elemente."""
@@ -832,17 +2438,28 @@ class KarteikartenGUI:
         
         # Tab 1: OCR-Ansicht
         ocr_tab = ttk.Frame(self.notebook)
+        self.ocr_tab = ocr_tab
         self.notebook.add(ocr_tab, text="📸 OCR-Erkennung")
         
         # Tab 2: Datenbank-Ansicht
         db_tab = ttk.Frame(self.notebook)
         self.notebook.add(db_tab, text="📊 Datenbank")
         
+        # Tab 3: Einstellungen
+        settings_tab = ttk.Frame(self.notebook)
+        self.notebook.add(settings_tab, text="⚙️ Einstellungen")
+        
         # Erstelle OCR-Tab Inhalt
         self._create_ocr_tab(ocr_tab)
         
         # Erstelle DB-Tab Inhalt
         self._create_db_tab(db_tab)
+        
+        # Erstelle Einstellungen-Tab Inhalt
+        self._create_settings_tab(settings_tab)
+
+        # Tab-Wechsel überwachen
+        self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
     
     def _create_ocr_tab(self, parent):
         """Erstellt den OCR-Tab Inhalt."""
@@ -958,7 +2575,7 @@ class KarteikartenGUI:
         self.cloud_info_label.pack(side=tk.LEFT, padx=5)
         
         # Rechte Seite: Dateiinfo und erkannter Text
-        right_frame = ttk.Frame(main_frame, width=500)
+        right_frame = ttk.Frame(main_frame, width=700)
         right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=False)
         right_frame.pack_propagate(False)
         
@@ -975,8 +2592,8 @@ class KarteikartenGUI:
         text_label = ttk.Label(right_frame, text="Erkannter Text:", font=("Arial", 10, "bold"))
         text_label.pack(anchor=tk.W, pady=(0, 5))
         
-        # Scrollbarer Textbereich
-        text_frame = ttk.Frame(right_frame, height=300)
+        # Scrollbarer Textbereich - VERKLEINERT von 180 auf 120 für mehr Platz für erkannte Felder
+        text_frame = ttk.Frame(right_frame, height=120)
         text_frame.pack(fill=tk.BOTH, expand=False)
         text_frame.pack_propagate(False)
         
@@ -1063,97 +2680,205 @@ class KarteikartenGUI:
 
         ttk.Label(special_chars_frame, text="(Strg+H für ∞)", font=("Arial", 8), foreground="gray").pack(side=tk.LEFT, padx=5)
         
+        # NEU: Eingabefeld für Kirchenbuchtext (unter "Erkannter Text")
+        kb_text_frame = ttk.LabelFrame(right_frame, text="Kirchenbuchtext (optional)", padding=5)
+        kb_text_frame.pack(fill=tk.BOTH, expand=False, pady=(10, 0))
+        kb_text_frame.pack_propagate(False)
+        kb_text_frame.config(height=100)
+        
+        kb_scrollbar = ttk.Scrollbar(kb_text_frame)
+        kb_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        self.kirchenbuch_text_display = tk.Text(kb_text_frame, wrap=tk.WORD, font=("Arial", 11),
+                                                yscrollcommand=kb_scrollbar.set)
+        self.kirchenbuch_text_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        kb_scrollbar.config(command=self.kirchenbuch_text_display.yview)
+        
+        # Haupt-Buttons in zweiter Reihe
+        action_buttons_frame = ttk.Frame(buttons_frame)
+        action_buttons_frame.pack(side=tk.TOP, anchor=tk.W, pady=(5, 0))
        
         # Speichern-Buttons
-        save_text_btn = ttk.Button(buttons_frame, text="💾 Text speichern", command=self._save_text)
+        save_text_btn = ttk.Button(action_buttons_frame, text="💾 Text speichern", command=self._save_text)
         save_text_btn.pack(side=tk.LEFT, padx=5)
         
-        self.save_db_btn = ttk.Button(buttons_frame, text="💽 In DB speichern", command=self._save_to_database)
+        self.save_db_btn = ttk.Button(action_buttons_frame, text="💽 In DB speichern", command=self._save_to_database)
         self.save_db_btn.pack(side=tk.LEFT, padx=5)
         
         # Erkennung-Button
-        recognize_btn = ttk.Button(buttons_frame, text="🧠 Felder erkennen", command=self._run_recognition_ocr_tab)
+        recognize_btn = ttk.Button(action_buttons_frame, text="🧠 Felder erkennen", command=self._run_recognition_ocr_tab)
         recognize_btn.pack(side=tk.LEFT, padx=5)
         
         # DB-Update-Button (für erkannte Felder)
-        update_db_btn = ttk.Button(buttons_frame, text="📤 DB aktualisieren", command=self._update_db_fields)
+        update_db_btn = ttk.Button(action_buttons_frame, text="📤 DB aktualisieren", command=self._update_db_fields)
         update_db_btn.pack(side=tk.LEFT, padx=5)
         
-        # Frame für erkannte Felder
-        fields_frame = ttk.LabelFrame(right_frame, text="Erkannte Felder", padding=10)
+        # Dritte Reihe für Kirchenbuch-Button und F-ID Feld
+        action_buttons_frame2 = ttk.Frame(buttons_frame)
+        action_buttons_frame2.pack(side=tk.TOP, anchor=tk.W, pady=(5, 0))
+
+        # Button zum Öffnen der aktuellen Karteikarte in IrfanView
+        irfan_btn = ttk.Button(action_buttons_frame2, text="in Irfanview", command=self._open_current_card_in_irfanview)
+        irfan_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Button zum Anzeigen des Kirchenbuchs
+        show_kb_btn = ttk.Button(action_buttons_frame2, text="📖 Kirchenbuch anzeigen", command=self._show_current_kirchenbuch)
+        show_kb_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Notiz-Feld (für beliebigen Text wie F-ID, Namen, etc.)
+        ttk.Label(action_buttons_frame2, text="Notiz:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(20, 5))
+        self.fid_entry = ttk.Entry(action_buttons_frame2, width=35, font=("Arial", 10))
+        self.fid_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Gramps-Feld
+        ttk.Label(action_buttons_frame2, text="Gramps:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(15, 5))
+        self.gramps_entry = ttk.Entry(action_buttons_frame2, width=15, font=("Arial", 10))
+        self.gramps_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Frame für erkannte Felder MIT SCROLLBAR
+        fields_frame = ttk.LabelFrame(right_frame, text="Erkannte Felder", padding=0)
         fields_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
         
+        # Canvas mit Scrollbar für das Feld-Grid
+        fields_canvas = tk.Canvas(fields_frame, highlightthickness=0)
+        fields_scrollbar = ttk.Scrollbar(fields_frame, orient="vertical", command=fields_canvas.yview)
+        fields_canvas.configure(yscrollcommand=fields_scrollbar.set)
+        
+        # Platziere Canvas und Scrollbar
+        fields_canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        fields_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Frame im Canvas für die Felder
+        fields_inner = ttk.Frame(fields_canvas)
+        fields_canvas_window = fields_canvas.create_window((0, 0), window=fields_inner, anchor="nw")
+        
+        # Binding für Scrollrad und Größenänderung
+        def on_fields_canvas_configure(event=None):
+            fields_canvas.configure(scrollregion=fields_canvas.bbox("all"))
+            # Mache das innere Frame so breit wie der Canvas
+            fields_canvas.itemconfig(fields_canvas_window, width=event.width if event else fields_canvas.winfo_width())
+        
+        fields_inner.bind("<Configure>", on_fields_canvas_configure)
+        fields_canvas.bind("<Configure>", lambda e: fields_canvas.itemconfig(fields_canvas_window, width=e.width))
+        
+        # Mausrad-Scrolling
+        def on_mousewheel(event):
+            fields_canvas.yview_scroll(int(-1*(event.delta/120)), "units")
+        fields_canvas.bind_all("<MouseWheel>", on_mousewheel)
+        
         # 2-Spalten-Layout für erkannte Felder
-        # Labels für Feldnamen (links) und Werte (rechts)
-        field_names = ["Vorname:", "Nachname:", "Partner:", "Stand:", "Beruf:", "Ort:", "Todestag:"]
+        # Labels für Feldnamen (links) und editierbare Werte (rechts)
+        field_names = ["Vorname:", "Nachname:", "Partner:", "Stand:", "Braut Stand:", "Beruf:", "Ort:", 
+                      "Seite:", "Nummer:", "Todestag:", "Geb.Jahr (gesch.):", "Bräutigam Stand:", "Bräutigam Vater:", "Braut Vater:", "Braut Nachname:", "Braut Ort:"]
         self.ocr_field_labels = {}
+        self.ocr_field_vars = {}
         
         for i, field_name in enumerate(field_names):
             # Label (links)
-            label = ttk.Label(fields_frame, text=field_name, font=("Arial", 9, "bold"), anchor=tk.W, width=12)
+            label = ttk.Label(fields_inner, text=field_name, font=("Arial", 9, "bold"), anchor=tk.W, width=16)
             label.grid(row=i, column=0, sticky=tk.W, pady=2, padx=(0, 10))
             
-            # Wert (rechts)
-            value_label = ttk.Label(fields_frame, text="—", font=("Arial", 9), anchor=tk.W, foreground="blue")
-            value_label.grid(row=i, column=1, sticky=tk.W, pady=2)
-            
-            # Speichere Referenz für spätere Updates
+            # Wert (rechts) - editierbar
             field_key = field_name.rstrip(':').lower()
-            self.ocr_field_labels[field_key] = value_label
+            var = tk.StringVar(value="")
+            
+            # Spezialbehandlung für Geb.Jahr (gesch.): Zeige Feld + Editor-Button
+            if field_key == 'geb.jahr (gesch.)':
+                value_frame = ttk.Frame(fields_inner)
+                value_frame.grid(row=i, column=1, sticky=tk.W, pady=2)
+                
+                value_entry = ttk.Entry(value_frame, textvariable=var, font=("Arial", 9), width=10, state='readonly')
+                value_entry.pack(side=tk.LEFT, padx=(0, 5))
+                
+                edit_btn = ttk.Button(
+                    value_frame, 
+                    text="✏️ Alter eingeben", 
+                    width=15,
+                    command=self._edit_geb_jahr_gesch
+                )
+                edit_btn.pack(side=tk.LEFT)
+            else:
+                value_entry = ttk.Entry(fields_inner, textvariable=var, font=("Arial", 9), width=28)
+                value_entry.grid(row=i, column=1, sticky=tk.W, pady=2)
+
+            # Speichere Referenz für spätere Updates
+            self.ocr_field_labels[field_key] = value_entry
+            self.ocr_field_vars[field_key] = var
         
         # Grid-Spalte 1 soll expandieren
-        fields_frame.columnconfigure(1, weight=1)
+        fields_inner.columnconfigure(1, weight=1)
     
     def _create_db_tab(self, parent):
         """Erstellt den Datenbank-Tab mit Listing und Filter."""
 
-        # Oberer Bereich: Filter und Suche
+        # Oberer Bereich: Filter und Suche (aufgeteilt in 3 Zeilen für bessere Sichtbarkeit)
         filter_frame = ttk.Frame(parent)
         filter_frame.pack(fill=tk.X, padx=10, pady=10)
 
-        # ID-Filter (vor Jahr-Filter)
-        ttk.Label(filter_frame, text="ID:").pack(side=tk.LEFT, padx=5)
-        self.id_filter = ttk.Entry(filter_frame, width=8)
+        # === ZEILE 1: FILTER ===
+        filter_row1 = ttk.Frame(filter_frame)
+        filter_row1.pack(fill=tk.X, pady=(0, 5))
+
+        # ID-Filter
+        ttk.Label(filter_row1, text="ID:").pack(side=tk.LEFT, padx=5)
+        self.id_filter = ttk.Entry(filter_row1, width=8)
         self.id_filter.pack(side=tk.LEFT, padx=5)
 
         # Jahr-Filter
-        ttk.Label(filter_frame, text="Jahr:").pack(side=tk.LEFT, padx=5)
-        self.year_filter = ttk.Combobox(filter_frame, width=10, state='readonly')
+        ttk.Label(filter_row1, text="Jahr:").pack(side=tk.LEFT, padx=(10, 5))
+        self.year_filter = ttk.Combobox(filter_row1, width=10, state='readonly')
         self.year_filter.pack(side=tk.LEFT, padx=5)
         self.year_filter.bind('<<ComboboxSelected>>', lambda e: self._refresh_db_list())
 
         # Ereignistyp-Filter
-        ttk.Label(filter_frame, text="Typ:").pack(side=tk.LEFT, padx=(20, 5))
-        self.type_filter = ttk.Combobox(filter_frame, width=15, state='readonly')
+        ttk.Label(filter_row1, text="Typ:").pack(side=tk.LEFT, padx=(10, 5))
+        self.type_filter = ttk.Combobox(filter_row1, width=15, state='readonly')
         self.type_filter['values'] = ['Alle', 'Heirat', 'Taufe', 'Begräbnis', '(Leere)']
         self.type_filter.current(0)
         self.type_filter.pack(side=tk.LEFT, padx=5)
         self.type_filter.bind('<<ComboboxSelected>>', lambda e: self._refresh_db_list())
 
-        # Dateinamen-Filter (nach Typ-Filter)
-        ttk.Label(filter_frame, text="Dateiname:").pack(side=tk.LEFT, padx=(20, 5))
-        self.filename_filter = ttk.Combobox(filter_frame, width=10, state='readonly')
+        # Dateinamen-Filter
+        ttk.Label(filter_row1, text="Datei:").pack(side=tk.LEFT, padx=(10, 5))
+        self.filename_filter = ttk.Combobox(filter_row1, width=10, state='readonly')
         self.filename_filter['values'] = ['Alle', 'Sb', 'Hb', 'Gb']
         self.filename_filter.current(0)
         self.filename_filter.pack(side=tk.LEFT, padx=5)
         self.filename_filter.bind('<<ComboboxSelected>>', lambda e: self._refresh_db_list())
 
+        # Kirchenbuch-Filter (z.B. "Hb 1695-1718" aus Dateiname)
+        ttk.Label(filter_row1, text="Kirchenbuch:").pack(side=tk.LEFT, padx=(10, 5))
+        self.kirchenbuch_filter = ttk.Combobox(filter_row1, width=16, state='readonly')
+        self.kirchenbuch_filter['values'] = ['Alle']
+        self.kirchenbuch_filter.current(0)
+        self.kirchenbuch_filter.pack(side=tk.LEFT, padx=5)
+        self.kirchenbuch_filter.bind('<<ComboboxSelected>>', lambda e: self._refresh_db_list())
+
+        # === ZEILE 2: SUCHE & ERSETZEN ===
+        filter_row2 = ttk.Frame(filter_frame)
+        filter_row2.pack(fill=tk.X, pady=(0, 5))
+
         # Namenssuche
-        ttk.Label(filter_frame, text="Name:").pack(side=tk.LEFT, padx=(20, 5))
-        self.name_search = ttk.Entry(filter_frame, width=20)
+        ttk.Label(filter_row2, text="Name:").pack(side=tk.LEFT, padx=5)
+        self.name_search = ttk.Entry(filter_row2, width=20)
         self.name_search.pack(side=tk.LEFT, padx=5)
+        # Enter-Taste im Namens-Suchfeld löst Suche aus
+        self.name_search.bind('<Return>', lambda e: self._refresh_db_list())
 
         # Checkbox für Regex-Suche
         self.regex_search_var = tk.BooleanVar(value=False)
-        self.regex_search_cb = ttk.Checkbutton(filter_frame, text="Regex-Suche", variable=self.regex_search_var)
+        self.regex_search_cb = ttk.Checkbutton(filter_row2, text="Regex", variable=self.regex_search_var)
         self.regex_search_cb.pack(side=tk.LEFT, padx=5)
 
-
-        search_btn = ttk.Button(filter_frame, text="🔍 Suchen", command=self._refresh_db_list)
+        search_btn = ttk.Button(filter_row2, text="🔍 Suchen", command=self._refresh_db_list)
         search_btn.pack(side=tk.LEFT, padx=5)
 
+        # Trennlinie
+        ttk.Separator(filter_row2, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
         # Eingabefeld für Ersetzen-Text
-        self.replace_entry = ttk.Entry(filter_frame, width=20)
+        ttk.Label(filter_row2, text="Ersetzen:").pack(side=tk.LEFT, padx=(0, 5))
+        self.replace_entry = ttk.Entry(filter_row2, width=20)
         self.replace_entry.pack(side=tk.LEFT, padx=5)
         self.replace_entry.insert(0, "Ersetzen Text")
 
@@ -1215,21 +2940,37 @@ class KarteikartenGUI:
                 f"Erfolgreich geändert: {erfolge}\nKeine Änderung nötig: {keine_aenderung}\nFehler: {fehler}"
             )
 
-        replace_btn = ttk.Button(filter_frame, text="Ersetzen", command=replace_selected_text)
+        replace_btn = ttk.Button(filter_row2, text="✓ Ersetzen", command=replace_selected_text)
         replace_btn.pack(side=tk.LEFT, padx=5)
 
-        clear_btn = ttk.Button(filter_frame, text="✕ Filter löschen", command=self._clear_filters)
+        # === ZEILE 3: AKTIONEN ===
+        filter_row3 = ttk.Frame(filter_frame)
+        filter_row3.pack(fill=tk.X)
+
+        clear_btn = ttk.Button(filter_row3, text="✕ Filter löschen", command=self._clear_filters)
         clear_btn.pack(side=tk.LEFT, padx=5)
 
-        refresh_btn = ttk.Button(filter_frame, text="🔄 Aktualisieren", command=self._refresh_db_list)
+        refresh_btn = ttk.Button(filter_row3, text="🔄 Aktualisieren", command=self._refresh_db_list)
         refresh_btn.pack(side=tk.LEFT, padx=5)
 
+        # Trennlinie
+        ttk.Separator(filter_row3, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
+
         # Button: Leere in sortierter Spalte auswählen
-        select_empty_btn = ttk.Button(filter_frame, text="⛶ Leere in Spalte auswählen", command=self._select_empty_in_sorted_column)
+        select_empty_btn = ttk.Button(filter_row3, text="⛶ Leere auswählen", command=self._select_empty_in_sorted_column)
         select_empty_btn.pack(side=tk.LEFT, padx=5)
-        # NEU: Button zum Sortieren nach Seite/Nummer
-        sort_page_btn = ttk.Button(filter_frame, text="📑 Nach Seite/Nr. sortieren", command=self._sort_by_page_and_number)
+        
+        # Button zum Sortieren nach Seite/Nummer
+        sort_page_btn = ttk.Button(filter_row3, text="📑 Nach Seite/Nr.", command=self._sort_by_page_and_number)
         sort_page_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Button zum Filtern ungültiger Zitationen
+        invalid_citation_btn = ttk.Button(filter_row3, text="⚠ Ungültige Zitationen", command=self._filter_invalid_citations)
+        invalid_citation_btn.pack(side=tk.LEFT, padx=5)
+
+        # Statistik-Button wie im Reader direkt im oberen Aktionsbereich
+        statistics_btn = ttk.Button(filter_row3, text="📊 Statistik", command=self._show_statistics)
+        statistics_btn.pack(side=tk.LEFT, padx=5)
         
         # Treeview mit Scrollbar
         tree_frame = ttk.Frame(parent)
@@ -1245,8 +2986,10 @@ class KarteikartenGUI:
         # Treeview
         columns = (
             'ID', 'Jahr', 'Datum', 'ISO_datum', 'Typ', 'Seite', 'Nr', 'Gemeinde',
-            'Vorname', 'Nachname', 'Partner', 'Beruf', 'Stand', 'Todestag', 'Ort',
-            'Dateiname', 'Notiz', 'Text')
+            'Vorname', 'Nachname', 'Partner', 'Beruf', 'Ort',
+            'Bräutigam Vater', 'Braut Vater', 'Braut Nachname', 'Braut Ort',
+            'Bräutigam Stand', 'Braut Stand', 'Todestag', 'Geb.Jahr (gesch.)',
+            'Dateiname', 'Notiz', 'Gramps', 'Text')
         self.tree = ttk.Treeview(
             tree_frame,
             columns=columns,
@@ -1271,11 +3014,18 @@ class KarteikartenGUI:
         self.tree.heading('Nachname', text='Nachname', command=lambda: self._sort_column('Nachname'))
         self.tree.heading('Partner', text='Partner', command=lambda: self._sort_column('Partner'))
         self.tree.heading('Beruf', text='Beruf', command=lambda: self._sort_column('Beruf'))
-        self.tree.heading('Stand', text='Stand', command=lambda: self._sort_column('Stand'))
-        self.tree.heading('Todestag', text='Todestag', command=lambda: self._sort_column('Todestag'))
         self.tree.heading('Ort', text='Ort', command=lambda: self._sort_column('Ort'))
+        self.tree.heading('Bräutigam Vater', text='Bräutigam Vater', command=lambda: self._sort_column('Bräutigam Vater'))
+        self.tree.heading('Braut Vater', text='Braut Vater', command=lambda: self._sort_column('Braut Vater'))
+        self.tree.heading('Braut Nachname', text='Braut Nachname', command=lambda: self._sort_column('Braut Nachname'))
+        self.tree.heading('Braut Ort', text='Braut Ort', command=lambda: self._sort_column('Braut Ort'))
+        self.tree.heading('Bräutigam Stand', text='Bräutigam Stand', command=lambda: self._sort_column('Bräutigam Stand'))
+        self.tree.heading('Braut Stand', text='Braut Stand', command=lambda: self._sort_column('Braut Stand'))
+        self.tree.heading('Todestag', text='Todestag', command=lambda: self._sort_column('Todestag'))
+        self.tree.heading('Geb.Jahr (gesch.)', text='Geb.Jahr (gesch.)', command=lambda: self._sort_column('Geb.Jahr (gesch.)'))
         self.tree.heading('Dateiname', text='Dateiname', command=lambda: self._sort_column('Dateiname'))
         self.tree.heading('Notiz', text='F-ID', command=lambda: self._sort_column('Notiz'))
+        self.tree.heading('Gramps', text='Gramps', command=lambda: self._sort_column('Gramps'))
         self.tree.heading('Text', text='Erkannter Text', command=lambda: self._sort_column('Text'))
 
         self.tree.column('ID', width=20, anchor='center')
@@ -1290,12 +3040,25 @@ class KarteikartenGUI:
         self.tree.column('Nachname', width=80, anchor='w')
         self.tree.column('Partner', width=100, anchor='w')
         self.tree.column('Beruf', width=80, anchor='w')
-        self.tree.column('Stand', width=60, anchor='w')
-        self.tree.column('Todestag', width=80, anchor='w')
         self.tree.column('Ort', width=80, anchor='w')
+        self.tree.column('Bräutigam Vater', width=100, anchor='w')
+        self.tree.column('Braut Vater', width=100, anchor='w')
+        self.tree.column('Braut Nachname', width=100, anchor='w')
+        self.tree.column('Braut Ort', width=80, anchor='w')
+        self.tree.column('Bräutigam Stand', width=60, anchor='w')
+        self.tree.column('Braut Stand', width=60, anchor='w')
+        self.tree.column('Todestag', width=80, anchor='w')
+        self.tree.column('Geb.Jahr (gesch.)', width=60, anchor='center')
         self.tree.column('Dateiname', width=80, anchor='w')
         self.tree.column('Notiz', width=8, anchor='center')
+        self.tree.column('Gramps', width=10, anchor='center')
         self.tree.column('Text', width=400, anchor='w')
+        
+        # Spaltenbreiten aus Config laden
+        self._apply_column_widths()
+        
+        # Spaltenbreiten-Änderungen speichern
+        self.tree.bind('<Button-1>', self._on_column_resize, add='+')
         
         # Style für mehrzeilige Darstellung
         style = ttk.Style()
@@ -1303,6 +3066,12 @@ class KarteikartenGUI:
         
         # Tag für Zeilen mit Notiz (grün)
         self.tree.tag_configure('has_notiz', background='#d4edda')
+        
+        # Tag für Zeilen mit Kirchenbuchtext (hellgrün)
+        self.tree.tag_configure('has_kirchenbuchtext', background='#c3f0ca')
+        
+        # Tag für Zeilen mit Gramps (blau)
+        self.tree.tag_configure('has_gramps', background='#cfe2ff')
         
         # NEU: Tag für ungültige Datumswerte (roter Text)
         self.tree.tag_configure('invalid_date', foreground='#dc3545', font=('Arial', 9, 'bold'))
@@ -1319,7 +3088,9 @@ class KarteikartenGUI:
         self.tree_menu.add_command(label="Karteikarte anzeigen", command=self._show_selected_card)
         self.tree_menu.add_command(label="Kirchenbuch anzeigen", command=self._show_selected_image)
         self.tree_menu.add_command(label="Text anzeigen", command=self._show_selected_text)
-        self.tree_menu.add_command(label="Text bearbeiten & neu verarbeiten", command=self._edit_and_reprocess_text)
+        self.tree_menu.add_command(label="F-ID bearbeiten", command=self._edit_fid)
+        self.tree_menu.add_command(label="Auswahl kopieren", command=self._copy_selected_rows_to_clipboard)
+        self.tree_menu.add_command(label="GEDCOM exportieren (Auswahl)", command=self._export_gedcom_selected_from_context)
         self.tree_menu.add_separator()
         self.tree_menu.add_command(label="Datensatz(e) löschen", command=self._delete_selected)
         self.tree.bind('<Button-3>', self._show_tree_menu)
@@ -1331,42 +3102,378 @@ class KarteikartenGUI:
         self.db_status_label = ttk.Label(status_frame, text="Keine Daten geladen")
         self.db_status_label.pack(side=tk.LEFT)
         
-        # Buttons unten - NEUE STRUKTUR: 2 Zeilen für bessere Sichtbarkeit
+        # Buttons unten - Aufgeteilt in mehrere Zeilen für bessere Sichtbarkeit
         button_frame = ttk.Frame(parent)
         button_frame.pack(fill=tk.X, padx=10, pady=5)
         
         # ZEILE 1: Haupt-Aktionen
         button_row1 = ttk.Frame(button_frame)
-        button_row1.pack(fill=tk.X, pady=(0, 5))
+        button_row1.pack(fill=tk.X, pady=(0, 3))
         
-        ttk.Button(button_row1, text="📂 Bild anzeigen", command=self._show_selected_image).pack(side=tk.LEFT, padx=5)    
-        ttk.Button(button_row1, text="📊 Statistik", command=self._show_statistics).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row1, text="📤 Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row1, text="� Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=5)
-        # NEU: Stapel-Erkennung für Auswahl
-        ttk.Button(button_row1, text="🧠 Erkennung (Auswahl)", command=self._run_recognition_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row1, text="�🔄 Text-Korrektur (alle)", command=self._reprocess_all_texts).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row1, text="🔧 Text-Korrektur (Auswahl)", command=self._reprocess_selected_texts).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_row1, text="📂 Bild", command=self._show_selected_image).pack(side=tk.LEFT, padx=3)    
+        ttk.Button(button_row1, text="📤 Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="� Export GEDCOM", command=self._export_gedcom).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="�📥 Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="📥 Import XLSX", command=self._import_xlsx).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="🔄 Abgleich families_ok", command=self._abgleich_families_ok).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="🧠 Erkennung (Auswahl)", command=self._run_recognition_selected).pack(side=tk.LEFT, padx=3)
         
-        # ZEILE 2: Spezial-Korrekturen
+        # ZEILE 2: Text-Korrektur
         button_row2 = ttk.Frame(button_frame)
-        button_row2.pack(fill=tk.X)
+        button_row2.pack(fill=tk.X, pady=(0, 3))
         
-        ttk.Button(button_row2, text="∞ Wetzlar 00→∞ (Auswahl)", command=self._fix_wetzlar_infinity_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row2, text="∞ 16.1→161 (Auswahl)", command=self._fix_infinity_year_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row2, text=" ev. Kb. Wetzlar (Auswahl)", command=self._fix_header_prefix_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row2, text=" Begräbnis (Auswahl)", command=self._insert_burial_symbol_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row2, text=" Hochzeit (Auswahl)", command=self._insert_marriage_symbol_selected).pack(side=tk.LEFT, padx=5)
-        # NEU: Spezial-Ersetzung für ev. Kb. Wetzlar. □ 1
-        ttk.Button(button_row2, text="ev. Kb. Wetzlar. □ 1 → ⚰ 1 (Auswahl)", command=self._replace_ev_kb_wetzlar_special_selected).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_row2, text=" ID-Counter zurücksetzen", command=self._reset_autoincrement).pack(side=tk.LEFT, padx=5)
-        # Button für p(Zahl)-Korrektur
-        ttk.Button(button_row2, text="p(Zahl) → p. (Zahl) (Auswahl)", command=self._fix_p_number_selected).pack(side=tk.LEFT, padx=5)
-        # Button für Standardisierung von p./Nr.-Angaben
-        ttk.Button(button_row2, text="p/Nr. standardisieren (Auswahl)", command=self._standardize_p_nr_selected).pack(side=tk.LEFT, padx=5)
-        # Button für Zitations-Formatierung
-        ttk.Button(button_row2, text="📋 Zitation formatieren (Auswahl)", command=self._format_citation_selected).pack(side=tk.LEFT, padx=5)
-        def _standardize_p_nr_selected(self):
+        ttk.Button(button_row2, text="🔄 Text-Korrektur (alle)", command=self._reprocess_all_texts).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row2, text="🔧 Text-Korrektur (Auswahl)", command=self._reprocess_selected_texts).pack(side=tk.LEFT, padx=3)
+        
+        # ZEILE 3: Spezial-Korrekturen (Teil 1)
+        button_row3 = ttk.Frame(button_frame)
+        button_row3.pack(fill=tk.X, pady=(0, 3))
+        
+        ttk.Button(button_row3, text="∞ Wetzlar 00→∞", command=self._fix_wetzlar_infinity_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row3, text="∞ 16.1→161", command=self._fix_infinity_year_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row3, text="+ ev. Kb. Wetzlar", command=self._fix_header_prefix_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row3, text="+ ⚰ Begräbnis", command=self._insert_burial_symbol_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row3, text="+ ∞ Hochzeit", command=self._insert_marriage_symbol_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row3, text="ev. Kb. □ 1 → ⚰ 1", command=self._replace_ev_kb_wetzlar_special_selected).pack(side=tk.LEFT, padx=3)
+        
+        # ZEILE 4: Spezial-Korrekturen (Teil 2)
+        button_row4 = ttk.Frame(button_frame)
+        button_row4.pack(fill=tk.X, pady=(0, 3))
+        
+        ttk.Button(button_row4, text="p(Zahl) → p. (Zahl)", command=self._fix_p_number_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row4, text="📋 p/Nr. standardisieren", command=self._standardize_p_nr_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row4, text="📋 Zitation formatieren", command=self._format_citation_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row4, text="🔢 ID-Counter zurücksetzen", command=self._reset_autoincrement).pack(side=tk.LEFT, padx=3)
+        
+        # ZEILE 5: Progressbar
+        progress_row = ttk.Frame(button_frame)
+        progress_row.pack(fill=tk.X)
+        
+        self.db_progress = ttk.Progressbar(progress_row, mode='determinate', length=400)
+        self.db_progress.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
+    
+    def _create_settings_tab(self, parent):
+        """Erstellt den Einstellungen-Tab Inhalt."""
+        main_frame = ttk.Frame(parent)
+        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Überschrift
+        title = ttk.Label(main_frame, text="⚙️ Einstellungen", font=("Arial", 16, "bold"))
+        title.pack(pady=(0, 20))
+        
+        # === Laufwerk-Konfiguration ===
+        drive_frame = ttk.LabelFrame(main_frame, text="Kirchenbuch-Medien Pfade", padding=15)
+        drive_frame.pack(fill=tk.X, pady=(0, 20))
+        
+        ttk.Label(drive_frame, text="Basis-Laufwerk für Kirchenbuch-Medien:").pack(anchor=tk.W, pady=(0, 5))
+        
+        # Info-Text
+        info_text = ttk.Label(
+            drive_frame, 
+            text=f"Aktuell: {self.config.media_drive}\\...\\Kirchenbücher\\...",
+            foreground="blue"
+        )
+        info_text.pack(anchor=tk.W, pady=(0, 10))
+        
+        # Eingabefeld und Button
+        drive_input_frame = ttk.Frame(drive_frame)
+        drive_input_frame.pack(fill=tk.X)
+        
+        ttk.Label(drive_input_frame, text="Laufwerk:").pack(side=tk.LEFT, padx=(0, 5))
+        
+        self.drive_var = tk.StringVar(value=self.config.media_drive)
+        drive_entry = ttk.Entry(drive_input_frame, textvariable=self.drive_var, width=10)
+        drive_entry.pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(
+            drive_input_frame, 
+            text="📁 Verzeichnis wählen", 
+            command=self._choose_media_drive
+        ).pack(side=tk.LEFT, padx=5)
+        
+        ttk.Button(
+            drive_input_frame, 
+            text="💾 Speichern", 
+            command=self._save_media_drive
+        ).pack(side=tk.LEFT, padx=20)
+        
+        # Hilfetext
+        help_text = ttk.Label(
+            drive_frame,
+            text="Wählen Sie das Basis-Laufwerk/Verzeichnis für die Kirchenbuch-Medien.\n"
+                 "Beispiel: E: oder D:\\Dokumente\\Kirchenbücher",
+            foreground="gray",
+            font=("Arial", 9, "italic")
+        )
+        help_text.pack(anchor=tk.W, pady=(10, 0))
+
+        # === Anwendungs-Pfade (Bildbasis + Datenbank) ===
+        app_paths_frame = ttk.LabelFrame(main_frame, text="Anwendungs-Pfade", padding=15)
+        app_paths_frame.pack(fill=tk.X, pady=(0, 20))
+
+        # Bild-Basispfad
+        ttk.Label(app_paths_frame, text="Bild-Basispfad (OCR-Tab):").pack(anchor=tk.W, pady=(0, 4))
+        image_path_row = ttk.Frame(app_paths_frame)
+        image_path_row.pack(fill=tk.X, pady=(0, 10))
+
+        self.settings_image_base_var = tk.StringVar(value=str(self.base_path))
+        ttk.Entry(image_path_row, textvariable=self.settings_image_base_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(image_path_row, text="📁 Wählen", command=self._choose_settings_image_base_path).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(image_path_row, text="✅ Übernehmen", command=self._apply_settings_image_base_path).pack(side=tk.LEFT)
+
+        # Datenbankpfad
+        ttk.Label(app_paths_frame, text="Datenbank-Datei (.db):").pack(anchor=tk.W, pady=(0, 4))
+        db_path_row = ttk.Frame(app_paths_frame)
+        db_path_row.pack(fill=tk.X, pady=(0, 6))
+
+        self.settings_db_path_var = tk.StringVar(value=self.active_db_path)
+        ttk.Entry(db_path_row, textvariable=self.settings_db_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+        ttk.Button(db_path_row, text="📁 Wählen", command=self._choose_settings_db_path).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(db_path_row, text="💾 DB laden", command=self._apply_settings_db_path).pack(side=tk.LEFT)
+
+        self.db_path_info_label = ttk.Label(
+            app_paths_frame,
+            text=f"Aktive DB: {self.active_db_path}",
+            foreground="blue"
+        )
+        self.db_path_info_label.pack(anchor=tk.W, pady=(4, 0))
+
+        ttk.Label(
+            app_paths_frame,
+            text="Hinweis: Im EXE-Betrieb kann die DB an einem anderen Ort liegen."
+                 " Hier können Sie die richtige DB-Datei dauerhaft auswählen.",
+            foreground="gray",
+            font=("Arial", 9, "italic")
+        ).pack(anchor=tk.W, pady=(4, 0))
+        
+        # === Spaltenbreiten-Info ===
+        column_frame = ttk.LabelFrame(main_frame, text="Datenbank-Ansicht", padding=15)
+        column_frame.pack(fill=tk.X, pady=(0, 20))
+        
+        ttk.Label(
+            column_frame,
+            text="Die Spaltenbreiten der Datenbank-Tabelle werden automatisch\n"
+                 "beim Ändern gespeichert und beim nächsten Start wiederhergestellt.",
+            foreground="gray"
+        ).pack(anchor=tk.W)
+        
+        ttk.Button(
+            column_frame, 
+            text="🔄 Spaltenbreiten zurücksetzen", 
+            command=self._reset_column_widths
+        ).pack(anchor=tk.W, pady=(10, 0))
+        
+        # === Weitere Einstellungen (Platzhalter für zukünftige Features) ===
+        other_frame = ttk.LabelFrame(main_frame, text="Weitere Einstellungen", padding=15)
+        other_frame.pack(fill=tk.X)
+        
+        ttk.Label(
+            other_frame,
+            text="Weitere Konfigurationsoptionen werden hier hinzugefügt.",
+            foreground="gray"
+        ).pack(anchor=tk.W)
+    
+    def _choose_media_drive(self):
+        """Öffnet einen Dialog zur Auswahl des Medien-Basis-Verzeichnisses."""
+        initial_dir = self.config.media_drive.rstrip(':') + ':\\'  if len(self.config.media_drive) == 2 else self.config.media_drive
+        
+        directory = filedialog.askdirectory(
+            title="Basis-Verzeichnis für Kirchenbuch-Medien wählen",
+            initialdir=initial_dir
+        )
+        
+        if directory:
+            # Extrahiere Laufwerksbuchstaben oder nutze ganzen Pfad
+            from pathlib import Path
+            path = Path(directory)
+            
+            # Wenn es ein Windows-Laufwerk ist (C:, D:, etc.)
+            if path.drive:
+                self.drive_var.set(path.drive)
+            else:
+                self.drive_var.set(directory)
+    
+    def _save_media_drive(self):
+        """Speichert die Laufwerks-Einstellung."""
+        new_drive = self.drive_var.get().strip()
+        
+        if not new_drive:
+            messagebox.showwarning("Ungültige Eingabe", "Bitte geben Sie einen gültigen Pfad ein.")
+            return
+        
+        self.config.media_drive = new_drive
+        messagebox.showinfo(
+            "Gespeichert", 
+            f"Laufwerk wurde gespeichert: {self.config.media_drive}\n\n"
+            "Die Änderung wird beim nächsten Laden von Medien wirksam."
+        )
+
+    def _choose_settings_image_base_path(self):
+        """Öffnet einen Dialog zur Auswahl des Bild-Basispfads."""
+        initial_dir = str(self.base_path) if self.base_path else str(Path.cwd())
+        directory = filedialog.askdirectory(
+            title="Bild-Basispfad wählen",
+            initialdir=initial_dir
+        )
+        if directory:
+            self.settings_image_base_var.set(directory)
+
+    def _apply_settings_image_base_path(self):
+        """Übernimmt den Bild-Basispfad in Config und lädt Bilder neu."""
+        new_path = Path(self.settings_image_base_var.get().strip()).expanduser()
+        if not new_path.exists() or not new_path.is_dir():
+            messagebox.showwarning("Ungültiger Pfad", f"Der Bild-Basispfad ist ungültig:\n{new_path}")
+            return
+
+        self.base_path = new_path
+        self.image_folder_var.set(str(new_path))
+        self.config.image_base_path = str(new_path)
+        self._reload_images()
+
+    def _choose_settings_db_path(self):
+        """Öffnet einen Dialog zur Auswahl der DB-Datei."""
+        initial_dir = str(Path(self.settings_db_path_var.get()).parent) if self.settings_db_path_var.get().strip() else str(Path.cwd())
+        selected = filedialog.askopenfilename(
+            title="SQLite-Datenbank wählen",
+            initialdir=initial_dir,
+            filetypes=[("SQLite DB", "*.db *.sqlite *.db3"), ("Alle Dateien", "*.*")]
+        )
+        if selected:
+            self.settings_db_path_var.set(selected)
+
+    def _apply_settings_db_path(self):
+        """Übernimmt den DB-Pfad, lädt die DB und speichert die Einstellung."""
+        raw_path = self.settings_db_path_var.get().strip()
+        if not raw_path:
+            messagebox.showwarning("Ungültiger Pfad", "Bitte einen DB-Pfad angeben.")
+            return
+
+        new_db_path = Path(raw_path).expanduser()
+        if not new_db_path.exists():
+            create_new = messagebox.askyesno(
+                "DB nicht gefunden",
+                f"Die Datei existiert nicht:\n{new_db_path}\n\nNeue Datenbank anlegen?"
+            )
+            if not create_new:
+                return
+
+        try:
+            self._switch_database(new_db_path)
+            self.settings_db_path_var.set(self.active_db_path)
+            self.config.db_path = self.active_db_path
+            messagebox.showinfo("DB geladen", f"Datenbank aktiv:\n{self.active_db_path}")
+        except Exception as e:
+            messagebox.showerror("DB-Fehler", f"Datenbank konnte nicht geladen werden:\n{e}")
+    
+    def _reset_column_widths(self):
+        """Setzt die Spaltenbreiten auf Standardwerte zurück."""
+        if messagebox.askyesno(
+            "Zurücksetzen",
+            "Möchten Sie die Spaltenbreiten auf die Standardwerte zurücksetzen?"
+        ):
+            # Setze Config zurück
+            self.config.set("column_widths", self.config.DEFAULT_CONFIG["column_widths"].copy())
+            
+            # Wende Standardbreiten an
+            self._apply_column_widths()
+            
+            messagebox.showinfo("Fertig", "Spaltenbreiten wurden zurückgesetzt.")
+    
+    def _apply_column_widths(self):
+        """Wendet gespeicherte Spaltenbreiten aus der Config an."""
+        if not hasattr(self, 'tree'):
+            return
+        
+        # Mapping von Spalten-IDs zu Config-Keys
+        column_map = {
+            'ID': 'id',
+            'Dateiname': 'dateiname',
+            'Text': 'erkannter_text',
+            'Typ': 'typ',
+            'Jahr': 'jahr',
+            'Datum': 'datum',
+            'ISO_datum': 'iso_datum',
+            'Seite': 'seite',
+            'Nr': 'nr',
+            'Gemeinde': 'gemeinde',
+            'Vorname': 'vorname',
+            'Nachname': 'nachname',
+            'Partner': 'partner',
+            'Beruf': 'beruf',
+            'Ort': 'ort',
+            'Bräutigam Vater': 'brautigam_vater',
+            'Braut Vater': 'braut_vater',
+            'Braut Nachname': 'braut_nachname',
+            'Braut Ort': 'braut_ort',
+            'Bräutigam Stand': 'brautigam_stand',
+            'Braut Stand': 'braut_stand',
+            'Todestag': 'todestag',
+            'Geb.Jahr (gesch.)': 'geb_jahr_gesch',
+            'Notiz': 'notiz'
+        }
+        
+        column_widths = self.config.get('column_widths', {})
+        
+        for col_id, config_key in column_map.items():
+            width = column_widths.get(config_key)
+            if width:
+                try:
+                    self.tree.column(col_id, width=width)
+                except:
+                    pass  # Spalte existiert möglicherweise nicht
+    
+    def _on_column_resize(self, event):
+        """Speichert Spaltenbreiten wenn sie geändert werden."""
+        # Verzögere das Speichern um 500ms nach der letzten Änderung
+        if hasattr(self, '_resize_timer'):
+            self.root.after_cancel(self._resize_timer)
+        
+        self._resize_timer = self.root.after(500, self._save_column_widths)
+    
+    def _save_column_widths(self):
+        """Speichert aktuelle Spaltenbreiten in die Config."""
+        if not hasattr(self, 'tree'):
+            return
+        
+        # Mapping von Spalten-IDs zu Config-Keys (gleich wie in _apply_column_widths)
+        column_map = {
+            'ID': 'id',
+            'Dateiname': 'dateiname',
+            'Text': 'erkannter_text',
+            'Typ': 'typ',
+            'Jahr': 'jahr',
+            'Datum': 'datum',
+            'ISO_datum': 'iso_datum',
+            'Seite': 'seite',
+            'Nr': 'nr',
+            'Gemeinde': 'gemeinde',
+            'Vorname': 'vorname',
+            'Nachname': 'nachname',
+            'Partner': 'partner',
+            'Beruf': 'beruf',
+            'Ort': 'ort',
+            'Bräutigam Vater': 'brautigam_vater',
+            'Braut Vater': 'braut_vater',
+            'Braut Nachname': 'braut_nachname',
+            'Braut Ort': 'braut_ort',
+            'Bräutigam Stand': 'brautigam_stand',
+            'Braut Stand': 'braut_stand',
+            'Todestag': 'todestag',
+            'Geb.Jahr (gesch.)': 'geb_jahr_gesch',
+            'Notiz': 'notiz'
+        }
+        
+        widths = {}
+        for col_id, config_key in column_map.items():
+            try:
+                width = self.tree.column(col_id, 'width')
+                widths[config_key] = width
+            except:
+                pass
+        
+        self.config.set_all_column_widths(widths)
+    
+    def _standardize_p_nr_selected(self):
             """Standardisiert p./Nr.-Angaben im Feld 'Erkannter Text' für die ausgewählten Einträge."""
             import re
             selection = self.tree.selection()
@@ -1463,15 +3570,29 @@ class KarteikartenGUI:
                     dateiname = row[1]
                     dateipfad = row[2]
                     
-                    # Regex-Pattern für Zitation (flexibel für verschiedene Formate)
-                    # Sucht: (ev. Kb. Wetzlar)? Symbol Datum p. Seite Nr. Nummer
-                    pattern = r"^\s*(ev\.?\s*Kb\.?\s*Wetzlar)?\s*([⚰∞\u26B0])\s*(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?\s*p\.?\s*(\d+)\s*Nr\.?\s*(\d+)\s*"
+                    # Entferne optionalen Punkt nach "Wetzlar" (normalisiert "Wetzlar." → "Wetzlar")
+                    text_normalized = re.sub(r'(ev\.?\s*Kb\.?\s*Wetzlar)\.', r'\1', original_text, flags=re.IGNORECASE)
                     
-                    match = re.match(pattern, original_text, re.IGNORECASE)
+                    # Entferne Komma nach Datum (1694.09.19, → 1694.09.19.)
+                    text_normalized = re.sub(r'(\d{4})\.(\d{1,2})\.(\d{1,2}),', r'\1.\2.\3.', text_normalized)
+                    
+                    # Korrigiere "pp." zu "p."
+                    text_normalized = re.sub(r'\bpp\.', 'p.', text_normalized, flags=re.IGNORECASE)
+                    
+                    # Entferne doppelte Leerzeichen vor "Nr."
+                    text_normalized = re.sub(r'Nr\.\s+(\d)', r'Nr. \1', text_normalized)
+                    
+                    # Regex-Pattern für Zitation (SEHR flexibel für verschiedene Formate)
+                    # Sucht: (ev. Kb. Wetzlar)? (Symbol ODER kein Symbol) Datum (mit/ohne Junk) p./P. Seite Nr. Nummer
+                    # Symbol ist optional (kann fehlen bei Hochzeiten)
+                    # Zwischen Datum und p. können Junk-Zeichen sein (z.B. "9.   p.")
+                    pattern = r"^\s*(ev\.?\s*Kb\.?\s*Wetzlar)?\s*([⚰∞\u26B0])?\s*(\d{4})[\.,\s]*(\d{1,2})[\.,\s]*(\d{1,2})[\.,\s]*[\d\.\s]*[Pp]{1,2}\.?\s*(\d+)[\.\s]*,?\s*Nr\.?\s*(\d+)\.?\s*"
+                    
+                    match = re.match(pattern, text_normalized, re.IGNORECASE)
                     if match:
                         # Extrahiere Komponenten
                         prefix = "ev. Kb. Wetzlar"
-                        symbol = match.group(2)
+                        symbol = match.group(2) if match.group(2) else "∞"  # Fallback auf ∞ wenn Symbol fehlt
                         jahr = match.group(3)
                         monat = match.group(4).zfill(2)
                         tag = match.group(5).zfill(2)
@@ -1479,7 +3600,7 @@ class KarteikartenGUI:
                         nummer = match.group(7)
                         
                         # Rest des Textes nach der Zitation
-                        rest = original_text[match.end():]
+                        rest = text_normalized[match.end():]
                         
                         # Formatierte Zitation erstellen
                         formatted = f"{prefix} {symbol} {jahr}.{monat}.{tag}. p. {seite} Nr. {nummer} {rest}"
@@ -1497,8 +3618,9 @@ class KarteikartenGUI:
                         erfolge += 1
                     else:
                         # Kein Match - könnte ohne "ev. Kb. Wetzlar" sein, probiere alternatives Pattern
-                        pattern_alt = r"^\s*([⚰∞\u26B0])\s*(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?\s*p\.?\s*(\d+)\s*Nr\.?\s*(\d+)\s*"
-                        match_alt = re.match(pattern_alt, original_text)
+                        # Akzeptiert P. oder p., normalisiert auf p.
+                        pattern_alt = r"^\s*([⚰∞\u26B0])\s*(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?\s*[Pp]\.?\s*(\d+)\.?\s*,?\s*Nr\.?\s*(\d+)\.?\s*"
+                        match_alt = re.match(pattern_alt, text_normalized)
                         if match_alt:
                             prefix = "ev. Kb. Wetzlar"
                             symbol = match_alt.group(1)
@@ -1507,7 +3629,7 @@ class KarteikartenGUI:
                             tag = match_alt.group(4).zfill(2)
                             seite = match_alt.group(5)
                             nummer = match_alt.group(6)
-                            rest = original_text[match_alt.end():]
+                            rest = text_normalized[match_alt.end():]
                             
                             formatted = f"{prefix} {symbol} {jahr}.{monat}.{tag}. p. {seite} Nr. {nummer} {rest}"
                             
@@ -1538,7 +3660,7 @@ class KarteikartenGUI:
         )
 
     def _fix_p_number_selected(self):
-        """Ersetzt in den ausgewählten Einträgen im Feld 'Erkannter Text' alle 'p(Zahl)' oder 'p (Zahl)' durch 'p. (Zahl)' und speichert in der Datenbank."""
+        """Ersetzt in den ausgewählten Einträgen im Feld 'Erkannter Text' alle 'p(Zahl)' oder 'p (Zahl)' oder 'P(Zahl)' durch 'p. (Zahl)' und speichert in der Datenbank."""
         import re
         selection = self.tree.selection()
         if not selection:
@@ -1549,7 +3671,7 @@ class KarteikartenGUI:
         if not messagebox.askyesno(
             "p(Zahl) → p. (Zahl) ersetzen",
             f"Möchten Sie die Ersetzung auf {count} Einträge anwenden?\n\n"
-            f"Alle Vorkommen von 'p(Zahl)' oder 'p (Zahl)' werden durch 'p. (Zahl)' ersetzt.\n"
+            f"Alle Vorkommen von 'p(Zahl)', 'p (Zahl)' oder 'P(Zahl)' werden durch 'p. (Zahl)' ersetzt.\n"
             f"Die alten Texte werden überschrieben."):
             return
 
@@ -1566,7 +3688,8 @@ class KarteikartenGUI:
                     original_text = row[0]
                     dateiname = row[1]
                     dateipfad = row[2]
-                    new_text = re.sub(r"p\s?(\d+)", r"p. \1", original_text)
+                    # Ersetze sowohl "p" als auch "P" (case-insensitive)
+                    new_text = re.sub(r"[Pp]\.?\s?(\d+)", r"p. \1", original_text)
                     if new_text == original_text:
                         keine_aenderung += 1
                         continue
@@ -1706,25 +3829,70 @@ class KarteikartenGUI:
         
         # Entferne die letzten 3 Zeichen vom media_ID (z.B. "_Sb")
         media_id_prefix = media_id[:-3]  # "EKiR_408_021_Sb" -> "EKiR_408_021"
-        seite_str = f"{seite_int:04d}"  # 4-stellig: 20 -> 0020
         
-        # Baue Pattern abhängig von gerader/ungerader Seite
-        if seite_int % 2 == 0:
-            # Gerade Seite: steht an erster Stelle (S_0020-*.jpg)
-            pattern = f"{media_id_prefix}* S_{seite_str}-*.jpg"
-            pattern = f"{media_id_prefix}*{seite_str}*.jpg"
-        else:
-            # Ungerade Seite: steht an zweiter Stelle (S_*-0021.jpg)
-            pattern = f"{media_id_prefix}* S_*-{seite_str}.jpg"
-            pattern = f"{media_id_prefix}*{seite_str}*.jpg"
+        # Unterstütze sowohl 3-stellige als auch 4-stellige Seitenzahlen
+        seite_str_3 = f"{seite_int:03d}"  # 3-stellig: 88 -> "088"
+        seite_str_4 = f"{seite_int:04d}"  # 4-stellig: 88 -> "0088"
         
+        # DEBUG: Zeige Konstruktions-Details
+        print(f"\n{'='*60}")
+        print(f"DEBUG: _show_selected_image Pfad-Konstruktion")
+        print(f"{'='*60}")
+        print(f"Input:")
+        print(f"  Typ:         {typ}")
+        print(f"  Jahr:        {jahr_int}")
+        print(f"  Seite:       {seite_int}")
+        print(f"\nGefundene Quelle:")
+        print(f"  Name:        {quelle['source']}")
+        print(f"  Media-ID:    {media_id}")
+        print(f"  Ordner:      {ordner}")
+        print(f"\nPattern-Konstruktion:")
+        print(f"  media_ID_prefix: {media_id_prefix}")
+        print(f"  seite_str (3-stellig): {seite_str_3}")
+        print(f"  seite_str (4-stellig): {seite_str_4}")
+        print(f"  Gerade/Ungerade: {'gerade' if seite_int % 2 == 0 else 'ungerade'}")
+        
+        # Teste mehrere Patterns - für BEIDE Formate (3- und 4-stellig)
+        # Wichtig: Patterns müssen spezifisch sein, damit z.B. "0002" nicht auch "0022" findet!
+        patterns = [
+            # 4-stellige Varianten - mit Trennzeichen um False Positives zu vermeiden
+            f"{media_id_prefix}* S_{seite_str_4}-*.jpg",
+            f"{media_id_prefix}* S_*-{seite_str_4}.jpg",
+            f"{media_id_prefix}*_{seite_str_4}.jpg",
+            f"{media_id_prefix}*_{seite_str_4} Sterbebuch.jpg",
+            # 3-stellige Varianten - mit Trennzeichen um False Positives zu vermeiden
+            f"{media_id_prefix}* S_{seite_str_3}-*.jpg",
+            f"{media_id_prefix}* S_*-{seite_str_3}.jpg",
+            f"{media_id_prefix}*_{seite_str_3}.jpg",
+        ]
+        
+        print(f"\nTeste Patterns:")
         treffer = []
-        treffer.extend(ordner.glob(pattern))
+        for pattern in patterns:
+            pattern_treffer = list(ordner.glob(pattern))
+            status = "✅" if pattern_treffer else "❌"
+            print(f"  {status} {pattern} → {len(pattern_treffer)} Treffer")
+            if pattern_treffer:
+                treffer.extend(pattern_treffer)
+        
+        # Duplikate entfernen (falls mehrere Patterns dieselbe Datei finden)
+        treffer = list(set(treffer))
+        
+        print(f"\nErgebnis:")
+        print(f"  Treffer gesamt: {len(treffer)}")
+        if treffer:
+            print(f"  Gefundene Dateien:")
+            for t in treffer[:5]:
+                print(f"    - {t.name}")
+        print(f"{'='*60}\n")
         
         if not treffer:
             # Zeige alle jpg-Dateien im Ordner zur Diagnose
             alle_jpgs = list(ordner.glob("*.jpg"))
             beispiel_dateien = "\n".join([f"  - {f.name}" for f in alle_jpgs[:10]])
+            
+            # Liste getestete Patterns
+            pattern_liste = "\n".join([f"  - {p}" for p in patterns])
             
             messagebox.showerror(
                 "Bild nicht gefunden", 
@@ -1732,10 +3900,9 @@ class KarteikartenGUI:
                 f"Quelle: {quelle['source']}\n"
                 f"Media-ID: {media_id}\n"
                 f"Jahr: {jahr_int}\n"
-                f"Seite: {seite_int} ({seite_str})\n\n"
+                f"Seite: {seite_int}\n\n"
                 f"Suchpfad: {ordner}\n\n"
-                f"Gesuchtes Pattern:\n"
-                f"  - {pattern}\n\n"
+                f"Getestete Patterns:\n{pattern_liste}\n\n"
                 f"Beispiel-Dateien im Ordner ({len(alle_jpgs)} gesamt):\n{beispiel_dateien}"
             )
             return
@@ -2119,6 +4286,9 @@ class KarteikartenGUI:
         if folder:
             self.image_folder_var.set(folder)
             self.base_path = Path(folder)
+            self.config.image_base_path = str(self.base_path)
+            if hasattr(self, "settings_image_base_var"):
+                self.settings_image_base_var.set(str(self.base_path))
             self._reload_images()
     
     def _reload_images(self):
@@ -2129,6 +4299,9 @@ class KarteikartenGUI:
             return
         
         self.base_path = new_path
+        self.config.image_base_path = str(self.base_path)
+        if hasattr(self, "settings_image_base_var"):
+            self.settings_image_base_var.set(str(self.base_path))
         self.image_files = []
         self.current_index = 0
         self.current_db_record_id = None
@@ -2154,12 +4327,15 @@ class KarteikartenGUI:
             year_filter = self.year_filter.get()
             type_filter = self.type_filter.get()
             filename_filter = self.filename_filter.get()
+            kirchenbuch_filter = self.kirchenbuch_filter.get()
             name_search = self.name_search.get().strip()
 
             query = (
                 "SELECT id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, "
-                "vorname, nachname, partner, beruf, stand, todestag, ort, "
-                "dateiname, notiz, erkannter_text "
+                "vorname, nachname, partner, beruf, ort, "
+                "braeutigam_vater, braut_vater, braut_nachname, braut_ort, "
+                "braeutigam_stand, stand, todestag, geb_jahr_gesch, "
+                "dateiname, notiz, erkannter_text, kirchenbuchtext, gramps "
                 "FROM karteikarten WHERE 1=1"
             )
             params = []
@@ -2215,10 +4391,20 @@ class KarteikartenGUI:
                     self.db_status_label.config(text="0 Datensätze gefunden (Regex-Fehler)")
                     return
                 # Filtere rows, bei denen erkannter_text auf das Pattern matcht
-                rows = [row for row in rows if pattern.search(str(row[17]))]
+                rows = [row for row in rows if pattern.search(str(row[23]))]  # Index 23 = erkannter_text
+
+            if kirchenbuch_filter and kirchenbuch_filter != 'Alle':
+                rows = [
+                    row for row in rows
+                    if self._extract_kirchenbuch_titel(row[21]) == kirchenbuch_filter
+                ]
 
             for row in rows:
-                # row: id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, vorname, nachname, partner, beruf, todestag, ort, dateiname, notiz, erkannter_text
+                # row: id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, 
+                # vorname, nachname, partner, beruf, ort,
+                # braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                # braeutigam_stand, stand, todestag, geb_jahr_gesch,
+                # dateiname, notiz, erkannter_text, kirchenbuchtext, gramps
                 def safe(idx):
                     try:
                         return row[idx] if row[idx] is not None else ''
@@ -2238,24 +4424,37 @@ class KarteikartenGUI:
                     safe(9),  # Nachname
                     safe(10), # Partner
                     safe(11), # Beruf
-                    safe(12), # Stand
-                    safe(13), # Todestag
-                    safe(14), # Ort
-                    safe(15), # Dateiname
-                    safe(16), # Notiz
-                    safe(17), # Erkannter Text
+                    safe(12), # Ort
+                    safe(13), # Bräutigam Vater
+                    safe(14), # Braut Vater
+                    safe(15), # Braut Nachname
+                    safe(16), # Braut Ort
+                    safe(17), # Bräutigam Stand
+                    safe(18), # Braut Stand (ehemals 'stand')
+                    safe(19), # Todestag
+                    safe(20), # Geb.Jahr (gesch.)
+                    safe(21), # Dateiname
+                    safe(22), # Notiz
+                    safe(25), # Gramps
+                    safe(23), # Erkannter Text
                 )
 
                 # NEU: Prüfe ob Datum gültig ist
                 jahr = safe(1)
                 datum = safe(2)
-                notiz = safe(10)
+                notiz = safe(22)
+                kirchenbuchtext = safe(24)  # Index 24 = kirchenbuchtext
+                gramps = safe(25)  # Index 25 = gramps
                 is_valid_date = self._is_valid_date(datum, jahr)
 
                 # Tags setzen
                 tags = []
                 if notiz:
                     tags.append('has_notiz')
+                if kirchenbuchtext:
+                    tags.append('has_kirchenbuchtext')
+                if gramps:
+                    tags.append('has_gramps')
                 if not is_valid_date and datum:
                     tags.append('invalid_date')
 
@@ -2267,13 +4466,36 @@ class KarteikartenGUI:
             self.year_filter['values'] = ['Alle'] + [str(y) for y in years]
             if not self.year_filter.get():
                 self.year_filter.current(0)
+
+            cursor.execute("SELECT DISTINCT dateiname FROM karteikarten WHERE dateiname IS NOT NULL AND dateiname != ''")
+            kb_values = sorted({
+                titel
+                for (dateiname,) in cursor.fetchall()
+                for titel in [self._extract_kirchenbuch_titel(dateiname)]
+                if titel
+            })
+            current_kb = self.kirchenbuch_filter.get()
+            self.kirchenbuch_filter['values'] = ['Alle'] + kb_values
+            if current_kb in self.kirchenbuch_filter['values']:
+                self.kirchenbuch_filter.set(current_kb)
+            else:
+                self.kirchenbuch_filter.current(0)
                 
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim Laden der Daten:\n{str(e)}")
+
+    def _extract_kirchenbuch_titel(self, dateiname: str) -> str:
+        """Extrahiert "Hb 1695-1718" aus Dateinamen wie "3282 Hb 1717 - 1695-1718 - F....jpg"."""
+        if not dateiname:
+            return ''
+        match = re.search(r"\b([A-Z][a-z])\s+\d{4}\s+-\s*(\d{4}-\d{4})", str(dateiname))
+        if not match:
+            return ''
+        return f"{match.group(1)} {match.group(2)}"
     
     def _is_valid_date(self, datum: str, jahr: Optional[int]) -> bool:
         """
-        Prüft ob ein Datum gültig ist (Jahr zwischen 1500 und 1700).
+        Prüft ob ein Datum gültig ist (Jahr zwischen 1500 und 1754).
         
         Args:
             datum: Datumsstring (z.B. "20.11.1564" oder "00.03.1616")
@@ -2285,9 +4507,9 @@ class KarteikartenGUI:
         if not datum:
             return True  # Leeres Datum ist "gültig" (keine Fehlermeldung)
         
-        # Prüfe ob Jahr im gültigen Bereich (1500-1700)
+        # Prüfe ob Jahr im gültigen Bereich (1500-1754)
         if jahr is not None:
-            if jahr < 1500 or jahr > 1700:
+            if jahr < 1500 or jahr > 1754:
                 return False
         
         # Prüfe Datumsformat: dd.mm.yyyy oder 00.mm.yyyy
@@ -2303,8 +4525,8 @@ class KarteikartenGUI:
             monat = int(monat_str)
             jahr_aus_datum = int(jahr_str)
             
-            # Jahr muss zwischen 1500 und 1700 liegen
-            if jahr_aus_datum < 1500 or jahr_aus_datum > 1700:
+            # Jahr muss zwischen 1500 und 1754 liegen
+            if jahr_aus_datum < 1500 or jahr_aus_datum > 1754:
                 return False
             
             # Monat muss zwischen 1 und 12 liegen
@@ -2321,21 +4543,23 @@ class KarteikartenGUI:
             return False
     
     def _sort_by_page_and_number(self):
-        """Sortiert die Treeview nach Seite und dann nach Nummer."""
+        """Sortiert die Treeview nach Filmnummer, dann Seite, dann Nummer."""
         # Hole alle Items mit ihren Werten
         import re
         data = []
         for item in self.tree.get_children(''):
             values = self.tree.item(item)['values']
-            # Korrekte Indizes: values[5] = Seite, values[6] = Nr, values[15] = Dateiname
+            # Korrekte Indizes: values[5] = Seite, values[6] = Nr, values[21] = Dateiname
             seite = values[5] if len(values) > 5 else ''
             nummer = values[6] if len(values) > 6 else ''
-            dateiname = values[15] if len(values) > 15 else ''
-            # Filmnummer extrahieren (z.B. F102779700)
+            dateiname = values[21] if len(values) > 21 else ''  # Index 21 = Dateiname
+            
+            # Filmnummer extrahieren (z.B. F102779699 aus "0012 Hb 1564 - 1564-1611 - F102779699_erf.jpg")
             filmnummer = ''
             m = re.search(r'(F\d{9,})', str(dateiname))
             if m:
                 filmnummer = m.group(1)
+            
             # Konvertiere zu Integer für numerische Sortierung
             try:
                 seite_int = int(seite) if seite else 0
@@ -2345,11 +4569,28 @@ class KarteikartenGUI:
                 nummer_int = int(nummer) if nummer else 0
             except (ValueError, TypeError):
                 nummer_int = 0
-            data.append((filmnummer, seite_int, nummer_int, item))
-        # Sortiere nach Filmnummer (alphanum), dann Seite, dann Nummer
-        data.sort(key=lambda x: (x[0], x[1], x[2]))
+            
+            data.append((filmnummer, seite_int, nummer_int, dateiname, item))
+        
+        # DEBUG: Zeige erste 10 Einträge vor Sortierung
+        print(f"\nDEBUG: Sortierung nach Film/Seite/Nr.")
+        print(f"Anzahl Einträge: {len(data)}")
+        print(f"Erste 10 Einträge (vor Sortierung):")
+        for i, (film, seite, nr, datei, _) in enumerate(data[:10]):
+            print(f"  {i+1}. Film={film or '(keine)'}, Seite={seite}, Nr={nr}, Datei={datei}")
+        
+        # Sortiere nach Filmnummer, dann Seite, dann Nummer
+        # Wichtig: Leere Filmnummern ans Ende
+        data.sort(key=lambda x: (x[0] if x[0] else 'ZZZZZZ', x[1], x[2]))
+        
+        # DEBUG: Zeige erste 10 Einträge nach Sortierung
+        print(f"\nErste 10 Einträge (nach Sortierung):")
+        for i, (film, seite, nr, datei, _) in enumerate(data[:10]):
+            print(f"  {i+1}. Film={film or '(keine)'}, Seite={seite}, Nr={nr}, Datei={datei}")
+        print()
+        
         # Reorganisiere die Items in der Treeview
-        for index, (_, _, _, item) in enumerate(data):
+        for index, (_, _, _, _, item) in enumerate(data):
             self.tree.move(item, '', index)
         # Zeige Sortierung in Spaltenüberschriften an
         for column in self.tree['columns']:
@@ -2366,12 +4607,116 @@ class KarteikartenGUI:
         # Update Status
         self.db_status_label.config(text=f"{len(data)} Datensätze - sortiert nach Film/Seite/Nr.")
     
+    def _filter_invalid_citations(self):
+        """Zeigt nur Datensätze an, die NICHT dem exakten formatierten Zitations-Muster entsprechen."""
+        import re
+
+        # STRIKTES Pattern für KORREKT formatierte Zitation
+        # Format: "ev. Kb. Wetzlar [⚰∞] YYYY.MM.DD. p. X Nr. Y "
+        # - Kleinbuchstaben "p." (nicht "P.")
+        # - Genau ein Leerzeichen zwischen Elementen
+        # - Kein Komma vor "Nr."
+        # - Punkt nach "ev", "Kb", "DD", aber NICHT nach "Wetzlar"
+        valid_pattern = r"^ev\. Kb\. Wetzlar [⚰∞\u26B0] \d{4}\.\d{2}\.\d{2}\. p\. \d+ Nr\. \d+ "
+        
+        # Sammle alle Items, die NICHT dem exakten Muster entsprechen
+        invalid_items = []
+        valid_count = 0
+        
+        for item in self.tree.get_children(''):
+            values = self.tree.item(item)['values']
+            # Index 21 = Text (erkannter_text)
+            if len(values) > 21:
+                text = str(values[21])
+            else:
+                continue
+            
+            # Prüfe: beginnt NICHT mit "inf" UND matched NICHT das strikte Pattern
+            if not text.lower().startswith('inf'):
+                match = re.match(valid_pattern, text)
+                if not match:
+                    invalid_items.append(item)
+                    # Debug: Zeige erste 5 ungültige mit Fehleranalyse
+                    if len(invalid_items) <= 5:
+                        # Analysiere wo die Abweichung ist
+                        abweichungen = []
+                        
+                        # Erwartetes Format: "ev. Kb. Wetzlar [⚰∞] YYYY.MM.DD. p. X Nr. Y "
+                        if not text.startswith("ev. Kb. Wetzlar "):
+                            if text.startswith("ev. Kb. Wetzlar."):
+                                abweichungen.append("Punkt nach 'Wetzlar'")
+                            elif "Wetzlar" in text[:30]:
+                                idx = text.index("Wetzlar") + 7
+                                abweichungen.append(f"Fehler nach Wetzlar: '{text[idx:idx+5]}'")
+                            else:
+                                abweichungen.append("Prefix fehlt/falsch")
+                        
+                        # Prüfe auf großes P
+                        if re.search(r'\bP\.', text[:80]):
+                            abweichungen.append("Großes 'P.' statt 'p.'")
+                        
+                        # Prüfe auf Komma vor Nr.
+                        if re.search(r'p\.\s*\d+\s*,\s*Nr\.', text[:80]):
+                            abweichungen.append("Komma vor 'Nr.'")
+                        
+                        # Prüfe auf pp. statt p.
+                        if re.search(r'\bpp\.', text[:80], re.IGNORECASE):
+                            abweichungen.append("'pp.' statt 'p.'")
+                        
+                        # Prüfe Datumsformat
+                        datum_match = re.search(r'(\d{4})[\.,\s]+(\d{1,2})[\.,\s]+(\d{1,2})', text[:50])
+                        if datum_match:
+                            jahr, monat, tag = datum_match.groups()
+                            if len(monat) == 1 or len(tag) == 1:
+                                abweichungen.append(f"Datum ohne führende Null: {jahr}.{monat}.{tag}")
+                            # Prüfe auf Komma im Datum
+                            if ',' in datum_match.group(0):
+                                abweichungen.append("Komma im Datum")
+                        
+                        fehler_text = ", ".join(abweichungen) if abweichungen else "Unbekannte Abweichung"
+                        print(f"DEBUG UNGÜLTIG [{fehler_text}]: {repr(text[:100])}")
+                else:
+                    valid_count += 1
+                    # Debug: Zeige erste 3 gültige an
+                    if valid_count <= 3:
+                        print(f"DEBUG GÜLTIG: {repr(text[:100])}")
+        
+        print(f"DEBUG: Gültige: {valid_count}, Ungültige: {len(invalid_items)}")
+        
+        # Deselektiere alles
+        self.tree.selection_remove(*self.tree.get_children(''))
+        
+        # Selektiere nur die ungültigen Items
+        if invalid_items:
+            for item in invalid_items:
+                self.tree.selection_add(item)
+            # Scrolle zum ersten ungültigen Item
+            self.tree.see(invalid_items[0])
+            self.db_status_label.config(text=f"{len(invalid_items)} Datensätze mit ungültiger Formatierung ausgewählt")
+            messagebox.showinfo(
+                "Ungültige Zitationen gefunden",
+                f"{len(invalid_items)} Datensätze haben KEINE korrekte Formatierung.\n"
+                f"({valid_count} sind korrekt formatiert)\n\n"
+                f"Korrektes Format:\n"
+                f"'ev. Kb. Wetzlar ⚰ YYYY.MM.DD. p. X Nr. Y ...'\n\n"
+                f"Häufige Fehler:\n"
+                f"- Großbuchstaben 'P.' statt 'p.'\n"
+                f"- Komma vor 'Nr.': 'p. 18, Nr. 3'\n"
+                f"- Punkt nach 'Wetzlar': 'Wetzlar.'\n"
+                f"- Falsche Leerzeichen\n\n"
+                f"Tipp: Mit '📋 Zitation formatieren' korrigieren."
+            )
+        else:
+            self.db_status_label.config(text="Alle Zitationen korrekt formatiert")
+            messagebox.showinfo("Filter", "Alle Datensätze (außer 'inf'-Einträge) haben korrekt formatierte Zitationen!")
+    
     def _clear_filters(self):
         """Löscht alle Filter."""
         self.id_filter.delete(0, tk.END)
         self.year_filter.set('Alle')
         self.type_filter.current(0)
         self.filename_filter.current(0)
+        self.kirchenbuch_filter.current(0)
         self.name_search.delete(0, tk.END)
         self._refresh_db_list()
     
@@ -2381,6 +4726,9 @@ class KarteikartenGUI:
             self.sort_reverse[col] = False
         else:
             self.sort_reverse[col] = not self.sort_reverse[col]
+        
+        # Speichere die aktuell sortierte Spalte
+        self._last_sorted_column = col
         
         reverse = self.sort_reverse[col]
         numeric_columns = ['ID', 'Jahr', 'Seite', 'Nr']
@@ -2461,11 +4809,35 @@ class KarteikartenGUI:
             if item not in self.tree.selection():
                 self.tree.selection_set(item)
             self.tree_menu.post(event.x_root, event.y_root)
+
+    def _copy_selected_rows_to_clipboard(self):
+        """Kopiert die ausgewählten Zeilen als TSV in die Zwischenablage."""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Keine Auswahl", "Bitte mindestens einen Eintrag auswählen.")
+            return
+
+        columns = list(self.tree['columns'])
+        header = "\t".join(columns)
+        rows = []
+        for item in selection:
+            values = self.tree.item(item).get('values', [])
+            row = ["" if value is None else str(value) for value in values]
+            rows.append("\t".join(row))
+
+        text = "\n".join([header] + rows)
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
     
     def _clear_ocr_field_labels(self):
         """Löscht die erkannten Felder im OCR-Tab."""
-        for field in self.ocr_field_labels:
-            self.ocr_field_labels[field].config(text="—", foreground="gray")
+        if hasattr(self, 'ocr_field_vars'):
+            for field_key, var in self.ocr_field_vars.items():
+                var.set("")
+        else:
+            for field in self.ocr_field_labels:
+                self.ocr_field_labels[field].config(text="—", foreground="gray")
         
         # Lösche auch die gespeicherten erkannten Felder
         if hasattr(self, '_last_recognized_fields'):
@@ -2473,6 +4845,71 @@ class KarteikartenGUI:
         
         # Setze Status zurück
         self.db_record_status.config(text="", foreground="blue")
+
+    def _set_ocr_field_value(self, field_key: str, value):
+        if not hasattr(self, 'ocr_field_vars'):
+            return
+        if field_key not in self.ocr_field_vars:
+            return
+        self.ocr_field_vars[field_key].set(value or "")
+
+    def _get_ocr_field_value(self, field_key: str) -> Optional[str]:
+        if not hasattr(self, 'ocr_field_vars'):
+            return None
+        var = self.ocr_field_vars.get(field_key)
+        if not var:
+            return None
+        value = var.get().strip()
+        return value if value else None
+
+    def _load_ocr_fields_from_db(self, record_id: int):
+        cursor = self.db.conn.cursor()
+        cursor.execute(
+            """
+            SELECT vorname, nachname, partner, stand, braeutigam_stand, beruf, ort, seite, nummer, todestag,
+                   geb_jahr_gesch, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                   ereignis_typ
+            FROM karteikarten WHERE id = ?
+            """,
+            (record_id,)
+        )
+        row = cursor.fetchone()
+        if not row:
+            return
+
+        (vorname, nachname, partner, stand, braeutigam_stand, beruf, ort, seite, nummer, todestag,
+         geb_jahr_gesch, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+         ereignis_typ) = row
+
+        is_marriage = bool(ereignis_typ and str(ereignis_typ).lower().startswith('heirat'))
+
+        self._set_ocr_field_value('vorname', vorname)
+        self._set_ocr_field_value('nachname', nachname)
+        self._set_ocr_field_value('partner', partner)
+        self._set_ocr_field_value('beruf', beruf)
+        self._set_ocr_field_value('ort', ort)
+        self._set_ocr_field_value('seite', str(seite) if seite is not None else None)
+        self._set_ocr_field_value('nummer', str(nummer) if nummer is not None else None)
+        self._set_ocr_field_value('todestag', todestag)
+        self._set_ocr_field_value('geb.jahr (gesch.)', str(geb_jahr_gesch) if geb_jahr_gesch is not None else None)
+        self._set_ocr_field_value('bräutigam stand', braeutigam_stand)
+        self._set_ocr_field_value('bräutigam vater', braeutigam_vater)
+        self._set_ocr_field_value('braut vater', braut_vater)
+        self._set_ocr_field_value('braut nachname', braut_nachname)
+        self._set_ocr_field_value('braut ort', braut_ort)
+
+        if is_marriage:
+            self._set_ocr_field_value('braut stand', stand)
+            self._set_ocr_field_value('stand', None)
+        else:
+            self._set_ocr_field_value('stand', stand)
+            self._set_ocr_field_value('braut stand', None)
+
+    def _on_tab_changed(self, event):
+        selected = event.widget.select()
+        if hasattr(self, 'ocr_tab') and selected == str(self.ocr_tab):
+            if self.current_db_record_id:
+                self._load_ocr_fields_from_db(self.current_db_record_id)
     
     def _show_selected_card(self):
         """Zeigt die ausgewählte Karteikarte im OCR-Tab."""
@@ -2484,12 +4921,13 @@ class KarteikartenGUI:
         record_id = self.tree.item(item)['values'][0]
         
         cursor = self.db.conn.cursor()
-        cursor.execute("SELECT dateipfad, erkannter_text FROM karteikarten WHERE id = ?", (record_id,))
+        cursor.execute("SELECT dateipfad, erkannter_text, kirchenbuchtext FROM karteikarten WHERE id = ?", (record_id,))
         row = cursor.fetchone()
         
         if row:
             dateipfad = Path(row[0])
             erkannter_text = row[1]
+            kirchenbuchtext = row[2] if len(row) > 2 and row[2] else ""
             try:
                 idx = self.image_files.index(dateipfad)
                 self.current_index = idx
@@ -2502,6 +4940,26 @@ class KarteikartenGUI:
                 
                 self.text_display.delete("1.0", tk.END)
                 self.text_display.insert("1.0", erkannter_text)
+
+                # OCR-Felder aus DB laden (editierbar)
+                self._load_ocr_fields_from_db(record_id)
+                
+                # Kirchenbuchtext anzeigen
+                self.kirchenbuch_text_display.delete("1.0", tk.END)
+                if kirchenbuchtext:
+                    self.kirchenbuch_text_display.insert("1.0", kirchenbuchtext)
+                
+                # F-ID und Gramps laden
+                cursor = self.db.conn.cursor()
+                cursor.execute("SELECT notiz, gramps FROM karteikarten WHERE id = ?", (record_id,))
+                row_data = cursor.fetchone()
+                self.fid_entry.delete(0, tk.END)
+                self.gramps_entry.delete(0, tk.END)
+                if row_data:
+                    if row_data[0]:  # notiz
+                        self.fid_entry.insert(0, row_data[0])
+                    if row_data[1]:  # gramps
+                        self.gramps_entry.insert(0, row_data[1])
                 
                 self.notebook.select(0)
             except ValueError:
@@ -2530,235 +4988,214 @@ class KarteikartenGUI:
             text_widget.insert("1.0", row[0])
             text_widget.config(state=tk.DISABLED)
     
-    def _edit_and_reprocess_text(self):
-        """Öffnet den Text zum Bearbeiten und verarbeitet ihn mit Post-Processing neu."""
+    def _edit_fid(self):
+        """Öffnet Dialog zum Bearbeiten der F-ID (Notiz-Feld)."""
         selection = self.tree.selection()
         if not selection:
             return
         
+        # Bei Mehrfachauswahl nur den ersten Eintrag bearbeiten
         item = selection[0]
         record_id = self.tree.item(item)['values'][0]
         
+        # Aktuellen F-ID Wert aus DB holen
         cursor = self.db.conn.cursor()
-        cursor.execute("SELECT erkannter_text, dateiname, dateipfad FROM karteikarten WHERE id = ?", (record_id,))
+        cursor.execute("SELECT notiz, dateiname FROM karteikarten WHERE id = ?", (record_id,))
         row = cursor.fetchone()
         
         if not row:
             return
         
-        original_text = row[0]
+        current_fid = row[0] if row[0] else ""
         dateiname = row[1]
-        dateipfad = row[2]
         
-        # Erstelle Bearbeitungsfenster - GRÖßER für Bild + Text
-        edit_window = tk.Toplevel(self.root)
-        edit_window.title(f"Text bearbeiten: {dateiname}")
-        edit_window.geometry("1400x800")  # Breit genug für Bild + Text
+        # Dialog erstellen
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"F-ID bearbeiten: {dateiname}")
+        dialog.geometry("400x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
         
-        # Hauptcontainer mit zwei Spalten
-        main_frame = ttk.Frame(edit_window)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        # Label
+        label_frame = ttk.Frame(dialog)
+        label_frame.pack(fill=tk.X, padx=20, pady=(20, 10))
+        ttk.Label(label_frame, text="F-ID:", font=("Arial", 10, "bold")).pack(anchor=tk.W)
         
-        # === LINKE SPALTE: Bildanzeige ===
-        left_frame = ttk.Frame(main_frame, width=650)
-        left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=False, padx=(0, 10))
-        left_frame.pack_propagate(False)
+        # Eingabefeld
+        entry_var = tk.StringVar(value=current_fid)
+        entry = ttk.Entry(dialog, textvariable=entry_var, font=("Arial", 12), width=30)
+        entry.pack(padx=20, pady=10)
+        entry.focus()
+        entry.select_range(0, tk.END)
         
-        # Info-Label
-        ttk.Label(left_frame, text=f"Datenbank-ID: {record_id}", font=("Arial", 9, "bold")).pack(anchor=tk.W, pady=(0, 2))
-        ttk.Label(left_frame, text=f"Datei: {dateiname}", font=("Arial", 9)).pack(anchor=tk.W, pady=(0, 10))
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill=tk.X, padx=20, pady=10)
         
-        # Bild laden und anzeigen
-        image_label = ttk.Label(left_frame, text="Bild wird geladen...", relief=tk.SUNKEN, anchor=tk.CENTER)
-        image_label.pack(fill=tk.BOTH, expand=True)
-        
-        try:
-            image = Image.open(dateipfad)
+        def save_fid():
+            new_fid = entry_var.get().strip()
             
-            # Skaliere Bild auf max 600px Breite
-            display_width = 600
-            aspect_ratio = image.height / image.width
-            display_height = int(display_width * aspect_ratio)
+            # In Datenbank speichern
+            cursor = self.db.conn.cursor()
+            cursor.execute("UPDATE karteikarten SET notiz = ? WHERE id = ?", (new_fid, record_id))
+            self.db.conn.commit()
             
-            image_resized = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
-            photo_image = ImageTk.PhotoImage(image_resized)
+            # TreeView aktualisieren
+            values = list(self.tree.item(item)['values'])
+            # Notiz ist Spalte 21 (0-basiert)
+            values[21] = new_fid
+            self.tree.item(item, values=values)
             
-            image_label.configure(image=photo_image, text="")
-            image_label.image = photo_image  # Referenz behalten
+            # Tag aktualisieren (grün wenn F-ID gesetzt)
+            current_tags = list(self.tree.item(item)['tags'])
+            if new_fid:
+                if 'has_notiz' not in current_tags:
+                    current_tags.append('has_notiz')
+            else:
+                if 'has_notiz' in current_tags:
+                    current_tags.remove('has_notiz')
+            self.tree.item(item, tags=current_tags)
             
-        except Exception as e:
-            image_label.configure(text=f"❌ Fehler beim Laden:\n{str(e)}")
+            dialog.destroy()
         
-        # === RECHTE SPALTE: TEXTBEARBEITUNG ===
-        right_frame = ttk.Frame(main_frame)
-        right_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True)
+        def cancel():
+            dialog.destroy()
         
-        # Textfeld mit Original
-        text_frame = ttk.Frame(right_frame)
-        text_frame.pack(fill=tk.BOTH, expand=True)
+        ttk.Button(button_frame, text="Speichern", command=save_fid).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Abbrechen", command=cancel).pack(side=tk.LEFT, padx=5)
         
-        ttk.Label(text_frame, text="Erkannter Text (bearbeitbar):", font=("Arial", 10, "bold")).pack(anchor=tk.W, pady=(0, 5))
+        # Enter-Taste zum Speichern
+        entry.bind('<Return>', lambda e: save_fid())
+        # Escape zum Abbrechen
+        dialog.bind('<Escape>', lambda e: cancel())
+
+    def _edit_geb_jahr_gesch(self):
+        """Öffnet Dialog zum Bearbeiten des geschätzten Geburtsjahrs durch Eingabe des Alters."""
+        # Hole aktuelles Todestag-Feld
+        todestag = self._get_ocr_field_value('todestag')
         
-        # Scrollbar + Textfeld
-        text_container = ttk.Frame(text_frame)
-        text_container.pack(fill=tk.BOTH, expand=True)
+        if not todestag:
+            messagebox.showwarning(
+                "Kein Todestag",
+                "Bitte zuerst das Feld 'Todestag' ausfüllen.\n\n"
+                "Das Geburtsjahr wird berechnet als: Todestag - Alter"
+            )
+            return
         
-        scrollbar = ttk.Scrollbar(text_container)
-        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        # Extrahiere Jahr aus Todestag (Format: YYYY.MM.DD oder YYYY-MM-DD)
+        import re
+        jahr_match = re.match(r'(\d{4})', todestag)
+        if not jahr_match:
+            messagebox.showerror(
+                "Ungültiges Datum",
+                f"Das Todestag-Format ist ungültig: {todestag}\n\n"
+                "Erwartet: YYYY.MM.DD oder YYYY-MM-DD"
+            )
+            return
         
-        text_widget = tk.Text(text_container, wrap=tk.WORD, font=("Arial", 14), yscrollcommand=scrollbar.set)
-        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        scrollbar.config(command=text_widget.yview)
+        todes_jahr = int(jahr_match.group(1))
         
-        text_widget.insert("1.0", original_text)
+        # Hole aktuelles Geburtsjahr (falls bereits gesetzt)
+        current_geb_jahr = self._get_ocr_field_value('geb.jahr (gesch.)')
+        current_alter = None
+        if current_geb_jahr and current_geb_jahr.isdigit():
+            current_alter = todes_jahr - int(current_geb_jahr)
         
-        # === SCHNELLEINGABE-BUTTONS (wie im OCR-Tab) ===
-        special_chars_frame = ttk.Frame(right_frame)
-        special_chars_frame.pack(fill=tk.X, pady=(10, 0))
+        # Dialog erstellen
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Geschätztes Geburtsjahr berechnen")
+        dialog.geometry("450x250")
+        dialog.transient(self.root)
+        dialog.grab_set()
         
-        ttk.Label(special_chars_frame, text="Schnelleingabe:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+        # Info-Frame
+        info_frame = ttk.Frame(dialog)
+        info_frame.pack(fill=tk.X, padx=20, pady=(20, 10))
         
-        # Buttons in gewünschter Reihenfolge: ev. Kb. Wetzlar - ∞ Heirat - p. - Nr.
-        kb_btn = ttk.Button(
-            special_chars_frame,
-            text="ev. Kb. Wetzlar",
-            width=15,
-            command=lambda: text_widget.insert(tk.INSERT, "ev. Kb. Wetzlar ")
+        ttk.Label(
+            info_frame, 
+            text=f"Todestag: {todestag} (Jahr: {todes_jahr})",
+            font=("Arial", 10, "bold")
+        ).pack(anchor=tk.W)
+        
+        ttk.Label(
+            info_frame,
+            text="Geben Sie das Alter in Jahren ein:",
+            font=("Arial", 9)
+        ).pack(anchor=tk.W, pady=(10, 0))
+        
+        # Eingabefeld für Alter
+        entry_frame = ttk.Frame(dialog)
+        entry_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        ttk.Label(entry_frame, text="Alter (Jahre):", font=("Arial", 10)).pack(side=tk.LEFT, padx=(0, 10))
+        
+        alter_var = tk.StringVar(value=str(current_alter) if current_alter else "")
+        alter_entry = ttk.Entry(entry_frame, textvariable=alter_var, font=("Arial", 12), width=10)
+        alter_entry.pack(side=tk.LEFT, padx=5)
+        alter_entry.focus()
+        alter_entry.select_range(0, tk.END)
+        
+        # Ergebnis-Label
+        result_label = ttk.Label(
+            dialog, 
+            text="", 
+            font=("Arial", 11, "bold"),
+            foreground="blue"
         )
-        kb_btn.pack(side=tk.LEFT, padx=2)
+        result_label.pack(pady=10)
         
-        infinity_btn = ttk.Button(
-            special_chars_frame, 
-            text="∞ Heirat", 
-            width=10,
-            command=lambda: text_widget.insert(tk.INSERT, "∞")
-        )
-        infinity_btn.pack(side=tk.LEFT, padx=2)
-        
-        coffin_btn = ttk.Button(
-            special_chars_frame,
-            text="⚰ Begraben",
-            width=10,
-            command=lambda: text_widget.insert(tk.INSERT, "⚰")
-        )
-        coffin_btn.pack(side=tk.LEFT, padx=2)
-        
-        p_btn = ttk.Button(
-            special_chars_frame,
-            text="p.",
-            width=5,
-            command=lambda: text_widget.insert(tk.INSERT, "p. ")
-        )
-        p_btn.pack(side=tk.LEFT, padx=2)
-        
-        nr_btn = ttk.Button(
-            special_chars_frame,
-            text="Nr.",
-            width=5,
-            command=lambda: text_widget.insert(tk.INSERT, "Nr. ")
-        )
-        nr_btn.pack(side=tk.LEFT, padx=2)
-        
-        # Strg+H Tastenkombination für ∞
-        def insert_infinity(event=None):
-            text_widget.insert(tk.INSERT, "∞")
-            return "break"
-        
-        text_widget.bind('<Control-h>', insert_infinity)
-        text_widget.bind('<Control-H>', insert_infinity)
-        
-        # Buttons-Frame unten
-        button_frame = ttk.Frame(right_frame)
-        button_frame.pack(fill=tk.X, pady=(10, 0))
-        
-        def apply_postprocessing():
-            """Wendet Post-Processing auf den aktuellen Text an."""
-            current_text = text_widget.get("1.0", "end-1c")  # WICHTIG: "end-1c" statt tk.END
-            
-            # Post-Processing anwenden
-            from .text_postprocessor import TextPostProcessor
-            processor = TextPostProcessor()
-            corrected_text = processor.process(current_text, aggressive=False)
-            
-            # Text ersetzen
-            text_widget.delete("1.0", tk.END)
-            text_widget.insert("1.0", corrected_text)
-            
-            # WICHTIG: Setze edit_window als parent, damit es nicht verschwindet!
-            # Und verwende after() um das Fenster im Fokus zu halten
-            edit_window.focus_force()  # Fokus zurück aufs Edit-Fenster
-            
-            # Info-Box mit edit_window als Parent
-            info_dialog = tk.Toplevel(edit_window)
-            info_dialog.title("Erfolg")
-            info_dialog.geometry("400x150")
-            info_dialog.transient(edit_window)  # Bleibt vor edit_window
-            info_dialog.grab_set()  # Modal
-            
-            ttk.Label(
-                info_dialog, 
-                text="✅ Text-Korrektur wurde angewendet!\n\n"
-                     "Sie können den Text jetzt noch manuell anpassen.\n\n"
-                     "Klicken Sie 'Änderungen speichern' wenn Sie fertig sind.",
-                font=("Arial", 10),
-                justify=tk.LEFT,
-                padding=20
-            ).pack()
-            
-            ttk.Button(
-                info_dialog, 
-                text="OK", 
-                command=lambda: [info_dialog.destroy(), edit_window.focus_force()]
-            ).pack(pady=10)
-            
-            # Zentriere Dialog über edit_window
-            info_dialog.update_idletasks()
-            x = edit_window.winfo_x() + (edit_window.winfo_width() - info_dialog.winfo_width()) // 2
-            y = edit_window.winfo_y() + (edit_window.winfo_height() - info_dialog.winfo_height()) // 2
-            info_dialog.geometry(f"+{x}+{y}")
-        
-        def save_changes():
-            """Speichert die Änderungen in der Datenbank."""
-            new_text = text_widget.get("1.0", "end-1c")  # WICHTIG: "end-1c" für korrekten Vergleich
-            
-            # Vergleiche mit Original (beide getrimmt)
-            if new_text.strip() == original_text.strip():
-                if messagebox.askyesno("Keine Änderungen", "Der Text wurde nicht geändert.\n\nTrotzdem schließen?"):
-                    edit_window.destroy()
-                return
-            
-            # Bestätigung vor dem Speichern
-            if not messagebox.askyesno(
-                "Änderungen speichern",
-                f"Möchten Sie die Änderungen wirklich in die Datenbank speichern?\n\n"
-                f"Datenbank-ID: {record_id}\n"
-                f"Datei: {dateiname}"
-            ):
-                return
-            
-            # Parse den neuen Text und speichere
-            try:
-                self.db.save_karteikarte(
-                    dateiname=dateiname,
-                    dateipfad=dateipfad,
-                    erkannter_text=new_text,
-                    ocr_methode="manual_edit"
+        # Berechne und zeige Vorschau
+        def update_preview(*args):
+            alter_str = alter_var.get().strip()
+            if alter_str and alter_str.isdigit():
+                alter = int(alter_str)
+                geb_jahr = todes_jahr - alter
+                result_label.config(
+                    text=f"➜ Geschätztes Geburtsjahr: {geb_jahr}\n({todes_jahr} - {alter} = {geb_jahr})"
                 )
-                
-                self._refresh_db_list()
-                
-                # ERST Fenster schließen, DANN Erfolgsmeldung
-                edit_window.destroy()
-                
-                messagebox.showinfo("Erfolg", f"Text wurde aktualisiert!\n\nDatenbank-ID: {record_id}")
-                
-            except Exception as e:
-                messagebox.showerror("Fehler", f"Fehler beim Speichern:\n{str(e)}")
+            else:
+                result_label.config(text="")
         
-        ttk.Button(button_frame, text="🔧 Text-Korrektur anwenden", command=apply_postprocessing).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="💾 Änderungen speichern", command=save_changes).pack(side=tk.LEFT, padx=5)
-        ttk.Button(button_frame, text="❌ Abbrechen", command=edit_window.destroy).pack(side=tk.RIGHT, padx=5)
-    
+        alter_var.trace('w', update_preview)
+        update_preview()  # Initiale Anzeige
+        
+        # Buttons
+        button_frame = ttk.Frame(dialog)
+        button_frame.pack(fill=tk.X, padx=20, pady=10)
+        
+        def save_geb_jahr():
+            alter_str = alter_var.get().strip()
+            if not alter_str or not alter_str.isdigit():
+                messagebox.showwarning("Ungültige Eingabe", "Bitte eine gültige Zahl eingeben.")
+                return
+            
+            alter = int(alter_str)
+            geb_jahr = todes_jahr - alter
+            
+            # Setze Wert im Feld
+            self._set_ocr_field_value('geb.jahr (gesch.)', str(geb_jahr))
+            
+            dialog.destroy()
+            
+            messagebox.showinfo(
+                "Gespeichert",
+                f"Geschätztes Geburtsjahr: {geb_jahr}\n\n"
+                f"Berechnung: {todes_jahr} - {alter} = {geb_jahr}\n\n"
+                "Nutzen Sie '📤 DB aktualisieren', um in die Datenbank zu speichern."
+            )
+        
+        def cancel():
+            dialog.destroy()
+        
+        ttk.Button(button_frame, text="💾 Speichern", command=save_geb_jahr).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="❌ Abbrechen", command=cancel).pack(side=tk.LEFT, padx=5)
+        
+        # Enter-Taste zum Speichern
+        alter_entry.bind('<Return>', lambda e: save_geb_jahr())
+        # Escape zum Abbrechen
+        dialog.bind('<Escape>', lambda e: cancel())
+
     def _delete_selected(self):
         """Löscht die ausgewählten Datensätze."""
         selection = self.tree.selection()
@@ -2819,12 +5256,31 @@ class KarteikartenGUI:
             dateipfad = str(self.current_image.absolute())
             ocr_methode = self.ocr_method if self.ocr_engine else 'unbekannt'
             
+            # Hole Kirchenbuchtext
+            kirchenbuchtext = self.kirchenbuch_text_display.get("1.0", tk.END).strip()
+            kirchenbuchtext = kirchenbuchtext if kirchenbuchtext else None
+            
+            # Hole F-ID
+            fid = self.fid_entry.get().strip()
+            fid = fid if fid else None
+            
+            # Hole Gramps
+            gramps = self.gramps_entry.get().strip()
+            gramps = gramps if gramps else None
+            
             record_id = self.db.save_karteikarte(
                 dateiname=dateiname,
                 dateipfad=dateipfad,
                 erkannter_text=text,
-                ocr_methode=ocr_methode
+                ocr_methode=ocr_methode,
+                kirchenbuchtext=kirchenbuchtext
             )
+            
+            # Update F-ID und Gramps separat (da save_karteikarte es nicht unterstützt)
+            if record_id:
+                cursor = self.db.conn.cursor()
+                cursor.execute("UPDATE karteikarten SET notiz = ?, gramps = ? WHERE id = ?", (fid, gramps, record_id))
+                self.db.conn.commit()
             
             self.current_db_record_id = record_id;
             
@@ -2845,20 +5301,80 @@ class KarteikartenGUI:
     def _show_statistics(self):
         """Zeigt Statistiken über die Datenbank."""
         try:
-            stats = self.db.get_statistics()
-            
-            msg = f"""Datenbank-Statistik:
-            
-Gesamtanzahl Karteikarten: {stats['gesamt']}
-Zeitraum: {stats['zeitraum']}
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM karteikarten")
+            total = cursor.fetchone()[0]
 
-Nach Ereignistyp:"""
-            
-            for typ, anzahl in stats.get('nach_typ', {}).items():
-                typ_name = typ or 'Unbekannt'
-                msg += f"\n  - {typ_name}: {anzahl}"
-            
-            messagebox.showinfo("Statistik", msg)
+            cursor.execute("SELECT ereignis_typ, COUNT(*) FROM karteikarten GROUP BY ereignis_typ ORDER BY ereignis_typ")
+            typ_stats = cursor.fetchall()
+
+            cursor.execute("SELECT COUNT(*) FROM karteikarten WHERE notiz IS NOT NULL AND notiz != ''")
+            with_fid = cursor.fetchone()[0]
+
+            cursor.execute("SELECT COUNT(*) FROM karteikarten WHERE gramps IS NOT NULL AND gramps != ''")
+            with_gramps = cursor.fetchone()[0]
+
+            # Je Typ: KB-Titel (aus dateiname) mit Anzahl Eintraege + ISO-Datumsbereich
+            cursor.execute(
+                "SELECT ereignis_typ, dateiname, iso_datum FROM karteikarten ORDER BY ereignis_typ, dateiname"
+            )
+            kb_rows = cursor.fetchall()
+
+            # dateiname-Muster: "NNNN Hb 1630 - 1611-1632 - F102779699_erf.jpg"
+            # KB-Titel = Typ-Kuerzel + Jahresbereich, z.B. "Hb 1611-1632"
+            kb_title_pattern = re.compile(r"\b([A-Z][a-z])\s+\d{4}\s+-\s*(\d{4}-\d{4})")
+
+            from collections import defaultdict
+
+            # {ereignis_typ -> {kb_titel -> {"count": int, "min_iso": str, "max_iso": str}}}
+            kb_per_typ = defaultdict(lambda: defaultdict(lambda: {"count": 0, "min_iso": None, "max_iso": None}))
+            for ereignis_typ, dateiname, iso_datum in kb_rows:
+                typ_key = ereignis_typ or "(leer)"
+                if dateiname:
+                    match = kb_title_pattern.search(str(dateiname))
+                    kb_titel = f"{match.group(1)} {match.group(2)}" if match else "(unbekannt)"
+                else:
+                    kb_titel = "(unbekannt)"
+
+                entry = kb_per_typ[typ_key][kb_titel]
+                entry["count"] += 1
+                if iso_datum:
+                    if entry["min_iso"] is None or iso_datum < entry["min_iso"]:
+                        entry["min_iso"] = iso_datum
+                    if entry["max_iso"] is None or iso_datum > entry["max_iso"]:
+                        entry["max_iso"] = iso_datum
+
+            lines = [
+                f"Gesamt: {total} Datensaetze",
+                f"Mit F-ID: {with_fid}",
+                f"Mit Gramps: {with_gramps}",
+                "",
+                "Nach Ereignistyp:",
+            ]
+
+            for typ, count in typ_stats:
+                typ_label = typ or "(leer)"
+                lines.append(f"  {typ_label}: {count}")
+
+            lines.append("")
+            lines.append("Kirchenbuecher je Typ:")
+            for typ, _count in typ_stats:
+                typ_label = typ or "(leer)"
+                lines.append(f"\n  [{typ_label}]")
+                kb_map = kb_per_typ.get(typ_label, {})
+                for kb_titel, data in sorted(kb_map.items()):
+                    min_iso = data["min_iso"] or "?"
+                    max_iso = data["max_iso"] or "?"
+                    lines.append(f"    {kb_titel:<16}  {data['count']:>4}  {min_iso} - {max_iso}")
+
+            win = tk.Toplevel(self.root)
+            win.title("Statistik")
+            win.geometry("540x520")
+
+            txt = tk.Text(win, font=("Arial", 11), wrap=tk.WORD)
+            txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+            txt.insert("1.0", "\n".join(lines))
+            txt.config(state=tk.DISABLED)
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim Abrufen der Statistik:\n{str(e)}")
     
@@ -2876,6 +5392,110 @@ Nach Ereignistyp:"""
                 messagebox.showinfo("Erfolg", f"Datenbank exportiert nach:\n{filepath}")
             except Exception as e:
                 messagebox.showerror("Fehler", f"Fehler beim Export:\n{str(e)}")
+    
+    def _export_gedcom(self):
+        """Exportiert die Datenbank als GEDCOM-Datei (GRAMPS-Dialekt)."""
+        # Prüfen ob Einträge ausgewählt sind
+        selection = self.tree.selection()
+        
+        # Dialog: Alle oder nur Auswahl exportieren
+        export_all = True
+        if selection:
+            result = messagebox.askyesnocancel(
+                "Export-Auswahl",
+                f"{len(selection)} Einträge sind ausgewählt.\n\n"
+                f"Ja = Nur Auswahl exportieren\n"
+                f"Nein = Alle Einträge exportieren\n"
+                f"Abbrechen = Export abbrechen"
+            )
+            if result is None:  # Cancel
+                return
+            export_all = not result  # Nein -> True, Ja -> False
+        
+        # Datei-Dialog
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".ged",
+            initialfile="karteikarten_export.ged",
+            filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")]
+        )
+        
+        if not filepath:
+            return
+        
+        try:
+            # Erstelle GedcomExporter
+            exporter = GedcomExporter(self.db.conn)
+            
+            # Filter-Parameter vorbereiten
+            filter_params = {}
+            
+            if not export_all and selection:
+                # Nur ausgewählte IDs exportieren
+                id_list = []
+                for item in selection:
+                    record_id = self.tree.item(item)['values'][0]
+                    id_list.append(record_id)
+                filter_params['id_list'] = id_list
+            
+            # Export durchführen
+            exported_count = exporter.export_to_gedcom(filepath, filter_params)
+            
+            # Erfolgsmeldung
+            messagebox.showinfo(
+                "Erfolg",
+                f"✅ GEDCOM-Export erfolgreich!\n\n"
+                f"Datei: {Path(filepath).name}\n"
+                f"Exportierte Datensätze: {exported_count}\n"
+                f"Format: GRAMPS-Dialekt\n\n"
+                f"Die Datei kann jetzt in GRAMPS oder andere\n"
+                f"Genealogie-Programme importiert werden."
+            )
+            
+        except ValueError as e:
+            messagebox.showwarning("Keine Daten", str(e))
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export:\n{str(e)}")
+
+    def _export_gedcom_selected_from_context(self):
+        """Exportiert per Kontextmenue nur die ausgewaehlten Datensaetze als GEDCOM."""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Keine Auswahl", "Bitte waehlen Sie mindestens einen Datensatz aus.")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".ged",
+            initialfile="karteikarten_export_auswahl.ged",
+            filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")]
+        )
+
+        if not filepath:
+            return
+
+        try:
+            exporter = GedcomExporter(self.db.conn)
+
+            id_list = []
+            for item in selection:
+                record_id = self.tree.item(item)['values'][0]
+                id_list.append(record_id)
+
+            filter_params = {'id_list': id_list}
+            exported_count = exporter.export_to_gedcom(filepath, filter_params)
+
+            messagebox.showinfo(
+                "Erfolg",
+                f"✅ GEDCOM-Export erfolgreich!\n\n"
+                f"Datei: {Path(filepath).name}\n"
+                f"Exportierte Datensaetze (Auswahl): {exported_count}\n"
+                f"Format: GRAMPS-Dialekt"
+            )
+
+        except ValueError as e:
+            messagebox.showwarning("Keine Daten", str(e))
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export:\n{str(e)}")
+
     
     def _import_csv(self):
         """Importiert Daten aus einer CSV-Datei in die Datenbank."""
@@ -2923,6 +5543,293 @@ Nach Ereignistyp:"""
             
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim Import:\n{str(e)}")
+
+    def _import_xlsx(self):
+        """Importiert Daten aus einer XLSX-Datei und aktualisiert vorhandene Datensätze."""
+        try:
+            import unicodedata
+
+            from openpyxl import load_workbook
+            from openpyxl.utils.datetime import from_excel
+        except Exception:
+            messagebox.showerror(
+                "Fehlendes Paket",
+                "Zum XLSX-Import wird das Paket 'openpyxl' benötigt.\n"
+                "Bitte installieren und erneut versuchen."
+            )
+            return
+
+        default_path = Path(
+            r"D:\projects\Wetzlar_csv\input\Merge\00_KB_1571-1613_Taufen_EINGABE001_V6--zur Sicherheit mit Vornamen.xlsx"
+        )
+        filepath = filedialog.askopenfilename(
+            title="XLSX-Datei zum Importieren auswählen",
+            initialdir=default_path.parent if default_path.parent.exists() else Path.home(),
+            initialfile=default_path.name,
+            filetypes=[("Excel-Dateien", "*.xlsx"), ("Alle Dateien", "*.*")]
+        )
+
+        if not filepath:
+            return
+
+        if not messagebox.askyesno(
+            "Import bestätigen",
+            f"⚠️ ACHTUNG: Import aus XLSX-Datei\n\n"
+            f"Datei: {Path(filepath).name}\n\n"
+            f"Der Abgleich erfolgt über dateiname = XLSX:Karteikarte.\n"
+            f"Gefundene Datensätze werden aktualisiert.\n\n"
+            f"Möchten Sie fortfahren?",
+            icon='warning'
+        ):
+            return
+
+        def normalize_text(value):
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text if text else None
+
+        def normalize_number(value):
+            if value is None:
+                return None
+            try:
+                if isinstance(value, float) and value.is_integer():
+                    return str(int(value))
+                if isinstance(value, int):
+                    return str(value)
+            except Exception:
+                pass
+            return str(value).strip() if str(value).strip() else None
+
+        def normalize_year(value):
+            if value is None or str(value).strip() == "":
+                return None
+            try:
+                return int(float(value))
+            except Exception:
+                return None
+
+        def normalize_date(value, wb_epoch):
+            if value is None or str(value).strip() == "":
+                return None
+            if hasattr(value, "strftime"):
+                return value.strftime("%d.%m.%Y")
+            if isinstance(value, (int, float)):
+                try:
+                    dt = from_excel(value, wb_epoch)
+                    if hasattr(dt, "strftime"):
+                        return dt.strftime("%d.%m.%Y")
+                except Exception:
+                    return None
+            text = str(value).strip()
+            match = re.match(r"^(\d{1,2})[\./-](\d{1,2})[\./-](\d{4})$", text)
+            if match:
+                day, month, year = match.groups()
+                return f"{day.zfill(2)}.{month.zfill(2)}.{year}"
+            match = re.match(r"^(\d{4})[\./-](\d{1,2})[\./-](\d{1,2})$", text)
+            if match:
+                year, month, day = match.groups()
+                return f"{day.zfill(2)}.{month.zfill(2)}.{year}"
+            return text
+
+        def iso_from_datum(datum):
+            if not datum:
+                return None
+            match = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", datum)
+            if not match:
+                return None
+            day, month, year = match.groups()
+            return f"{year}-{month}-{day}"
+
+        def stand_from_gender(value):
+            if value is None:
+                return None
+            text = str(value).strip().lower()
+            if text in {"m", "maennlich", "männlich", "male", "1"}:
+                return "Sohn"
+            if text in {"w", "weiblich", "female", "f", "2"}:
+                return "Tochter"
+            if "m" in text and "weib" not in text:
+                return "Sohn"
+            if "w" in text or "weib" in text:
+                return "Tochter"
+            return None
+
+        def normalize_key(value):
+            if value is None:
+                return None
+            text = str(value).strip()
+            if not text:
+                return None
+            text = text.replace("\u00A0", " ")
+            text = unicodedata.normalize("NFKC", text)
+            text = re.sub(r"\s+", " ", text)
+            return text.casefold()
+
+        def build_match_keys(value):
+            keys = set()
+            if value is None:
+                return keys
+            raw = str(value).strip()
+            if not raw:
+                return keys
+            raw = re.sub(r"_erf(?=\.(jpg|jpeg|png|tif|tiff)$)", "", raw, flags=re.IGNORECASE)
+            base = re.sub(r"\.(jpg|jpeg|png|tif|tiff)$", "", raw, flags=re.IGNORECASE)
+            base_no_inf = re.sub(r"_inf$", "", base, flags=re.IGNORECASE)
+            base_no_erf = re.sub(r"_erf$", "", base, flags=re.IGNORECASE)
+            base_no_inf_erf = re.sub(r"_erf$", "", base_no_inf, flags=re.IGNORECASE)
+            for candidate in (raw, base, base_no_inf, base_no_erf, base_no_inf_erf):
+                key = normalize_key(candidate)
+                if key:
+                    keys.add(key)
+            return keys
+
+        try:
+            wb = load_workbook(filename=filepath, read_only=True, data_only=True)
+            ws = wb.active
+
+            header_row = None
+            for row in ws.iter_rows(min_row=1, max_row=5, values_only=True):
+                if row and any(cell is not None for cell in row):
+                    header_row = row
+                    break
+
+            if not header_row:
+                messagebox.showerror("Fehler", "Keine Header-Zeile in der XLSX-Datei gefunden.")
+                return
+
+            headers = {str(name).strip(): idx for idx, name in enumerate(header_row) if name is not None}
+
+            required = [
+                "Karteikarte", "Jahr", "Datum Taufe", "Datum Geburt", "Seite", "Nummer",
+                "Karteikartentext", "Vorname Täufling", "Klarname", "Vorname Vater",
+                "Geschlecht Täufling", "Kirchenbucheintrag"
+            ]
+            missing = [name for name in required if name not in headers]
+            if missing:
+                messagebox.showerror(
+                    "Fehlende Spalten",
+                    "In der XLSX-Datei fehlen folgende Spalten:\n" + "\n".join(missing)
+                )
+                return
+
+            cursor = self.db.conn.cursor()
+            cursor.execute(
+                "SELECT id, dateiname FROM karteikarten WHERE dateiname IS NOT NULL AND dateiname <> ''"
+            )
+            key_to_ids = {}
+            for record_id, name in cursor.fetchall():
+                for key in build_match_keys(name):
+                    key_to_ids.setdefault(key, []).append(record_id)
+
+            updated = 0
+            not_found = 0
+            errors = 0
+
+            total_rows = max(ws.max_row - 1, 0)
+            self.db_progress['maximum'] = total_rows
+            self.db_progress['value'] = 0
+
+            created_at = "2026-01-16 00:00:00"
+            for row_index, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=1):
+                self.db_progress['value'] = row_index
+                self.root.update_idletasks()
+                try:
+                    dateiname = normalize_text(row[headers["Karteikarte"]])
+                    if not dateiname:
+                        continue
+
+                    row_keys = build_match_keys(dateiname)
+                    matched_ids = []
+                    for key in row_keys:
+                        if key in key_to_ids:
+                            matched_ids.extend(key_to_ids[key])
+                    matched_ids = list(dict.fromkeys(matched_ids))
+
+                    if not matched_ids:
+                        not_found += 1
+                        continue
+
+                    jahr = normalize_year(row[headers["Jahr"]])
+                    datum_taufe = normalize_date(row[headers["Datum Taufe"]], wb.epoch)
+                    datum_geburt = normalize_date(row[headers["Datum Geburt"]], wb.epoch)
+                    datum = datum_taufe or datum_geburt
+                    iso_datum = iso_from_datum(datum)
+                    seite = normalize_number(row[headers["Seite"]])
+                    nummer = normalize_number(row[headers["Nummer"]])
+                    erkannter_text = normalize_text(row[headers["Karteikartentext"]])
+                    vorname = normalize_text(row[headers["Vorname Täufling"]])
+                    nachname = normalize_text(row[headers["Klarname"]])
+                    partner = normalize_text(row[headers["Vorname Vater"]])
+                    stand = stand_from_gender(row[headers["Geschlecht Täufling"]])
+                    kirchenbuchtext = normalize_text(row[headers["Kirchenbucheintrag"]])
+
+                    for record_id in matched_ids:
+                        cursor.execute(
+                            """
+                            UPDATE karteikarten
+                            SET kirchengemeinde = ?,
+                                ereignis_typ = ?,
+                                jahr = ?,
+                                datum = ?,
+                                seite = ?,
+                                nummer = ?,
+                                erkannter_text = ?,
+                                ocr_methode = ?,
+                                erstellt_am = ?,
+                                aktualisiert_am = CURRENT_TIMESTAMP,
+                                iso_datum = ?,
+                                vorname = ?,
+                                nachname = ?,
+                                partner = ?,
+                                todestag = ?,
+                                ort = ?,
+                                stand = ?,
+                                kirchenbuchtext = ?,
+                                geb_jahr_gesch = ?
+                            WHERE id = ?
+                            """,
+                            (
+                                "ev. Kb. Wetzlar",
+                                "Taufe",
+                                jahr,
+                                datum,
+                                seite,
+                                nummer,
+                                erkannter_text,
+                                "Import",
+                                created_at,
+                                iso_datum,
+                                vorname,
+                                nachname,
+                                partner,
+                                datum,
+                                "Wetzlar",
+                                stand,
+                                kirchenbuchtext,
+                                jahr,
+                                record_id
+                            )
+                        )
+                    updated += len(matched_ids)
+                except Exception:
+                    errors += 1
+
+            self.db.conn.commit()
+            self._refresh_db_list()
+
+            self.db_progress['value'] = 0
+            messagebox.showinfo(
+                "XLSX-Import abgeschlossen",
+                f"✅ XLSX-Import abgeschlossen!\n\n"
+                f"Aktualisiert: {updated}\n"
+                f"Nicht gefunden (kein Match): {not_found}\n"
+                f"Fehler: {errors}"
+            )
+
+        except Exception as e:
+            self.db_progress['value'] = 0
+            messagebox.showerror("Fehler", f"Fehler beim XLSX-Import:\n{str(e)}")
     
     def _load_image_files(self):
         """Lädt alle Bilddateien aus dem Verzeichnis."""
@@ -3337,12 +6244,20 @@ Nach Ereignistyp:"""
         from .text_postprocessor import TextPostProcessor
         processor = TextPostProcessor()
         
+        # Progressbar initialisieren
+        self.db_progress['maximum'] = count
+        self.db_progress['value'] = 0
+        
         erfolge = 0
         fehler = 0
         
         cursor = self.db.conn.cursor()
         
-        for item in selection:
+        for idx, item in enumerate(selection):
+            # Progressbar aktualisieren
+            self.db_progress['value'] = idx
+            self.root.update_idletasks()
+            
             record_id = self.tree.item(item)['values'][0]
             
             try:
@@ -3371,6 +6286,9 @@ Nach Ereignistyp:"""
             except Exception as e:
                 fehler += 1
                 print(f"Fehler bei ID {record_id}: {str(e)}")
+        
+        # Progressbar zurücksetzen
+        self.db_progress['value'] = 0
         
         self._refresh_db_list()
         
@@ -4002,6 +6920,88 @@ Nach Ereignistyp:"""
             f"Erfolgreich geändert: {erfolge}\n"
             f"Keine Änderung nötig: {keine_aenderung}\n"
             f"Fehler: {fehler}"
+        )
+    
+    def _abgleich_families_ok(self):
+        """Gleicht Einträge mit families_ok.tsv ab und setzt F-ID."""
+        # Lade TSV-Datei
+        tsv_path = Path("input/families_ok.tsv")
+        if not tsv_path.exists():
+            messagebox.showerror(
+                "Fehler",
+                f"Datei nicht gefunden: {tsv_path}\n\n"
+                "Bitte stellen Sie sicher, dass die Datei im Ordner 'input' liegt."
+            )
+            return
+        
+        try:
+            with open(tsv_path, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f, delimiter='\t')
+                families = list(reader)
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Fehler beim Lesen der TSV-Datei:\n{e}")
+            return
+        
+        if not families:
+            messagebox.showwarning("Warnung", "Die TSV-Datei enthält keine Daten.")
+            return
+        
+        # Durchlaufe alle DB-Einträge
+        cursor = self.db.conn.cursor()
+        cursor.execute("""
+            SELECT id, iso_datum, dateiname, notiz
+            FROM karteikarten
+            WHERE ereignis_typ = 'Heirat'
+        """)
+        
+        db_entries = cursor.fetchall()
+        matched = 0
+        total = 0
+        skipped = 0
+        
+        for entry in db_entries:
+            db_id = entry[0]
+            db_iso_datum = (entry[1] or '').strip()
+            db_dateiname = (entry[2] or '').strip()
+            db_notiz = (entry[3] or '').strip()
+            
+            if not db_iso_datum or not db_dateiname:
+                continue
+            
+            total += 1
+            
+            # Überspringe wenn bereits F-ID vorhanden
+            if db_notiz:
+                skipped += 1
+                continue
+            
+            # Suche passende Familie
+            for family in families:
+                # Prüfe Bedingungen: citedatetr (ISO) und path (Dateiname)
+                tsv_iso_datum = (family.get('citedatetr', '') or '').strip()
+                tsv_path = (family.get('path', '') or '').strip()
+                
+                # Match wenn beide Bedingungen erfüllt
+                if tsv_iso_datum == db_iso_datum and tsv_path == db_dateiname:
+                    # Setze F-ID in notiz-Feld
+                    fid = (family.get('Familien-Kennung', '') or '').strip()
+                    if fid:
+                        cursor.execute(
+                            "UPDATE karteikarten SET notiz = ? WHERE id = ?",
+                            (fid, db_id)
+                        )
+                        matched += 1
+                        break
+        
+        self.db.conn.commit()
+        self._refresh_db_list()
+        
+        messagebox.showinfo(
+            "Abgleich abgeschlossen",
+            f"Abgleich mit families_ok.tsv abgeschlossen!\n\n"
+            f"Geprüfte Heiratseinträge: {total}\n"
+            f"Zugeordnete F-IDs: {matched}\n"
+            f"Übersprungen (bereits F-ID): {skipped}"
         )
     
     def _reset_autoincrement(self):
