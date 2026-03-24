@@ -1,0 +1,27 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+.venv-build/
+
+# Local/editor files
+.vscode/
+.python-version
+*.lnk
+*.bak
+
+# Runtime and local data
+output/
+test/
+credentials/
+*.db
+
+# OS files
+Thumbs.db
+Desktop.ini

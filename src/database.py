@@ -53,6 +53,7 @@ class KarteikartenDB:
                 -- OCR-Daten
                 erkannter_text TEXT,
                 ocr_methode TEXT,  -- easyocr, tesseract, cloud_vision
+                kirchenbuchtext TEXT,  -- Manuell eingegebener Kirchenbuchtext
                 
                 -- Extrahierte Felder
                 vorname TEXT,
@@ -61,9 +62,19 @@ class KarteikartenDB:
                 beruf TEXT,
                 todestag TEXT,
                 ort TEXT,
+                geb_jahr_gesch INTEGER,  -- Geschätztes Geburtsjahr (berechnet aus Todesdatum - Alter)
+                
+                -- Neue Felder für Heiraten
+                braeutigam_vater TEXT,
+                braut_vater TEXT,
+                braut_nachname TEXT,
+                braut_ort TEXT,
                 
                 -- Notiz (kurzer Text bis 10 Zeichen)
                 notiz TEXT,
+                
+                -- Gramps ID (10 Zeichen)
+                gramps TEXT,
                 
                 -- Timestamps
                 erstellt_am TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -96,7 +107,16 @@ class KarteikartenDB:
             ('beruf', 'TEXT'),
             ('todestag', 'TEXT'),
             ('ort', 'TEXT'),
+            ('geb_jahr_gesch', 'INTEGER'),
             ('stand', 'TEXT'),
+            ('braeutigam_stand', 'TEXT'),
+            ('braeutigam_vater', 'TEXT'),
+            ('braut_vater', 'TEXT'),
+            ('braut_nachname', 'TEXT'),
+            ('braut_ort', 'TEXT'),
+            ('kirchenbuchtext', 'TEXT'),
+            ('fid', 'TEXT'),  # Familien-ID aus families_ok.tsv
+            ('gramps', 'TEXT'),  # Gramps ID
         ]
         for field, ftype in new_fields:
             if field not in columns:
@@ -236,7 +256,10 @@ class KarteikartenDB:
     
     def save_karteikarte(self, dateiname: str, dateipfad: str, erkannter_text: str,
                         ocr_methode: str = 'cloud_vision', skip_if_exists: bool = False,
-                        vorname: str = None, nachname: str = None, partner: str = None, beruf: str = None, todestag: str = None, ort: str = None) -> int:
+                        vorname: str = None, nachname: str = None, partner: str = None, beruf: str = None, todestag: str = None, ort: str = None,
+                        geb_jahr_gesch: int = None,
+                        braeutigam_vater: str = None, braut_vater: str = None, braut_nachname: str = None, braut_ort: str = None,
+                        kirchenbuchtext: str = None) -> int:
         """
         Speichert eine Karteikarte in der Datenbank.
         
@@ -247,6 +270,7 @@ class KarteikartenDB:
             ocr_methode: Verwendete OCR-Methode
             skip_if_exists: Wenn True, wird nichts getan wenn Eintrag bereits existiert (kein Update)
             vorname, nachname, partner, beruf, todestag, ort: Extrahierte Felder
+            braeutigam_vater, braut_vater, braut_nachname, braut_ort: Zusätzliche Felder für Heiraten
         Returns:
             ID des eingefügten/aktualisierten Datensatzes, oder None wenn übersprungen
         """
@@ -277,6 +301,12 @@ class KarteikartenDB:
                     beruf = ?,
                     todestag = ?,
                     ort = ?,
+                    geb_jahr_gesch = ?,
+                    braeutigam_vater = ?,
+                    braut_vater = ?,
+                    braut_nachname = ?,
+                    braut_ort = ?,
+                    kirchenbuchtext = ?,
                     aktualisiert_am = CURRENT_TIMESTAMP
                 WHERE dateipfad = ?
             """, (
@@ -284,8 +314,12 @@ class KarteikartenDB:
                 parsed['jahr'], parsed['datum'], parsed['iso_datum'], parsed['seite'], parsed['nummer'],
                 erkannter_text, ocr_methode,
                 vorname, nachname, partner, beruf, todestag, ort,
+                geb_jahr_gesch,
+                braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                kirchenbuchtext,
                 dateipfad
             ))
+            # Hinweis: notiz und gramps werden absichtlich NICHT überschrieben bei Updates
             self.conn.commit()
             return existing[0]
         else:
@@ -293,13 +327,19 @@ class KarteikartenDB:
                 INSERT INTO karteikarten (
                     dateiname, dateipfad, kirchengemeinde, ereignis_typ,
                     jahr, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode,
-                    vorname, nachname, partner, beruf, todestag, ort
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    vorname, nachname, partner, beruf, todestag, ort,
+                    geb_jahr_gesch,
+                    braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                    kirchenbuchtext
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 dateiname, dateipfad, parsed['kirchengemeinde'], parsed['ereignis_typ'],
                 parsed['jahr'], parsed['datum'], parsed['iso_datum'], parsed['seite'], parsed['nummer'],
                 erkannter_text, ocr_methode,
-                vorname, nachname, partner, beruf, todestag, ort
+                vorname, nachname, partner, beruf, todestag, ort,
+                geb_jahr_gesch,
+                braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                kirchenbuchtext
             ))
             self.conn.commit()
             return cursor.lastrowid
@@ -420,6 +460,26 @@ class KarteikartenDB:
                     ocr_methode = row.get('ocr_methode', 'imported')
                     notiz = row.get('notiz')
                     
+                    # Extrahierte Felder
+                    vorname = row.get('vorname')
+                    nachname = row.get('nachname')
+                    partner = row.get('partner')
+                    stand = row.get('stand')
+                    beruf = row.get('beruf')
+                    todestag = row.get('todestag')
+                    ort = row.get('ort')
+                    geb_jahr_gesch = row.get('geb_jahr_gesch')
+                    
+                    # Heiratsfelder
+                    braeutigam_stand = row.get('braeutigam_stand')
+                    braeutigam_vater = row.get('braeutigam_vater')
+                    braut_vater = row.get('braut_vater')
+                    braut_nachname = row.get('braut_nachname')
+                    braut_ort = row.get('braut_ort')
+                    
+                    # Kirchenbuchtext
+                    kirchenbuchtext = row.get('kirchenbuchtext')
+                    
                     if not dateipfad or not erkannter_text:
                         fehler += 1
                         continue
@@ -446,10 +506,30 @@ class KarteikartenDB:
                                 erkannter_text = ?,
                                 ocr_methode = ?,
                                 notiz = ?,
+                                gramps = ?,
+                                vorname = ?,
+                                nachname = ?,
+                                partner = ?,
+                                stand = ?,
+                                beruf = ?,
+                                todestag = ?,
+                                ort = ?,
+                                geb_jahr_gesch = ?,
+                                braeutigam_stand = ?,
+                                braeutigam_vater = ?,
+                                braut_vater = ?,
+                                braut_nachname = ?,
+                                braut_ort = ?,
+                                kirchenbuchtext = ?,
                                 aktualisiert_am = CURRENT_TIMESTAMP
                             WHERE dateipfad = ?
                         """, (dateiname, kirchengemeinde, ereignis_typ, jahr_int, datum, iso_datum,
-                              seite, nummer, erkannter_text, ocr_methode, notiz, dateipfad))
+                              seite, nummer, erkannter_text, ocr_methode, notiz, row.get('gramps'),
+                              vorname, nachname, partner, stand, beruf, todestag, ort,
+                              geb_jahr_gesch,
+                              braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                              kirchenbuchtext,
+                              dateipfad))
                         aktualisiert += 1
                     else:
                         # Neuer Eintrag
@@ -458,19 +538,31 @@ class KarteikartenDB:
                             cursor.execute("""
                                 INSERT INTO karteikarten (
                                     id, dateiname, dateipfad, kirchengemeinde, ereignis_typ,
-                                    jahr, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    jahr, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz, gramps,
+                                    vorname, nachname, partner, stand, beruf, todestag, ort, geb_jahr_gesch,
+                                    braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                                    kirchenbuchtext
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (int(original_id), dateiname, dateipfad, kirchengemeinde, ereignis_typ,
-                                  jahr_int, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz))
+                                  jahr_int, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz, row.get('gramps'),
+                                  vorname, nachname, partner, stand, beruf, todestag, ort, geb_jahr_gesch,
+                                  braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                                  kirchenbuchtext))
                         else:
                             # Automatische ID-Vergabe
                             cursor.execute("""
                                 INSERT INTO karteikarten (
                                     dateiname, dateipfad, kirchengemeinde, ereignis_typ,
-                                    jahr, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                    jahr, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz, gramps,
+                                    vorname, nachname, partner, stand, beruf, todestag, ort, geb_jahr_gesch,
+                                    braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                                    kirchenbuchtext
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (dateiname, dateipfad, kirchengemeinde, ereignis_typ,
-                                  jahr_int, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz))
+                                  jahr_int, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz, row.get('gramps'),
+                                  vorname, nachname, partner, stand, beruf, todestag, ort, geb_jahr_gesch,
+                                  braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                                  kirchenbuchtext))
                         erfolge += 1
                         
                 except Exception as e:
