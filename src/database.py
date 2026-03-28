@@ -78,6 +78,10 @@ class KarteikartenDB:
                 -- Gramps ID (10 Zeichen)
                 gramps TEXT,
 
+                -- Reader-/Erkennungs-spezifische IDs
+                fid_reader TEXT,
+                fid_erkennung TEXT,
+
                 -- Offline-First Sync-Metadaten
                 version INTEGER DEFAULT 1,
                 updated_by TEXT,
@@ -139,6 +143,8 @@ class KarteikartenDB:
             ('kirchenbuchtext', 'TEXT'),
             ('fid', 'TEXT'),  # Familien-ID aus families_ok.tsv
             ('gramps', 'TEXT'),  # Gramps ID
+            ('fid_reader', 'TEXT'),
+            ('fid_erkennung', 'TEXT'),
             ('global_id', 'TEXT'),
             ('version', 'INTEGER DEFAULT 1'),
             ('updated_by', 'TEXT'),
@@ -547,6 +553,88 @@ class KarteikartenDB:
             # Daten
             writer.writerows(rows)
     
+    def export_full_backup(self, output_dir: str):
+        """Exportiert Karteikarten + Sync-Queue als zwei separate CSV-Dateien."""
+        import csv
+        from datetime import datetime
+        from pathlib import Path
+        
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        karteikarten_path = str(Path(output_dir) / f'_backup_karteikarten_{timestamp}.csv')
+        queue_path = str(Path(output_dir) / f'_backup_sync_queue_{timestamp}.csv')
+        
+        cursor = self.conn.cursor()
+        
+        # Export Karteikarten
+        cursor.execute('SELECT * FROM karteikarten ORDER BY jahr, datum, nummer')
+        rows = cursor.fetchall()
+        with open(karteikarten_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([desc[0] for desc in cursor.description])
+            writer.writerows(rows)
+        
+        # Export Sync-Queue
+        cursor.execute('SELECT * FROM sync_queue ORDER BY id')
+        queue_rows = cursor.fetchall()
+        with open(queue_path, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if queue_rows:
+                writer.writerow([desc[0] for desc in cursor.description])
+                writer.writerows(queue_rows)
+            else:
+                writer.writerow(['id', 'global_id', 'op', 'source', 'payload', 'base_version', 'created_at', 'retries', 'last_error', 'sent_at'])
+        
+        return karteikarten_path, queue_path
+
+    def restore_full_backup(self, karteikarten_csv: str, queue_csv: str = None):
+        """Importiert Karteikarten und Sync-Queue aus Backup-CSVs.
+        
+        Args:
+            karteikarten_csv: Pfad zur _backup_karteikarten_*.csv
+            queue_csv: Pfad zur _backup_sync_queue_*.csv (optional)
+        """
+        import csv
+        
+        cursor = self.conn.cursor()
+        
+        # 1. Leere die existierenden Tabellen
+        cursor.execute("DELETE FROM sync_queue")
+        cursor.execute("DELETE FROM karteikarten")
+        self.conn.commit()
+        
+        # 2. Importiere Karteikarten
+        with open(karteikarten_csv, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # Extrahiere alle Spalten
+                placeholders = ', '.join(['?' for _ in row.keys()])
+                cols = ', '.join(row.keys())
+                query = f"INSERT INTO karteikarten ({cols}) VALUES ({placeholders})"
+                
+                # Konvertiere Werte (ensure_ascii für JSON)
+                values = list(row.values())
+                cursor.execute(query, values)
+        
+        self.conn.commit()
+        
+        # 3. Importiere Sync-Queue falls vorhanden
+        if queue_csv:
+            try:
+                with open(queue_csv, 'r', encoding='utf-8') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        placeholders = ', '.join(['?' for _ in row.keys()])
+                        cols = ', '.join(row.keys())
+                        query = f"INSERT INTO sync_queue ({cols}) VALUES ({placeholders})"
+                        values = list(row.values())
+                        cursor.execute(query, values)
+                
+                self.conn.commit()
+            except Exception as e:
+                print(f"Warnung: Sync-Queue konnte nicht importiert werden: {e}")
+
     def import_from_csv(self, csv_path: str, preserve_ids: bool = True) -> Tuple[int, int, int]:
         """
         Importiert Karteikarten aus einer CSV-Datei.
@@ -706,3 +794,4 @@ class KarteikartenDB:
     def __del__(self):
         """Destruktor - schließt die Verbindung."""
         self.close()
+

@@ -1,9 +1,35 @@
 """Konfigurationsverwaltung für die Karteikarten-Anwendung."""
 
 import json
+import shutil
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
+
+
+def resolve_config_path(filename: str = "config.json") -> Path:
+    """Ermittelt den Pfad einer Konfigurationsdatei analog zum App-Modus."""
+    candidates = []
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        candidates.extend([exe_dir / filename, Path.cwd() / filename])
+    else:
+        project_root = Path(__file__).resolve().parent.parent
+        candidates.extend([project_root / filename, Path.cwd() / filename])
+    return next((p for p in candidates if p.exists()), candidates[0])
+
+
+def bootstrap_config(target: Union[str, Path], template_filename: str = "config.json") -> Path:
+    """Legt eine neue Konfigurationsdatei optional als Kopie einer bestehenden Vorlage an."""
+    target_path = Path(target)
+    if target_path.exists():
+        return target_path
+
+    template_path = resolve_config_path(template_filename)
+    if template_path.exists() and template_path != target_path:
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(template_path, target_path)
+    return target_path
 
 
 class Config:
@@ -16,6 +42,7 @@ class Config:
         "db_path": "",
         "online_sync": {
             "enabled": False,
+            "mode": "mysql",
             "endpoint_url": "",
             "db_user": "",
             "db_password": "",
@@ -24,6 +51,8 @@ class Config:
             "db_port": 3306,
             "api_key": "",
             "device_id": "",
+            "last_pull_cursor": "",
+            "last_pull_id": "",
             "source": "erkennung",
             "sync_interval_seconds": 20,
             "batch_size": 100
@@ -64,19 +93,7 @@ class Config:
             config_path: Pfad zur Config-Datei. Standard: config.json im Projektverzeichnis
         """
         if config_path is None:
-            candidates = []
-
-            # Im EXE-Betrieb liegt die gewünschte config.json typischerweise neben der EXE.
-            if getattr(sys, "frozen", False):
-                exe_dir = Path(sys.executable).resolve().parent
-                candidates.extend([exe_dir / "config.json", Path.cwd() / "config.json"])
-            else:
-                # Entwicklungsbetrieb: Projekt-Root (ein Level über src/)
-                project_root = Path(__file__).resolve().parent.parent
-                candidates.extend([project_root / "config.json", Path.cwd() / "config.json"])
-
-            # Nimm die erste vorhandene Datei, sonst den primären Zielpfad für spätere saves.
-            config_path = next((p for p in candidates if p.exists()), candidates[0])
+            config_path = resolve_config_path("config.json")
         
         self.config_path = Path(config_path)
         self.config = self._load()
@@ -177,13 +194,14 @@ class Config:
         self.set("online_sync", merged)
 
 
-# Globale Config-Instanz (Singleton-Pattern)
-_config_instance: Optional[Config] = None
+# Globale Config-Instanzen (pro Pfad)
+_config_instances: Dict[str, Config] = {}
 
 
-def get_config() -> Config:
-    """Gibt die globale Config-Instanz zurück (Singleton)."""
-    global _config_instance
-    if _config_instance is None:
-        _config_instance = Config()
-    return _config_instance
+def get_config(config_path: Optional[Union[str, Path]] = None) -> Config:
+    """Gibt eine Config-Instanz pro Pfad zurück."""
+    resolved = Path(config_path).resolve() if config_path is not None else resolve_config_path("config.json").resolve()
+    key = str(resolved)
+    if key not in _config_instances:
+        _config_instances[key] = Config(resolved)
+    return _config_instances[key]
