@@ -20,6 +20,7 @@ from .extraction_lists import (ANREDEN, ARTIKEL, BERUFE, BERUFS_EINLEITUNG,
                                WEIBLICHE_VORNAMEN)
 from .gedcom_exporter import GedcomExporter
 from .ocr_engine import OCREngine
+from .online_sync import OnlineSyncService
 
 
 class KarteikartenGUI:
@@ -134,6 +135,11 @@ class KarteikartenGUI:
         if not (self.config.db_path or "").strip():
             self.config.db_path = self.active_db_path
         
+        # Online-Sync Service
+        self._sync_service = OnlineSyncService()
+        self._sync_service.start_background(self.db)
+        self._sync_status_var: tk.StringVar  # wird in _create_settings_content gesetzt
+
         # Aktueller DB-Record (None = nicht gespeichert, ID = bereits in DB)
         self.current_db_record_id = None
         
@@ -3365,15 +3371,59 @@ class KarteikartenGUI:
             command=self._reset_column_widths
         ).pack(anchor=tk.W, pady=(10, 0))
         
-        # === Weitere Einstellungen (Platzhalter für zukünftige Features) ===
-        other_frame = ttk.LabelFrame(main_frame, text="Weitere Einstellungen", padding=15)
-        other_frame.pack(fill=tk.X)
-        
-        ttk.Label(
-            other_frame,
-            text="Weitere Konfigurationsoptionen werden hier hinzugefügt.",
-            foreground="gray"
-        ).pack(anchor=tk.W)
+        # === Online-Sync Einstellungen ===
+        sync_frame = ttk.LabelFrame(main_frame, text="🌐 Online-Synchronisation (MySQL)", padding=15)
+        sync_frame.pack(fill=tk.X, pady=(0, 20))
+
+        cfg = self.config.online_sync
+
+        # Aktivieren/Deaktivieren
+        self._sync_enabled_var = tk.BooleanVar(value=bool(cfg.get("enabled", False)))
+        ttk.Checkbutton(
+            sync_frame, text="Online-Sync aktivieren",
+            variable=self._sync_enabled_var
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        # Quelle dieser Instanz
+        src_row = ttk.Frame(sync_frame)
+        src_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(src_row, text="Diese Instanz ist:", width=20).pack(side=tk.LEFT)
+        self._sync_source_var = tk.StringVar(value=cfg.get("source", "erkennung"))
+        ttk.Radiobutton(src_row, text="Erkennung", variable=self._sync_source_var, value="erkennung").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(src_row, text="Reader", variable=self._sync_source_var, value="reader").pack(side=tk.LEFT, padx=4)
+
+        # Verbindungs-Felder
+        def _lbl_entry(parent, label, var, show=""):
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, width=20).pack(side=tk.LEFT)
+            e = ttk.Entry(row, textvariable=var, show=show)
+            e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+
+        self._sync_host_var = tk.StringVar(value=cfg.get("db_host", ""))
+        self._sync_port_var = tk.StringVar(value=str(cfg.get("db_port", 3306)))
+        self._sync_user_var = tk.StringVar(value=cfg.get("db_user", ""))
+        self._sync_pw_var = tk.StringVar(value=cfg.get("db_password", ""))
+        self._sync_db_var = tk.StringVar(value=cfg.get("db_name", ""))
+        self._sync_interval_var = tk.StringVar(value=str(cfg.get("sync_interval_seconds", 20)))
+
+        _lbl_entry(sync_frame, "DB-Host:", self._sync_host_var)
+        _lbl_entry(sync_frame, "DB-Port:", self._sync_port_var)
+        _lbl_entry(sync_frame, "DB-Benutzer:", self._sync_user_var)
+        _lbl_entry(sync_frame, "DB-Passwort:", self._sync_pw_var, show="*")
+        _lbl_entry(sync_frame, "DB-Name:", self._sync_db_var)
+        _lbl_entry(sync_frame, "Intervall (Sek):", self._sync_interval_var)
+
+        # Status + Buttons
+        btn_row = ttk.Frame(sync_frame)
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_row, text="💾 Speichern", command=self._save_sync_settings).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🔄 Jetzt synchronisieren", command=self._sync_now_clicked).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🔌 Verbindung testen", command=self._test_sync_connection).pack(side=tk.LEFT)
+
+        self._sync_status_var = tk.StringVar(value="–")
+        ttk.Label(sync_frame, textvariable=self._sync_status_var, foreground="blue").pack(anchor=tk.W, pady=(6, 0))
+        self._update_sync_status()
     
     def _choose_media_drive(self):
         """Öffnet einen Dialog zur Auswahl des Medien-Basis-Verzeichnisses."""
@@ -3467,6 +3517,90 @@ class KarteikartenGUI:
         except Exception as e:
             messagebox.showerror("DB-Fehler", f"Datenbank konnte nicht geladen werden:\n{e}")
     
+    # ------------------------------------------------------------------ #
+    #  Online-Sync Hilfsmethoden                                          #
+    # ------------------------------------------------------------------ #
+
+    def _save_sync_settings(self):
+        """Speichert die Online-Sync-Konfiguration und startet ggf. den Dienst neu."""
+        try:
+            port = int(self._sync_port_var.get().strip() or "3306")
+            interval = int(self._sync_interval_var.get().strip() or "20")
+        except ValueError:
+            messagebox.showwarning("Eingabefehler", "Port und Intervall müssen ganze Zahlen sein.")
+            return
+
+        new_cfg = {
+            "enabled": self._sync_enabled_var.get(),
+            "db_host": self._sync_host_var.get().strip(),
+            "db_port": port,
+            "db_user": self._sync_user_var.get().strip(),
+            "db_password": self._sync_pw_var.get(),
+            "db_name": self._sync_db_var.get().strip(),
+            "source": self._sync_source_var.get(),
+            "sync_interval_seconds": interval,
+            "batch_size": self.config.online_sync.get("batch_size", 100),
+        }
+        self.config.set_online_sync(new_cfg)
+
+        # Dienst neu starten
+        self._sync_service.stop_background()
+        self._sync_service = OnlineSyncService()
+        self._sync_service.start_background(self.db)
+
+        self._update_sync_status()
+        messagebox.showinfo("Gespeichert", "Online-Sync-Einstellungen wurden gespeichert.")
+
+    def _update_sync_status(self):
+        """Aktualisiert das Status-Label im Einstellungen-Tab."""
+        if not hasattr(self, "_sync_status_var"):
+            return
+        try:
+            stats = self._sync_service.get_status()
+            enabled = self.config.online_sync.get("enabled", False)
+            if not enabled:
+                self._sync_status_var.set("Status: Deaktiviert")
+            else:
+                pending = stats.get("pending", 0)
+                last = stats.get("last_sync", "–")
+                self._sync_status_var.set(f"Status: Aktiv | Warteschlange: {pending} | Letzter Sync: {last}")
+        except Exception as exc:
+            self._sync_status_var.set(f"Status: Fehler – {exc}")
+        # alle 5 Sekunden aktualisieren
+        self.root.after(5000, self._update_sync_status)
+
+    def _sync_now_clicked(self):
+        """Manueller Sync-Aufruf."""
+        try:
+            self._sync_service.sync_now(self.db)
+            self._update_sync_status()
+            messagebox.showinfo("Sync", "Synchronisation abgeschlossen.")
+        except Exception as exc:
+            messagebox.showerror("Sync-Fehler", str(exc))
+
+    def _test_sync_connection(self):
+        """Testet die MySQL-Verbindung mit den aktuell eingetragenen Werten."""
+        try:
+            import pymysql  # type: ignore
+            port = int(self._sync_port_var.get().strip() or "3306")
+            conn = pymysql.connect(
+                host=self._sync_host_var.get().strip(),
+                port=port,
+                user=self._sync_user_var.get().strip(),
+                password=self._sync_pw_var.get(),
+                database=self._sync_db_var.get().strip(),
+                connect_timeout=5,
+            )
+            conn.close()
+            messagebox.showinfo("Verbindung OK", "MySQL-Verbindung erfolgreich hergestellt.")
+        except ImportError:
+            messagebox.showerror(
+                "Fehlendes Paket",
+                "pymysql ist nicht installiert.\nBitte ausführen:\n  pip install pymysql"
+            )
+        except Exception as exc:
+            messagebox.showerror("Verbindungsfehler", str(exc))
+
     def _reset_column_widths(self):
         """Setzt die Spaltenbreiten auf Standardwerte zurück."""
         if messagebox.askyesno(

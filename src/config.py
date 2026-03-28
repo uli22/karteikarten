@@ -17,6 +17,11 @@ class Config:
         "online_sync": {
             "enabled": False,
             "endpoint_url": "",
+            "db_user": "",
+            "db_password": "",
+            "db_name": "",
+            "db_host": "",
+            "db_port": 3306,
             "api_key": "",
             "device_id": "",
             "source": "erkennung",

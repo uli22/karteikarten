@@ -9,6 +9,7 @@ dependencies = [
     "google-cloud-vision>=3.11.0",
     "openpyxl>=3.1.5",
     "pillow>=12.1.0",
+    "pymysql>=1.1.0",
     "pytesseract>=0.3.13",
 ]
 
