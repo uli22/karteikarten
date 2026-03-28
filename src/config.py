@@ -14,6 +14,15 @@ class Config:
         "image_base_path": "",
         "kirchenbuch_base_path": "",
         "db_path": "",
+        "online_sync": {
+            "enabled": False,
+            "endpoint_url": "",
+            "api_key": "",
+            "device_id": "",
+            "source": "erkennung",
+            "sync_interval_seconds": 20,
+            "batch_size": 100
+        },
         "column_widths": {
             "id": 20,
             "jahr": 40,
@@ -147,6 +156,20 @@ class Config:
         """Speichert alle Spaltenbreiten auf einmal."""
         self.config["column_widths"] = widths
         self.save()
+
+    @property
+    def online_sync(self) -> Dict[str, Any]:
+        """Gibt die Online-Sync-Konfiguration zurück."""
+        value = self.config.get("online_sync", {})
+        if not isinstance(value, dict):
+            value = {}
+        merged = {**self.DEFAULT_CONFIG["online_sync"], **value}
+        return merged
+
+    def set_online_sync(self, values: Dict[str, Any]) -> None:
+        """Aktualisiert die Online-Sync-Konfiguration."""
+        merged = {**self.online_sync, **values}
+        self.set("online_sync", merged)
 
 
 # Globale Config-Instanz (Singleton-Pattern)

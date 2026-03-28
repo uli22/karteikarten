@@ -2,6 +2,7 @@
 
 import re
 import sqlite3
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -34,6 +35,7 @@ class KarteikartenDB:
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS karteikarten (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                global_id TEXT UNIQUE,
                 dateiname TEXT NOT NULL,
                 dateipfad TEXT NOT NULL UNIQUE,
                 
@@ -75,10 +77,30 @@ class KarteikartenDB:
                 
                 -- Gramps ID (10 Zeichen)
                 gramps TEXT,
+
+                -- Offline-First Sync-Metadaten
+                version INTEGER DEFAULT 1,
+                updated_by TEXT,
+                sync_status TEXT DEFAULT 'pending',
                 
                 -- Timestamps
                 erstellt_am TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 aktualisiert_am TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS sync_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                global_id TEXT NOT NULL,
+                op TEXT NOT NULL,
+                source TEXT,
+                payload TEXT,
+                base_version INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                retries INTEGER DEFAULT 0,
+                last_error TEXT,
+                sent_at TIMESTAMP
             )
         """)
         
@@ -117,10 +139,35 @@ class KarteikartenDB:
             ('kirchenbuchtext', 'TEXT'),
             ('fid', 'TEXT'),  # Familien-ID aus families_ok.tsv
             ('gramps', 'TEXT'),  # Gramps ID
+            ('global_id', 'TEXT'),
+            ('version', 'INTEGER DEFAULT 1'),
+            ('updated_by', 'TEXT'),
+            ('sync_status', "TEXT DEFAULT 'pending'"),
         ]
         for field, ftype in new_fields:
             if field not in columns:
                 cursor.execute(f"ALTER TABLE karteikarten ADD COLUMN {field} {ftype}")
+
+        # Backfill für bestehende Datensätze
+        cursor.execute("SELECT id, global_id, version FROM karteikarten")
+        for row in cursor.fetchall():
+            row_id, global_id, version = row
+            if not global_id:
+                cursor.execute(
+                    "UPDATE karteikarten SET global_id = ? WHERE id = ?",
+                    (str(uuid.uuid4()), row_id)
+                )
+            if version is None or version < 1:
+                cursor.execute("UPDATE karteikarten SET version = 1 WHERE id = ?", (row_id,))
+
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_sync_queue_pending
+            ON sync_queue(sent_at, id)
+        """)
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_global_id
+            ON karteikarten(global_id)
+        """)
         
         # Index für schnelle Suche (nach Migration, damit iso_datum bereits existiert)
         cursor.execute("""
@@ -259,7 +306,8 @@ class KarteikartenDB:
                         vorname: str = None, nachname: str = None, partner: str = None, beruf: str = None, todestag: str = None, ort: str = None,
                         geb_jahr_gesch: int = None,
                         braeutigam_vater: str = None, braut_vater: str = None, braut_nachname: str = None, braut_ort: str = None,
-                        kirchenbuchtext: str = None) -> int:
+                        kirchenbuchtext: str = None,
+                        updated_by: str = 'erkennung') -> int:
         """
         Speichert eine Karteikarte in der Datenbank.
         
@@ -278,11 +326,13 @@ class KarteikartenDB:
         parsed = self.parse_header(erkannter_text)
         cursor = self.conn.cursor()
         # Prüfe ob bereits vorhanden (Update statt Insert)
-        cursor.execute("SELECT id FROM karteikarten WHERE dateipfad = ?", (dateipfad,))
+        cursor.execute("SELECT id, global_id, version FROM karteikarten WHERE dateipfad = ?", (dateipfad,))
         existing = cursor.fetchone()
         if existing:
             if skip_if_exists:
                 return None
+            record_id = existing['id']
+            global_id = existing['global_id'] or str(uuid.uuid4())
             cursor.execute("""
                 UPDATE karteikarten SET
                     dateiname = ?,
@@ -307,6 +357,10 @@ class KarteikartenDB:
                     braut_nachname = ?,
                     braut_ort = ?,
                     kirchenbuchtext = ?,
+                    global_id = ?,
+                    version = COALESCE(version, 1) + 1,
+                    updated_by = ?,
+                    sync_status = 'pending',
                     aktualisiert_am = CURRENT_TIMESTAMP
                 WHERE dateipfad = ?
             """, (
@@ -317,32 +371,104 @@ class KarteikartenDB:
                 geb_jahr_gesch,
                 braeutigam_vater, braut_vater, braut_nachname, braut_ort,
                 kirchenbuchtext,
+                global_id,
+                updated_by,
                 dateipfad
             ))
             # Hinweis: notiz und gramps werden absichtlich NICHT überschrieben bei Updates
+            cursor.execute("SELECT version FROM karteikarten WHERE id = ?", (record_id,))
+            current_version = cursor.fetchone()['version']
+            self._enqueue_sync(cursor, global_id=global_id, op='upsert', source=updated_by, base_version=current_version)
             self.conn.commit()
-            return existing[0]
+            return record_id
         else:
+            global_id = str(uuid.uuid4())
             cursor.execute("""
                 INSERT INTO karteikarten (
-                    dateiname, dateipfad, kirchengemeinde, ereignis_typ,
+                    global_id, dateiname, dateipfad, kirchengemeinde, ereignis_typ,
                     jahr, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode,
                     vorname, nachname, partner, beruf, todestag, ort,
                     geb_jahr_gesch,
                     braeutigam_vater, braut_vater, braut_nachname, braut_ort,
-                    kirchenbuchtext
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    kirchenbuchtext,
+                    version, updated_by, sync_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
-                dateiname, dateipfad, parsed['kirchengemeinde'], parsed['ereignis_typ'],
+                global_id, dateiname, dateipfad, parsed['kirchengemeinde'], parsed['ereignis_typ'],
                 parsed['jahr'], parsed['datum'], parsed['iso_datum'], parsed['seite'], parsed['nummer'],
                 erkannter_text, ocr_methode,
                 vorname, nachname, partner, beruf, todestag, ort,
                 geb_jahr_gesch,
                 braeutigam_vater, braut_vater, braut_nachname, braut_ort,
-                kirchenbuchtext
+                kirchenbuchtext,
+                1,
+                updated_by,
+                'pending'
             ))
+            self._enqueue_sync(cursor, global_id=global_id, op='upsert', source=updated_by, base_version=1)
             self.conn.commit()
             return cursor.lastrowid
+
+    def _enqueue_sync(self, cursor, global_id: str, op: str, source: str = 'erkennung', base_version: int = 1) -> None:
+        """Schreibt einen Datensatz in die lokale Sync-Queue."""
+        cursor.execute(
+            """
+            INSERT INTO sync_queue (global_id, op, source, base_version)
+            VALUES (?, ?, ?, ?)
+            """,
+            (global_id, op, source, base_version)
+        )
+
+    def get_sync_queue_stats(self) -> Dict[str, int]:
+        """Liefert eine einfache Übersicht über die lokale Sync-Queue."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM sync_queue")
+        total = cursor.fetchone()[0]
+        cursor.execute("SELECT COUNT(*) FROM sync_queue WHERE sent_at IS NULL")
+        pending = cursor.fetchone()[0]
+        return {
+            'total': total,
+            'pending': pending,
+            'sent': total - pending,
+        }
+
+    def get_pending_sync_items(self, limit: int = 100) -> List[Dict]:
+        """Liest noch nicht gesendete Queue-Einträge."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, global_id, op, source, base_version, created_at, retries, last_error
+            FROM sync_queue
+            WHERE sent_at IS NULL
+            ORDER BY id
+            LIMIT ?
+            """,
+            (limit,)
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+    def mark_sync_item_sent(self, queue_id: int) -> None:
+        """Markiert einen Queue-Eintrag als erfolgreich gesendet."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE sync_queue SET sent_at = CURRENT_TIMESTAMP, last_error = NULL WHERE id = ?",
+            (queue_id,)
+        )
+        self.conn.commit()
+
+    def mark_sync_item_error(self, queue_id: int, error_message: str) -> None:
+        """Erhöht Retry-Zähler und speichert den letzten Fehlertext."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            """
+            UPDATE sync_queue
+            SET retries = COALESCE(retries, 0) + 1,
+                last_error = ?
+            WHERE id = ?
+            """,
+            (error_message[:500], queue_id)
+        )
+        self.conn.commit()
     
     def search_by_year(self, year: int) -> List[Dict]:
         """Sucht Karteikarten nach Jahr."""
