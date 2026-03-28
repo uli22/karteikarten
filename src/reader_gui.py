@@ -832,7 +832,10 @@ class KarteikartenReader:
         if not row or not row[0]:
             messagebox.showwarning("Kein Bild", "Für diesen Eintrag ist kein Karteikarten-Bild gespeichert.")
             return
-        pfad = self._resolve_relocated_path(Path(row[0]), self.config.image_base_path)
+        # Nutze zuerst den aktuell eingegebenen Wert aus den Einstellungen (falls vorhanden),
+        # damit die Bildsuche sofort funktioniert, auch ohne explizites "Übernehmen".
+        card_base_path = self.card_base_path_var.get().strip() if hasattr(self, "card_base_path_var") else ""
+        pfad = self._resolve_relocated_path(Path(row[0]), card_base_path or self.config.image_base_path)
         if not pfad.exists():
             messagebox.showerror("Datei nicht gefunden", f"Karteikarte nicht gefunden:\n{pfad}")
             return
@@ -896,7 +899,11 @@ class KarteikartenReader:
 
         quelle = passende_quellen[0]
         media_id = quelle["media_ID"]
-        kb_base_path = self.config.get("kirchenbuch_base_path", "")
+        kb_base_path = (
+            self.kb_base_path_var.get().strip()
+            if hasattr(self, "kb_base_path_var") and self.kb_base_path_var.get().strip()
+            else self.config.get("kirchenbuch_base_path", "")
+        )
         ordner = self._resolve_relocated_path(Path(quelle["media_path"]), kb_base_path)
 
         if not ordner.exists():
@@ -910,9 +917,13 @@ class KarteikartenReader:
         patterns = [
             f"{media_id_prefix}* S_{seite_str_4}-*.jpg",
             f"{media_id_prefix}* S_*-{seite_str_4}.jpg",
+            f"{media_id_prefix}* S_{seite_str_4}_*.jpg",
+            f"{media_id_prefix}* S_*_{seite_str_4}.jpg",
             f"{media_id_prefix}*_{seite_str_4}.jpg",
             f"{media_id_prefix}* S_{seite_str_3}-*.jpg",
             f"{media_id_prefix}* S_*-{seite_str_3}.jpg",
+            f"{media_id_prefix}* S_{seite_str_3}_*.jpg",
+            f"{media_id_prefix}* S_*_{seite_str_3}.jpg",
             f"{media_id_prefix}*_{seite_str_3}.jpg",
         ]
 
