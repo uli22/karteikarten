@@ -4,20 +4,23 @@ Zweite, eigenständige Anwendung - NUR LESEN, außer F-ID Bearbeitung per Kontex
 Keine Änderungen an src/gui.py oder anderen bestehenden Dateien.
 """
 
+import json
 import re
 import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from PIL import Image as PILImage
 from PIL import ImageTk
 
-from .config import get_config
+from .config import bootstrap_config, get_config, resolve_config_path
 from .database import KarteikartenDB
 from .extraction_lists import get_sources_with_adjusted_paths
 from .gedcom_exporter import GedcomExporter
+from .online_sync import OnlineSyncService
 
 
 class KarteikartenReader:
@@ -30,13 +33,38 @@ class KarteikartenReader:
         self.root.title("Wetzlar Karteikarten – Leser")
         self.root.geometry("1200x800")
 
-        # Config (dieselbe wie Hauptanwendung)
-        self.config = get_config()
+        # Eigene Reader-Konfiguration, initial aus config.json gebootstrapped.
+        reader_config_target = resolve_config_path("config_reader.json")
+        reader_config_exists = reader_config_target.exists()
+        self._reader_config_path = bootstrap_config(reader_config_target, "config.json")
+        self.config = get_config(self._reader_config_path)
+        
+        # Beim ersten Start: API-Mode mit deaktiviertem Sync, bis Benutzer API-Key eingibt
+        if not reader_config_exists:
+            reader_sync_config = {
+                "enabled": False,  # Deaktiviert bis Benutzer API-Key eingibt
+                "mode": "api",     # Reader nutzt nur API, nicht lokales MySQL
+                "source": "reader",
+                "endpoint_url": "",
+                "api_key": "",
+                "device_id": "",
+                "last_pull_cursor": "",
+                "last_pull_id": "",
+                "sync_interval_seconds": 20,
+                "batch_size": 100
+            }
+            self.config.set_online_sync(reader_sync_config)
 
         # Datenbank
         db_path = self._resolve_db_path()
         self.db = KarteikartenDB(str(db_path))
         self.active_db_path = str(Path(db_path).resolve())
+
+        # Online-Sync (startet nur, wenn enabled=True UND richtig konfiguriert)
+        self._sync_service = OnlineSyncService(config_obj=self.config)
+        if self.config.online_sync.get("enabled", False):
+            self._sync_service.start_background(self.db)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Sortierzustand
         self.sort_reverse: dict = {}
@@ -159,6 +187,8 @@ class KarteikartenReader:
         ttk.Button(filter_row3, text="📑 Nach Seite/Nr.", command=self._sort_by_page_and_number).pack(side=tk.LEFT, padx=5)
         ttk.Button(filter_row3, text="📊 Statistik", command=self._show_statistics).pack(side=tk.LEFT, padx=5)
         ttk.Button(filter_row3, text="💾 Backup CSV", command=self._backup_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_row3, text="🔒 Full Backup", command=self._backup_full_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_row3, text="↩️ Restore", command=self._restore_full_backup).pack(side=tk.LEFT, padx=5)
 
         # === TREEVIEW ===
         tree_frame = ttk.Frame(parent)
@@ -244,8 +274,32 @@ class KarteikartenReader:
     # ------------------------------------------------------------------
 
     def _create_settings_tab(self, parent):
-        main_frame = ttk.Frame(parent)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        outer = ttk.Frame(parent)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        main_frame = ttk.Frame(canvas)
+
+        def _on_frame_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        window_id = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+        main_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _bind_mousewheel(widget):
+            widget.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+
+        _bind_mousewheel(canvas)
+        _bind_mousewheel(main_frame)
 
         ttk.Label(main_frame, text="⚙️ Einstellungen", font=("Arial", 16, "bold")).pack(pady=(0, 20))
 
@@ -352,6 +406,124 @@ class KarteikartenReader:
         ttk.Button(column_frame, text="🔄 Spaltenbreiten zurücksetzen", command=self._reset_column_widths).pack(
             anchor=tk.W, pady=(10, 0)
         )
+
+        # === Online-Sync Einstellungen ===
+        sync_frame = ttk.LabelFrame(main_frame, text="🌐 Online-Synchronisation", padding=15)
+        sync_frame.pack(fill=tk.X, pady=(0, 20))
+
+        cfg = self.config.online_sync
+
+        self._sync_enabled_var = tk.BooleanVar(value=bool(cfg.get("enabled", False)))
+        ttk.Checkbutton(sync_frame, text="Online-Sync aktivieren", variable=self._sync_enabled_var).pack(anchor=tk.W, pady=(0, 8))
+
+        src_row = ttk.Frame(sync_frame)
+        src_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(src_row, text="Diese Instanz ist:", width=20).pack(side=tk.LEFT)
+        self._sync_source_var = tk.StringVar(value=cfg.get("source", "reader"))
+        ttk.Radiobutton(src_row, text="Erkennung", variable=self._sync_source_var, value="erkennung").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(src_row, text="Reader", variable=self._sync_source_var, value="reader").pack(side=tk.LEFT, padx=4)
+
+        mode_row = ttk.Frame(sync_frame)
+        mode_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(mode_row, text="Sync-Modus:", width=20).pack(side=tk.LEFT)
+        self._sync_mode_var = tk.StringVar(value=cfg.get("mode", "api"))
+        ttk.Combobox(mode_row, textvariable=self._sync_mode_var, values=["mysql", "api"], width=15, state="readonly").pack(side=tk.LEFT, padx=4)
+
+        sync_style = ttk.Style(self.root)
+        sync_style.configure("SyncInvalid.TEntry", foreground="#a00000", fieldbackground="#ffe6e6")
+
+        def _lbl_entry(frame_parent, label, var, show="", hint=""):
+            row = ttk.Frame(frame_parent)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, width=22).pack(side=tk.LEFT)
+            entry = ttk.Entry(row, textvariable=var, show=show)
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if hint:
+                ttk.Label(row, text=hint, foreground="gray", font=("Arial", 8, "italic")).pack(side=tk.LEFT, padx=(6, 0))
+            return entry
+
+        self._mysql_fields_frame = ttk.Frame(sync_frame)
+        self._mysql_fields_frame.pack(fill=tk.X)
+        ttk.Label(
+            self._mysql_fields_frame,
+            text="▸ Modus mysql: direkte Verbindung (nur VPS / lokales Netz)",
+            foreground="#666",
+            font=("Arial", 8, "italic"),
+        ).pack(anchor=tk.W, pady=(6, 2))
+
+        self._sync_host_var = tk.StringVar(value=cfg.get("db_host", ""))
+        self._sync_port_var = tk.StringVar(value=str(cfg.get("db_port", 3306)))
+        self._sync_user_var = tk.StringVar(value=cfg.get("db_user", ""))
+        self._sync_pw_var = tk.StringVar(value=cfg.get("db_password", ""))
+        self._sync_db_var = tk.StringVar(value=cfg.get("db_name", ""))
+
+        _lbl_entry(self._mysql_fields_frame, "DB-Host:", self._sync_host_var,
+                   hint="z.B. 192.168.1.10 (nur für mysql-Modus)")
+        _lbl_entry(self._mysql_fields_frame, "DB-Port:", self._sync_port_var, hint="Standard: 3306")
+        _lbl_entry(self._mysql_fields_frame, "DB-Benutzer:", self._sync_user_var)
+        _lbl_entry(self._mysql_fields_frame, "DB-Passwort:", self._sync_pw_var, show="*")
+        _lbl_entry(self._mysql_fields_frame, "DB-Name:", self._sync_db_var)
+
+        ttk.Label(
+            sync_frame,
+            text="▸ Modus api: PHP-Datei auf Webspace (z.B. Lima-City) → URL unten eintragen",
+            foreground="#0055aa",
+            font=("Arial", 8, "italic"),
+        ).pack(anchor=tk.W, pady=(10, 2))
+
+        self._sync_interval_var = tk.StringVar(value=str(cfg.get("sync_interval_seconds", 20)))
+        self._sync_endpoint_var = tk.StringVar(value=cfg.get("endpoint_url", ""))
+        self._sync_api_key_var = tk.StringVar(value=cfg.get("api_key", ""))
+
+        self._sync_endpoint_entry = _lbl_entry(
+            sync_frame,
+            "API-Endpoint:",
+            self._sync_endpoint_var,
+            hint="https://deine-domain.de/sync/lima_sync_endpoint.php",
+        )
+        self._sync_endpoint_hint_var = tk.StringVar(value="")
+        ttk.Label(sync_frame, textvariable=self._sync_endpoint_hint_var,
+                  foreground="#8a5a00", font=("Arial", 8, "italic")).pack(anchor=tk.W, padx=(160, 0), pady=(0, 2))
+        _lbl_entry(sync_frame, "API-Key:", self._sync_api_key_var, show="*", hint="wie in lima_sync_endpoint.php eingetragen")
+        _lbl_entry(sync_frame, "Intervall (Sek):", self._sync_interval_var)
+
+        def _validate_endpoint_field(*_):
+            raw_url = self._sync_endpoint_var.get().strip()
+            if not raw_url:
+                self._sync_endpoint_entry.configure(style="TEntry")
+                self._sync_endpoint_hint_var.set("")
+                return
+            normalized = self._normalize_endpoint_url(raw_url)
+            parts = urlsplit(normalized)
+            if parts.netloc:
+                self._sync_endpoint_entry.configure(style="TEntry")
+                self._sync_endpoint_hint_var.set(
+                    f"Wird als {normalized} gespeichert" if normalized != raw_url else ""
+                )
+            else:
+                self._sync_endpoint_entry.configure(style="SyncInvalid.TEntry")
+                self._sync_endpoint_hint_var.set("Ungültige URL. Beispiel: https://wze.de.cool/lima_sync_endpoint.php")
+
+        def _on_mode_change(*_):
+            if self._sync_mode_var.get() == "mysql":
+                self._mysql_fields_frame.pack(fill=tk.X, after=mode_row)
+            else:
+                self._mysql_fields_frame.pack_forget()
+
+        self._sync_mode_var.trace_add("write", _on_mode_change)
+        self._sync_endpoint_var.trace_add("write", _validate_endpoint_field)
+        _on_mode_change()
+        _validate_endpoint_field()
+
+        btn_row = ttk.Frame(sync_frame)
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_row, text="💾 Speichern", command=self._save_sync_settings).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🔄 Jetzt synchronisieren", command=self._sync_now_clicked).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🔌 Verbindung testen", command=self._test_sync_connection).pack(side=tk.LEFT)
+
+        self._sync_status_var = tk.StringVar(value="–")
+        ttk.Label(sync_frame, textvariable=self._sync_status_var, foreground="blue").pack(anchor=tk.W, pady=(6, 0))
+        self._update_sync_status()
 
     # ------------------------------------------------------------------
     # Daten laden & filtern
@@ -677,6 +849,73 @@ class KarteikartenReader:
         except Exception as e:
             messagebox.showerror("Fehler", f"Backup fehlgeschlagen:\n{e}")
 
+    def _backup_full_csv(self):
+        """Exportiert Karteikarten + Sync-Queue mit Datum im Dateinamen."""
+        from pathlib import Path
+        
+        # Wähle Verzeichnis
+        output_dir = filedialog.askdirectory(title="Verzeichnis für Full Backup wählen")
+        if not output_dir:
+            return
+
+        try:
+            karteikarten_path, queue_path = self.db.export_full_backup(output_dir)
+            
+            # Zähle Einträge
+            import csv
+            with open(karteikarten_path, 'r', encoding='utf-8') as f:
+                rows_count = sum(1 for _ in csv.reader(f)) - 1
+            
+            with open(queue_path, 'r', encoding='utf-8') as f:
+                queue_count = sum(1 for _ in csv.reader(f)) - 1
+            
+            msg = (
+                f"Full Backup erstellt:\n\n"
+                f"Karteikarten: {rows_count} Datensätze\n"
+                f"  → {Path(karteikarten_path).name}\n\n"
+                f"Sync-Queue: {queue_count} Einträge\n"
+                f"  → {Path(queue_path).name}\n\n"
+                f"Speicherort: {output_dir}"
+            )
+            messagebox.showinfo("Full Backup erstellt", msg)
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Full Backup fehlgeschlagen:\n{e}")
+
+    def _restore_full_backup(self):
+        """Importiert Karteikarten + Sync-Queue aus Backup-CSVs."""
+        import csv
+        import os
+        
+        # Ask for directory with backup files
+        backup_dir = filedialog.askdirectory(title="Backup-Verzeichnis mit CSV-Dateien wählen")
+        if not backup_dir:
+            return
+
+        # Find backup files
+        karteikarten_file = None
+        queue_file = None
+        
+        for file in os.listdir(backup_dir):
+            if '_backup_karteikarten_' in file and file.endswith('.csv'):
+                karteikarten_file = os.path.join(backup_dir, file)
+            elif '_backup_sync_queue_' in file and file.endswith('.csv'):
+                queue_file = os.path.join(backup_dir, file)
+        
+        if not karteikarten_file:
+            messagebox.showwarning("Nicht gefunden", "Zur Wiederherstellung wird _backup_karteikarten_*.csv benötigt")
+            return
+
+        # Warnung anzeigen
+        if not messagebox.askyesno("Bestätigung", 
+            "Aktuelle Daten werden mit dem Backup überschrieben!\n\nFortfahren?"):
+            return
+
+        try:
+            self.db.restore_full_backup(karteikarten_file, queue_file)
+            messagebox.showinfo("Erfolg", "Daten erfolgreich wiederhergestellt!\n\nBitte die Anwendung neu starten.")
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Wiederherstellung fehlgeschlagen:\n{e}")
+
     # ------------------------------------------------------------------
     # Statistik
     # ------------------------------------------------------------------
@@ -875,7 +1114,7 @@ class KarteikartenReader:
             typ_kuerzel = "Gb"
 
         # Passende Quelle aus den aktuell konfigurierten Quellen suchen
-        sources = get_sources_with_adjusted_paths()
+        sources = get_sources_with_adjusted_paths(self.config)
         passende_quellen = []
         for source in sources:
             if source.get("media_type") != "kirchenbuchseiten":
@@ -1265,7 +1504,11 @@ class KarteikartenReader:
                 return
         try:
             new_db = KarteikartenDB(str(new_path))
+            cur = new_db.conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM karteikarten")
+            new_db_rows = int(cur.fetchone()[0] or 0)
             old_conn = getattr(self.db, "conn", None)
+            self._sync_service.stop_background()
             if old_conn:
                 try:
                     old_conn.close()
@@ -1274,6 +1517,14 @@ class KarteikartenReader:
             self.db = new_db
             self.active_db_path = str(new_path.resolve())
             self.config.db_path = self.active_db_path
+            if new_db_rows == 0:
+                self.config.set_online_sync({
+                    "last_pull_cursor": "1970-01-01 00:00:00",
+                    "last_pull_id": "",
+                })
+            self._sync_service = OnlineSyncService(config_obj=self.config)
+            if self.config.online_sync.get("enabled", False):
+                self._sync_service.start_background(self.db)
             self.settings_db_path_var.set(self.active_db_path)
             if hasattr(self, "db_path_info_label"):
                 self.db_path_info_label.config(text=f"Aktive DB: {self.active_db_path}")
@@ -1282,9 +1533,197 @@ class KarteikartenReader:
         except Exception as e:
             messagebox.showerror("DB-Fehler", f"Datenbank konnte nicht geladen werden:\n{e}")
 
+    # ------------------------------------------------------------------
+    # Online-Sync Hilfsmethoden
+    # ------------------------------------------------------------------
+
+    def _normalize_endpoint_url(self, raw_url: str) -> str:
+        url = (raw_url or "").strip()
+        if not url:
+            return ""
+        if "://" not in url:
+            url = "https://" + url
+        url = url.replace("https://https://", "https://")
+        url = url.replace("http://http://", "http://")
+        url = url.replace("https://https:/", "https://")
+        url = url.replace("http://http:/", "http://")
+        if url.startswith("https:/") and not url.startswith("https://"):
+            url = "https://" + url[len("https:/"):]
+        if url.startswith("http:/") and not url.startswith("http://"):
+            url = "http://" + url[len("http:/"):]
+        parts = urlsplit(url)
+        if not parts.netloc and parts.path:
+            path = parts.path.lstrip("/")
+            if "/" in path:
+                host, rest = path.split("/", 1)
+                if "." in host:
+                    parts = parts._replace(netloc=host, path="/" + rest)
+            elif "." in path:
+                parts = parts._replace(netloc=path, path="")
+        scheme = parts.scheme or "https"
+        return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))
+
+    def _save_sync_settings(self):
+        try:
+            port = int(self._sync_port_var.get().strip() or "3306")
+            interval = int(self._sync_interval_var.get().strip() or "20")
+        except ValueError:
+            messagebox.showwarning("Eingabefehler", "Port und Intervall müssen ganze Zahlen sein.")
+            return
+
+        endpoint_url = self._normalize_endpoint_url(self._sync_endpoint_var.get())
+        self._sync_endpoint_var.set(endpoint_url)
+        new_cfg = {
+            "enabled": self._sync_enabled_var.get(),
+            "mode": self._sync_mode_var.get().strip() or "mysql",
+            "db_host": self._sync_host_var.get().strip(),
+            "db_port": port,
+            "db_user": self._sync_user_var.get().strip(),
+            "db_password": self._sync_pw_var.get(),
+            "db_name": self._sync_db_var.get().strip(),
+            "endpoint_url": endpoint_url,
+            "api_key": self._sync_api_key_var.get(),
+            "source": self._sync_source_var.get(),
+            "sync_interval_seconds": interval,
+            "batch_size": self.config.online_sync.get("batch_size", 100),
+        }
+        self.config.set_online_sync(new_cfg)
+        self._sync_service.stop_background()
+        self._sync_service = OnlineSyncService(config_obj=self.config)
+        if new_cfg.get("enabled", False):
+            self._sync_service.start_background(self.db)
+        self._update_sync_status()
+        messagebox.showinfo("Gespeichert", "Online-Sync-Einstellungen wurden gespeichert.")
+
+    def _update_sync_status(self):
+        if not hasattr(self, "_sync_status_var"):
+            return
+        try:
+            stats = self._sync_service.get_status()
+            enabled = self.config.online_sync.get("enabled", False)
+            if not enabled:
+                self._sync_status_var.set("Status: Deaktiviert")
+            else:
+                mode = stats.get("mode", self.config.online_sync.get("mode", "mysql"))
+                pending = stats.get("pending", 0)
+                last = stats.get("last_sync", "–")
+                local_records = int(stats.get("local_records", 0) or 0)
+                remote_total = stats.get("remote_total")
+                last_pulled = int(stats.get("last_pulled", 0) or 0)
+                last_pushed = int(stats.get("last_pushed", 0) or 0)
+                if isinstance(remote_total, int) and remote_total > 0:
+                    progress = min(100, int((local_records / remote_total) * 100))
+                    summary = (
+                        f"Status: Aktiv ({mode}) | Lokal/Online: {local_records}/{remote_total} ({progress}%)"
+                    )
+                else:
+                    summary = f"Status: Aktiv ({mode}) | Lokal: {local_records}"
+                summary += (
+                    f" | Letzter Download: +{last_pulled} | Letzter Upload: +{last_pushed}"
+                    f" | Warteschlange: {pending} | Letzter Sync: {last}"
+                )
+                self._sync_status_var.set(summary)
+        except Exception as exc:
+            self._sync_status_var.set(f"Status: Fehler – {exc}")
+        self.root.after(5000, self._update_sync_status)
+
+    def _sync_now_clicked(self):
+        try:
+            result = self._sync_service.sync_now(self.db)
+            total_pushed = result.pushed
+            total_pulled = result.pulled
+            total_failed = result.failed
+
+            # Bei API-Pagination kann der erste Lauf nur den Cursor vorziehen,
+            # ohne lokale Änderungen (0/0). Dann einmal automatisch nachziehen.
+            if total_failed == 0 and total_pushed == 0 and total_pulled == 0:
+                stats = self._sync_service.get_status(self.db)
+                local_records = int(stats.get("local_records", 0) or 0)
+                remote_total = stats.get("remote_total")
+                if isinstance(remote_total, int) and local_records < remote_total:
+                    second = self._sync_service.sync_now(self.db)
+                    total_pushed += second.pushed
+                    total_pulled += second.pulled
+                    total_failed += second.failed
+                    result.errors.extend(second.errors)
+
+            self._update_sync_status()
+            if total_failed or result.errors:
+                details = "\n".join(result.errors[:5]) if result.errors else "Unbekannter Fehler"
+                if len(result.errors) > 5:
+                    details += "\n..."
+                messagebox.showerror(
+                    "Sync-Fehler",
+                    f"Synchronisation fehlgeschlagen.\n"
+                    f"Gepusht: {total_pushed}, Gepullt: {total_pulled}, Fehler: {total_failed}\n\n"
+                    f"Details:\n{details}"
+                )
+                return
+            if total_pushed == 0 and total_pulled == 0:
+                messagebox.showwarning("Kein Transfer", "Synchronisation ohne Übertragung abgeschlossen.\nEs wurden keine Datensätze übertragen.")
+                return
+            messagebox.showinfo("Sync", f"Synchronisation abgeschlossen.\nGepusht: {total_pushed}, Gepullt: {total_pulled}, Fehler: {total_failed}")
+        except Exception as exc:
+            messagebox.showerror("Sync-Fehler", str(exc))
+
+    def _test_sync_connection(self):
+        mode = (self._sync_mode_var.get() or "mysql").strip().lower()
+        if mode == "api":
+            url = self._normalize_endpoint_url(self._sync_endpoint_var.get())
+            self._sync_endpoint_var.set(url)
+            if not url:
+                messagebox.showwarning("Kein Endpoint", "Bitte zuerst die API-Endpoint-URL eintragen.\n\nBeispiel: https://deine-domain.de/sync/lima_sync_endpoint.php")
+                return
+            if not urlsplit(url).netloc:
+                messagebox.showwarning("Ungültige URL", "Der API-Endpoint ist ungültig.\nBitte vollständige URL angeben, z.B.\nhttps://wze.de.cool/lima_sync_endpoint.php")
+                return
+            try:
+                from urllib import error, request
+                from urllib.parse import urlencode
+                json_str = json.dumps({"action": "ping", "api_key": self._sync_api_key_var.get()}, ensure_ascii=False)
+                payload = urlencode({"payload": json_str}).encode("utf-8")
+                req = request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+                with request.urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+                if not isinstance(data, dict) or data.get("ok") is False:
+                    raise RuntimeError(str(data.get("error") if isinstance(data, dict) else "Ungültige API-Antwort"))
+                messagebox.showinfo("Verbindung OK", f"API-Endpunkt ist erreichbar.\nServer-Zeit: {data.get('server_time', '?')}")
+            except error.URLError as exc:
+                messagebox.showerror("Verbindungsfehler", f"API nicht erreichbar: {exc}")
+            except Exception as exc:
+                messagebox.showerror("Verbindungsfehler", str(exc))
+            return
+
+        try:
+            import pymysql  # type: ignore
+            port = int(self._sync_port_var.get().strip() or "3306")
+            conn = pymysql.connect(
+                host=self._sync_host_var.get().strip(),
+                port=port,
+                user=self._sync_user_var.get().strip(),
+                password=self._sync_pw_var.get(),
+                database=self._sync_db_var.get().strip(),
+                connect_timeout=5,
+            )
+            conn.close()
+            messagebox.showinfo("Verbindung OK", "MySQL-Verbindung erfolgreich hergestellt.")
+        except ImportError:
+            messagebox.showerror("Fehlendes Paket", "pymysql ist nicht installiert.\nBitte ausführen:\n  pip install pymysql")
+        except Exception as exc:
+            messagebox.showerror("Verbindungsfehler", str(exc))
+
+    def _on_close(self):
+        try:
+            self._sync_service.stop_background()
+        except Exception:
+            pass
+        self.root.destroy()
+
 
 def run_reader():
     """Startet die Leseanwendung."""
     root = tk.Tk()
     KarteikartenReader(root)
     root.mainloop()
+

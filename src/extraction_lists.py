@@ -10,16 +10,17 @@ Dieses Modul enthält alle Listen und Mappings für:
 - Zu ignorierende Wörter
 """
 
-def get_sources_with_adjusted_paths():
+def get_sources_with_adjusted_paths(config=None):
     """
     Gibt die SOURCES-Liste mit angepassten media_path zurück.
     Die Pfade werden basierend auf der Config angepasst.
     """
     import re
 
-    from .config import get_config
-    
-    config = get_config()
+    if config is None:
+        from .config import get_config
+        config = get_config()
+
     media_drive = config.media_drive
     
     adjusted_sources = []

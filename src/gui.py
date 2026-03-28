@@ -1,12 +1,14 @@
 ﻿"""Grafische Benutzeroberfläche für die Karteikartenerkennung."""
 
 import csv
+import json
 import re
 import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from PIL import Image, ImageTk
 
@@ -3220,6 +3222,8 @@ class KarteikartenGUI:
         
         ttk.Button(button_row1, text="📂 Bild", command=self._show_selected_image).pack(side=tk.LEFT, padx=3)    
         ttk.Button(button_row1, text="📤 Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="🔒 Full Backup", command=self._export_full_csv).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="↩️ Restore", command=self._import_full_backup).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row1, text="� Export GEDCOM", command=self._export_gedcom).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row1, text="�📥 Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row1, text="📥 Import XLSX", command=self._import_xlsx).pack(side=tk.LEFT, padx=3)
@@ -3261,10 +3265,34 @@ class KarteikartenGUI:
         self.db_progress.pack(side=tk.LEFT, padx=5, fill=tk.X, expand=True)
     
     def _create_settings_tab(self, parent):
-        """Erstellt den Einstellungen-Tab Inhalt."""
-        main_frame = ttk.Frame(parent)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
-        
+        """Erstellt den Einstellungen-Tab Inhalt (scrollbar)."""
+        # Scrollbarer Container
+        canvas = tk.Canvas(parent, borderwidth=0, highlightthickness=0)
+        vsb = ttk.Scrollbar(parent, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        main_frame = ttk.Frame(canvas)
+        window_id = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+
+        def _on_frame_configure(event):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfig(window_id, width=event.width)
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+        main_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+        # Innenabstand
+        main_frame = ttk.Frame(main_frame, padding=(20, 20))
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
         # Überschrift
         title = ttk.Label(main_frame, text="⚙️ Einstellungen", font=("Arial", 16, "bold"))
         title.pack(pady=(0, 20))
@@ -3372,7 +3400,7 @@ class KarteikartenGUI:
         ).pack(anchor=tk.W, pady=(10, 0))
         
         # === Online-Sync Einstellungen ===
-        sync_frame = ttk.LabelFrame(main_frame, text="🌐 Online-Synchronisation (MySQL)", padding=15)
+        sync_frame = ttk.LabelFrame(main_frame, text="🌐 Online-Synchronisation", padding=15)
         sync_frame.pack(fill=tk.X, pady=(0, 20))
 
         cfg = self.config.online_sync
@@ -3392,27 +3420,97 @@ class KarteikartenGUI:
         ttk.Radiobutton(src_row, text="Erkennung", variable=self._sync_source_var, value="erkennung").pack(side=tk.LEFT, padx=4)
         ttk.Radiobutton(src_row, text="Reader", variable=self._sync_source_var, value="reader").pack(side=tk.LEFT, padx=4)
 
+        mode_row = ttk.Frame(sync_frame)
+        mode_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(mode_row, text="Sync-Modus:", width=20).pack(side=tk.LEFT)
+        self._sync_mode_var = tk.StringVar(value=cfg.get("mode", "mysql"))
+        mode_box = ttk.Combobox(mode_row, textvariable=self._sync_mode_var, values=["mysql", "api"], width=15, state="readonly")
+        mode_box.pack(side=tk.LEFT, padx=4)
+
+        sync_style = ttk.Style(self.root)
+        sync_style.configure("SyncInvalid.TEntry", foreground="#a00000", fieldbackground="#ffe6e6")
+
         # Verbindungs-Felder
-        def _lbl_entry(parent, label, var, show=""):
+        def _lbl_entry(parent, label, var, show="", hint=""):
             row = ttk.Frame(parent)
             row.pack(fill=tk.X, pady=2)
-            ttk.Label(row, text=label, width=20).pack(side=tk.LEFT)
+            ttk.Label(row, text=label, width=22).pack(side=tk.LEFT)
             e = ttk.Entry(row, textvariable=var, show=show)
             e.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if hint:
+                ttk.Label(row, text=hint, foreground="gray", font=("Arial", 8, "italic")).pack(side=tk.LEFT, padx=(6, 0))
+            return e
+
+        # --- MySQL-Felder (nur relevant im Modus "mysql") ---
+        self._mysql_fields_frame = ttk.Frame(sync_frame)
+        self._mysql_fields_frame.pack(fill=tk.X)
+        ttk.Label(self._mysql_fields_frame,
+                  text="▸ Modus mysql: direkte Verbindung (nur VPS / lokales Netz)",
+                  foreground="#666", font=("Arial", 8, "italic")).pack(anchor=tk.W, pady=(6, 2))
 
         self._sync_host_var = tk.StringVar(value=cfg.get("db_host", ""))
         self._sync_port_var = tk.StringVar(value=str(cfg.get("db_port", 3306)))
         self._sync_user_var = tk.StringVar(value=cfg.get("db_user", ""))
         self._sync_pw_var = tk.StringVar(value=cfg.get("db_password", ""))
         self._sync_db_var = tk.StringVar(value=cfg.get("db_name", ""))
-        self._sync_interval_var = tk.StringVar(value=str(cfg.get("sync_interval_seconds", 20)))
 
-        _lbl_entry(sync_frame, "DB-Host:", self._sync_host_var)
-        _lbl_entry(sync_frame, "DB-Port:", self._sync_port_var)
-        _lbl_entry(sync_frame, "DB-Benutzer:", self._sync_user_var)
-        _lbl_entry(sync_frame, "DB-Passwort:", self._sync_pw_var, show="*")
-        _lbl_entry(sync_frame, "DB-Name:", self._sync_db_var)
+        _lbl_entry(self._mysql_fields_frame, "DB-Host:", self._sync_host_var,
+                   hint="z.B. 192.168.1.10 (nur für mysql-Modus, nicht für Lima-City)")
+        _lbl_entry(self._mysql_fields_frame, "DB-Port:", self._sync_port_var, hint="Standard: 3306")
+        _lbl_entry(self._mysql_fields_frame, "DB-Benutzer:", self._sync_user_var)
+        _lbl_entry(self._mysql_fields_frame, "DB-Passwort:", self._sync_pw_var, show="*")
+        _lbl_entry(self._mysql_fields_frame, "DB-Name:", self._sync_db_var)
+
+        # --- API-Felder (Modus "api", z.B. Lima-City) ---
+        ttk.Label(sync_frame,
+                  text="▸ Modus api: PHP-Datei auf Webspace (z.B. Lima-City) → URL unten eintragen",
+                  foreground="#0055aa", font=("Arial", 8, "italic")).pack(anchor=tk.W, pady=(10, 2))
+
+        self._sync_interval_var = tk.StringVar(value=str(cfg.get("sync_interval_seconds", 20)))
+        self._sync_endpoint_var = tk.StringVar(value=cfg.get("endpoint_url", ""))
+        self._sync_api_key_var = tk.StringVar(value=cfg.get("api_key", ""))
+
+        self._sync_endpoint_entry = _lbl_entry(sync_frame, "API-Endpoint:", self._sync_endpoint_var,
+                                               hint="https://deine-domain.de/sync/lima_sync_endpoint.php")
+        self._sync_endpoint_hint_var = tk.StringVar(value="")
+        ttk.Label(sync_frame, textvariable=self._sync_endpoint_hint_var,
+                  foreground="#8a5a00", font=("Arial", 8, "italic")).pack(anchor=tk.W, padx=(160, 0), pady=(0, 2))
+        _lbl_entry(sync_frame, "API-Key:", self._sync_api_key_var, show="*",
+                   hint="wie in lima_sync_endpoint.php eingetragen")
         _lbl_entry(sync_frame, "Intervall (Sek):", self._sync_interval_var)
+
+        def _validate_endpoint_field(*_):
+            raw_url = self._sync_endpoint_var.get().strip()
+            if not raw_url:
+                self._sync_endpoint_entry.configure(style="TEntry")
+                self._sync_endpoint_hint_var.set("")
+                return
+
+            normalized = self._normalize_endpoint_url(raw_url)
+            parts = urlsplit(normalized)
+            is_valid = bool(parts.netloc)
+
+            if is_valid:
+                self._sync_endpoint_entry.configure(style="TEntry")
+                if normalized != raw_url:
+                    self._sync_endpoint_hint_var.set(f"Wird als {normalized} gespeichert")
+                else:
+                    self._sync_endpoint_hint_var.set("")
+            else:
+                self._sync_endpoint_entry.configure(style="SyncInvalid.TEntry")
+                self._sync_endpoint_hint_var.set("Ungültige URL. Beispiel: https://wze.de.cool/lima_sync_endpoint.php")
+
+        def _on_mode_change(*_):
+            if self._sync_mode_var.get() == "mysql":
+                self._mysql_fields_frame.pack(fill=tk.X, after=mode_row)
+            else:
+                self._mysql_fields_frame.pack_forget()
+
+        self._sync_mode_var.trace_add("write", _on_mode_change)
+        self._sync_endpoint_var.trace_add("write", _validate_endpoint_field)
+        # Initial-Sichtbarkeit setzen
+        _on_mode_change()
+        _validate_endpoint_field()
 
         # Status + Buttons
         btn_row = ttk.Frame(sync_frame)
@@ -3521,6 +3619,38 @@ class KarteikartenGUI:
     #  Online-Sync Hilfsmethoden                                          #
     # ------------------------------------------------------------------ #
 
+    def _normalize_endpoint_url(self, raw_url: str) -> str:
+        """Normalisiert typische URL-Eingabefehler fuer den API-Endpunkt."""
+        url = (raw_url or "").strip()
+        if not url:
+            return ""
+
+        if "://" not in url:
+            url = "https://" + url
+
+        # Hauefige Tippfehler bei doppeltem/verkuerztem Schema korrigieren.
+        url = url.replace("https://https://", "https://")
+        url = url.replace("http://http://", "http://")
+        url = url.replace("https://https:/", "https://")
+        url = url.replace("http://http:/", "http://")
+        if url.startswith("https:/") and not url.startswith("https://"):
+            url = "https://" + url[len("https:/"):]
+        if url.startswith("http:/") and not url.startswith("http://"):
+            url = "http://" + url[len("http:/"):]
+
+        parts = urlsplit(url)
+        if not parts.netloc and parts.path:
+            path = parts.path.lstrip("/")
+            if "/" in path:
+                host, rest = path.split("/", 1)
+                if "." in host:
+                    parts = parts._replace(netloc=host, path="/" + rest)
+            elif "." in path:
+                parts = parts._replace(netloc=path, path="")
+
+        scheme = parts.scheme or "https"
+        return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))
+
     def _save_sync_settings(self):
         """Speichert die Online-Sync-Konfiguration und startet ggf. den Dienst neu."""
         try:
@@ -3530,13 +3660,19 @@ class KarteikartenGUI:
             messagebox.showwarning("Eingabefehler", "Port und Intervall müssen ganze Zahlen sein.")
             return
 
+        endpoint_url = self._normalize_endpoint_url(self._sync_endpoint_var.get())
+        self._sync_endpoint_var.set(endpoint_url)
+
         new_cfg = {
             "enabled": self._sync_enabled_var.get(),
+            "mode": self._sync_mode_var.get().strip() or "mysql",
             "db_host": self._sync_host_var.get().strip(),
             "db_port": port,
             "db_user": self._sync_user_var.get().strip(),
             "db_password": self._sync_pw_var.get(),
             "db_name": self._sync_db_var.get().strip(),
+            "endpoint_url": endpoint_url,
+            "api_key": self._sync_api_key_var.get(),
             "source": self._sync_source_var.get(),
             "sync_interval_seconds": interval,
             "batch_size": self.config.online_sync.get("batch_size", 100),
@@ -3561,9 +3697,10 @@ class KarteikartenGUI:
             if not enabled:
                 self._sync_status_var.set("Status: Deaktiviert")
             else:
+                mode = stats.get("mode", self.config.online_sync.get("mode", "mysql"))
                 pending = stats.get("pending", 0)
                 last = stats.get("last_sync", "–")
-                self._sync_status_var.set(f"Status: Aktiv | Warteschlange: {pending} | Letzter Sync: {last}")
+                self._sync_status_var.set(f"Status: Aktiv ({mode}) | Warteschlange: {pending} | Letzter Sync: {last}")
         except Exception as exc:
             self._sync_status_var.set(f"Status: Fehler – {exc}")
         # alle 5 Sekunden aktualisieren
@@ -3572,14 +3709,90 @@ class KarteikartenGUI:
     def _sync_now_clicked(self):
         """Manueller Sync-Aufruf."""
         try:
-            self._sync_service.sync_now(self.db)
+            result = self._sync_service.sync_now(self.db)
             self._update_sync_status()
-            messagebox.showinfo("Sync", "Synchronisation abgeschlossen.")
+            if result.failed or result.errors:
+                details = "\n".join(result.errors[:5]) if result.errors else "Unbekannter Fehler"
+                if len(result.errors) > 5:
+                    details += "\n..."
+                messagebox.showerror(
+                    "Sync-Fehler",
+                    f"Synchronisation fehlgeschlagen.\n"
+                    f"Gepusht: {result.pushed}, Gepullt: {result.pulled}, Fehler: {result.failed}\n\n"
+                    f"Details:\n{details}"
+                )
+                return
+
+            if result.pushed == 0 and result.pulled == 0:
+                messagebox.showwarning(
+                    "Kein Transfer",
+                    "Synchronisation ohne Übertragung abgeschlossen.\n"
+                    "Es wurden keine Datensätze übertragen."
+                )
+                return
+
+            messagebox.showinfo(
+                "Sync",
+                f"Synchronisation abgeschlossen.\n"
+                f"Gepusht: {result.pushed}, Gepullt: {result.pulled}, Fehler: {result.failed}"
+            )
         except Exception as exc:
             messagebox.showerror("Sync-Fehler", str(exc))
 
     def _test_sync_connection(self):
-        """Testet die MySQL-Verbindung mit den aktuell eingetragenen Werten."""
+        """Testet die Verbindung im aktuell gewählten Sync-Modus."""
+        mode = (self._sync_mode_var.get() or "mysql").strip().lower()
+        if mode == "api":
+            url = self._normalize_endpoint_url(self._sync_endpoint_var.get())
+            self._sync_endpoint_var.set(url)
+            if not url:
+                messagebox.showwarning("Kein Endpoint",
+                    "Bitte zuerst die API-Endpoint-URL eintragen.\n\n"
+                    "Beispiel: https://deine-domain.de/sync/lima_sync_endpoint.php\n\n"
+                    "Hinweis: mysql.lima-city.de ist der DB-Host, kein API-Endpoint.")
+                return
+            if not urlsplit(url).netloc:
+                messagebox.showwarning(
+                    "Ungültige URL",
+                    "Der API-Endpoint ist ungültig.\n"
+                    "Bitte vollständige URL angeben, z.B.\n"
+                    "https://wze.de.cool/lima_sync_endpoint.php"
+                )
+                return
+            try:
+                from urllib import error, request
+                from urllib.parse import urlencode
+                json_str = json.dumps({
+                    "action": "ping",
+                    "api_key": self._sync_api_key_var.get(),
+                }, ensure_ascii=False)
+                payload = urlencode({"payload": json_str}).encode("utf-8")
+                req = request.Request(
+                    url,
+                    data=payload,
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                    method="POST",
+                )
+                with request.urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+                if not isinstance(data, dict) or data.get("ok") is False:
+                    raise RuntimeError(str(data.get("error") if isinstance(data, dict) else "Ungültige API-Antwort"))
+                server_time = data.get("server_time", "?")
+                messagebox.showinfo("Verbindung OK",
+                    f"API-Endpunkt ist erreichbar.\nServer-Zeit: {server_time}")
+            except error.URLError as exc:
+                messagebox.showerror("Verbindungsfehler",
+                    f"API nicht erreichbar: {exc}\n\n"
+                    "Prüfen Sie:\n"
+                    "• Ist die PHP-Datei hochgeladen?\n"
+                    "• Stimmt die URL?\n"
+                    "• Ist mysql.lima-city.de eingetragen? → Das ist kein Webserver!\n"
+                    "  Benötigt wird die URL zur PHP-Datei auf Ihrem Webspace.")
+            except Exception as exc:
+                messagebox.showerror("Verbindungsfehler", str(exc))
+            return
+
         try:
             import pymysql  # type: ignore
             port = int(self._sync_port_var.get().strip() or "3306")
@@ -5633,6 +5846,67 @@ class KarteikartenGUI:
             except Exception as e:
                 messagebox.showerror("Fehler", f"Fehler beim Export:\n{str(e)}")
     
+    def _export_full_csv(self):
+        """Exportiert Karteikarten + Sync-Queue als zwei CSVs."""
+        from pathlib import Path
+        
+        output_dir = filedialog.askdirectory(title="Verzeichnis für Full Backup wählen")
+        if not output_dir:
+            return
+
+        try:
+            karteikarten_path, queue_path = self.db.export_full_backup(output_dir)
+            
+            import csv
+            with open(karteikarten_path, 'r', encoding='utf-8') as f:
+                rows_count = sum(1 for _ in csv.reader(f)) - 1
+            
+            with open(queue_path, 'r', encoding='utf-8') as f:
+                queue_count = sum(1 for _ in csv.reader(f)) - 1
+            
+            msg = (
+                f"Full Backup erstellt:\n\n"
+                f"Karteikarten: {rows_count} Datensätze\n"
+                f"Sync-Queue: {queue_count} Einträge\n\n"
+                f"Speicherort: {output_dir}"
+            )
+            messagebox.showinfo("Full Backup erstellt", msg)
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Full Backup fehlgeschlagen:\n{e}")
+
+    def _import_full_backup(self):
+        """Importiert Daten + Queue aus Backup-CSVs."""
+        import csv
+        import os
+        
+        backup_dir = filedialog.askdirectory(title="Backup-Verzeichnis mit CSV-Dateien")
+        if not backup_dir:
+            return
+
+        karteikarten_file = None
+        queue_file = None
+        
+        for file in os.listdir(backup_dir):
+            if '_backup_karteikarten_' in file and file.endswith('.csv'):
+                karteikarten_file = os.path.join(backup_dir, file)
+            elif '_backup_sync_queue_' in file and file.endswith('.csv'):
+                queue_file = os.path.join(backup_dir, file)
+        
+        if not karteikarten_file:
+            messagebox.showwarning("Nicht gefunden", "Zur Wiederherstellung wird _backup_karteikarten_*.csv benötigt")
+            return
+
+        if not messagebox.askyesno("Bestätigung", 
+            "Aktuelle Daten werden mit dem Backup überschrieben!\n\nFortfahren?"):
+            return
+
+        try:
+            self.db.restore_full_backup(karteikarten_file, queue_file)
+            messagebox.showinfo("Erfolg", "Daten erfolgreich wiederhergestellt!\n\nBitte die Anwendung neu starten.")
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Wiederherstellung fehlgeschlagen:\n{e}")
+
+
     def _export_gedcom(self):
         """Exportiert die Datenbank als GEDCOM-Datei (GRAMPS-Dialekt)."""
         # Prüfen ob Einträge ausgewählt sind

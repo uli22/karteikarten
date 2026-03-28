@@ -1,16 +1,8 @@
-"""Offline-First Online-Sync fuer MySQL (Lima-City o.ae.).
+"""Offline-First Online-Sync fuer SQLite <-> Online-Backend.
 
-Architektur:
-  - Lokale SQLite-DB ist primaere Datenquelle (offline-first).
-  - Aenderungen landen in der lokalen sync_queue.
-  - flush_once() sendet Pending-Eintraege zur MySQL-Online-DB (PUSH).
-  - pull_once() holt neue Eintraege vom Server und merged sie lokal (PULL).
-  - Konfliktregel: Wenn updated_at auf dem Server neuer ist, gewinnt der Server
-    - AUSNAHME: fid_reader wird lokal nicht ueberschrieben, fid_erkennung nicht vom Reader.
-  - Abhängigkeit: pymysql (wird nur importiert wenn sync aktiv).
-
-Installation:
-    pip install pymysql
+Unterstuetzte Backends:
+    - mysql: direkte MySQL-Verbindung (z.B. VPS)
+    - api: HTTP-REST-Endpunkt (empfohlen fuer Lima-City Webhosting)
 """
 
 from __future__ import annotations
@@ -18,15 +10,48 @@ from __future__ import annotations
 import json
 import logging
 import threading
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from urllib import error, request
+from urllib.parse import urlsplit, urlunsplit
 
 from .config import get_config
 from .database import KarteikartenDB
 
 logger = logging.getLogger("online_sync")
+
+
+def _normalize_endpoint_url(raw_url: str) -> str:
+    """Normalisiert typische URL-Eingabefehler fuer den API-Endpunkt."""
+    url = (raw_url or "").strip()
+    if not url:
+        return ""
+
+    if "://" not in url:
+        url = "https://" + url
+
+    url = url.replace("https://https://", "https://")
+    url = url.replace("http://http://", "http://")
+    url = url.replace("https://https:/", "https://")
+    url = url.replace("http://http:/", "http://")
+    if url.startswith("https:/") and not url.startswith("https://"):
+        url = "https://" + url[len("https:/"):]
+    if url.startswith("http:/") and not url.startswith("http://"):
+        url = "http://" + url[len("http:/"):]
+
+    parts = urlsplit(url)
+    if not parts.netloc and parts.path:
+        path = parts.path.lstrip("/")
+        if "/" in path:
+            host, rest = path.split("/", 1)
+            if "." in host:
+                parts = parts._replace(netloc=host, path="/" + rest)
+        elif "." in path:
+            parts = parts._replace(netloc=path, path="")
+
+    scheme = parts.scheme or "https"
+    return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))
 
 # Felder die NICHT von der Remote-Seite ueberschrieben werden duerfen,
 # wenn sie von der lokalen Gegenseite gesetzt wurden.
@@ -170,29 +195,37 @@ class MySQLConnection:
 
 
 class OnlineSyncService:
-    """Offline-First Sync: lokale SQLite ↔ MySQL Online-DB."""
+    """Offline-First Sync: lokale SQLite <-> Online-Backend."""
 
     MAX_RETRIES = 5
 
-    def __init__(self) -> None:
-        cfg = get_config().online_sync
+    def __init__(self, config_obj=None) -> None:
+        self._config_obj = config_obj or get_config()
+        cfg = self._config_obj.online_sync
         self.enabled: bool = bool(cfg.get("enabled", False))
         self.source: str = str(cfg.get("source", "erkennung")).strip() or "erkennung"
         self.batch_size: int = int(cfg.get("batch_size", 100) or 100)
         self.interval: int = int(cfg.get("sync_interval_seconds", 20) or 20)
+        self.mode: str = str(cfg.get("mode", "mysql") or "mysql").strip().lower()
 
-        # Verbindungsparameter (explizite Felder, kein URL-Parsen mehr)
+        # Verbindungsparameter
         self._host: str = str(cfg.get("db_host", "")).strip()
         self._port: int = int(cfg.get("db_port", 3306) or 3306)
         self._user: str = str(cfg.get("db_user", "")).strip()
         self._password: str = str(cfg.get("db_password", ""))
         self._database: str = str(cfg.get("db_name", "")).strip()
+        self._endpoint_url: str = _normalize_endpoint_url(str(cfg.get("endpoint_url", "")))
+        self._api_key: str = str(cfg.get("api_key", "")).strip()
+        self._last_pull_cursor: str = str(cfg.get("last_pull_cursor", "")).strip() or "1970-01-01 00:00:00"
+        self._last_pull_id: str = str(cfg.get("last_pull_id", "")).strip()
 
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._last_result: Optional[SyncResult] = None
         self._last_sync_ts: str = ""
+        self._remote_total: Optional[int] = None
+        self._warned_missing_last_pull_id: bool = False
         self._db: Optional[KarteikartenDB] = None
 
     # ------------------------------------------------------------------
@@ -206,13 +239,26 @@ class OnlineSyncService:
                 stats = db.get_sync_queue_stats()
             except Exception:
                 stats = {"pending": 0, "sent": 0, "total": 0}
+            try:
+                cur = db.conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM karteikarten")
+                local_records = int(cur.fetchone()[0] or 0)
+            except Exception:
+                local_records = 0
         else:
             stats = {"pending": 0, "sent": 0, "total": 0}
+            local_records = 0
         return {
             "enabled": self.enabled,
+            "mode": self.mode,
             "pending": stats.get("pending", 0),
             "sent": stats.get("sent", 0),
             "total": stats.get("total", 0),
+            "local_records": local_records,
+            "remote_total": self._remote_total,
+            "last_pushed": (self._last_result.pushed if self._last_result else 0),
+            "last_pulled": (self._last_result.pulled if self._last_result else 0),
+            "last_failed": (self._last_result.failed if self._last_result else 0),
             "last_sync": self._last_sync_ts or "–",
             "last_result": self._last_result,
         }
@@ -244,7 +290,10 @@ class OnlineSyncService:
     def sync_now(self, db: KarteikartenDB) -> SyncResult:
         """Führt sofort einen vollständigen Push+Pull-Zyklus durch."""
         with self._lock:
-            return self._run_cycle(db)
+            result = self._run_cycle(db)
+            self._last_result = result
+            self._last_sync_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            return result
 
     def flush_once(self, db: KarteikartenDB) -> SyncResult:
         """Abwärtskompatible Methode – führt sync_now aus."""
@@ -255,30 +304,49 @@ class OnlineSyncService:
     # ------------------------------------------------------------------
 
     def _background_loop(self, db: KarteikartenDB) -> None:
-        while not self._stop_event.is_set():
-            try:
-                with self._lock:
-                    result = self._run_cycle(db)
-                    self._last_result = result
-                    self._last_sync_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
-                if result.failed or result.errors:
-                    logger.warning(
-                        "Sync-Zyklus: %d gepusht, %d gepullt, %d Fehler",
-                        result.pushed, result.pulled, result.failed,
-                    )
-                else:
-                    logger.debug(
-                        "Sync-Zyklus OK: %d gepusht, %d gepullt",
-                        result.pushed, result.pulled,
-                    )
-            except Exception as exc:
-                logger.exception("Unerwarteter Fehler im Sync-Thread: %s", exc)
-            self._stop_event.wait(timeout=self.interval)
+        thread_db: Optional[KarteikartenDB] = None
+        try:
+            # Eigene DB-Verbindung pro Thread: verhindert SQLite-Threadingfehler.
+            thread_db = KarteikartenDB(db.db_path)
+            while not self._stop_event.is_set():
+                try:
+                    with self._lock:
+                        result = self._run_cycle(thread_db)
+                        self._last_result = result
+                        self._last_sync_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                    if result.failed or result.errors:
+                        logger.warning(
+                            "Sync-Zyklus: %d gepusht, %d gepullt, %d Fehler",
+                            result.pushed, result.pulled, result.failed,
+                        )
+                    else:
+                        logger.debug(
+                            "Sync-Zyklus OK: %d gepusht, %d gepullt",
+                            result.pushed, result.pulled,
+                        )
+                except Exception as exc:
+                    logger.exception("Unerwarteter Fehler im Sync-Thread: %s", exc)
+                self._stop_event.wait(timeout=self.interval)
+        finally:
+            if thread_db is not None:
+                try:
+                    thread_db.conn.close()
+                except Exception:
+                    pass
 
     def _run_cycle(self, db: KarteikartenDB) -> SyncResult:
         result = SyncResult()
 
-        if not self.enabled or not self._host:
+        if not self.enabled:
+            return result
+
+        if self.mode == "api":
+            return self._run_cycle_api(db)
+        return self._run_cycle_mysql(db)
+
+    def _run_cycle_mysql(self, db: KarteikartenDB) -> SyncResult:
+        result = SyncResult()
+        if not self._host:
             return result
 
         try:
@@ -306,8 +374,173 @@ class OnlineSyncService:
                 mysql.close()
             except Exception:
                 pass
+        return result
+
+    def _run_cycle_api(self, db: KarteikartenDB) -> SyncResult:
+        result = SyncResult()
+        if not self._endpoint_url:
+            result.failed += 1
+            result.errors.append("API-Endpoint fehlt")
+            return result
+        if not self._api_key:
+            result.failed += 1
+            result.errors.append("API-Key fehlt")
+            return result
+
+        pending = db.get_pending_sync_items(limit=self.batch_size)
+        cur_local = db.conn.cursor()
+        cur_local.execute("SELECT COUNT(*) FROM karteikarten")
+        local_count = int(cur_local.fetchone()[0] or 0)
+        effective_last_pull = self._last_pull_cursor if local_count > 0 else "1970-01-01 00:00:00"
+        effective_last_pull_id = self._last_pull_id if local_count > 0 else ""
+
+        payload_items: List[Dict[str, Any]] = []
+        for item in pending:
+            if item.get("retries", 0) >= self.MAX_RETRIES:
+                continue
+            entry: Dict[str, Any] = {
+                "queue_id": item["id"],
+                "global_id": item["global_id"],
+                "op": item.get("op", "upsert"),
+                "base_version": int(item.get("base_version") or 1),
+                "source": item.get("source") or self.source,
+            }
+            if entry["op"] != "delete":
+                local_record = self._load_local_record(db, entry["global_id"])
+                if local_record is None:
+                    continue
+                entry["record"] = local_record
+            payload_items.append(entry)
+
+        payload = {
+            "api_key": self._api_key,
+            "source": self.source,
+            "batch_size": self.batch_size,
+            "last_pull": effective_last_pull,
+            "last_pull_id": effective_last_pull_id,
+            "pending": payload_items,
+        }
+
+        try:
+            response = self._api_call(payload)
+        except Exception as exc:
+            result.failed += 1
+            result.errors.append(f"API-Fehler: {exc}")
+            return result
+
+        server_has_last_pull_id = "last_pull_id" in response
+
+        acked = set(response.get("acked_ids", []))
+        for item in pending:
+            queue_id = item["id"]
+            if queue_id in acked:
+                db.mark_sync_item_sent(queue_id)
+                result.pushed += 1
+
+        for err in response.get("errors", []):
+            queue_id = err.get("id")
+            if queue_id is None:
+                continue
+            db.mark_sync_item_error(int(queue_id), str(err.get("error") or "Unbekannter API-Fehler"))
+            result.failed += 1
+
+        for server_row in response.get("pull", []):
+            try:
+                updated = self._apply_pull(db, server_row, result)
+                if updated:
+                    result.pulled += 1
+            except Exception as exc:
+                result.failed += 1
+                result.errors.append(f"pull {server_row.get('global_id')}: {exc}")
+
+        new_cursor = str(response.get("last_pull") or "").strip()
+        new_cursor_id = str(response.get("last_pull_id") or "").strip()
+        cursor_changed = False
+        if new_cursor:
+            cursor_changed = (new_cursor != self._last_pull_cursor) or (new_cursor_id != self._last_pull_id)
+            self._last_pull_cursor = new_cursor
+            self._last_pull_id = new_cursor_id
+            if cursor_changed:
+                self._config_obj.set_online_sync({
+                    "last_pull_cursor": new_cursor,
+                    "last_pull_id": new_cursor_id,
+                })
+
+        remote_total = response.get("remote_total")
+        if isinstance(remote_total, int):
+            self._remote_total = remote_total
+
+        # Ohne last_pull_id kann bei gleichen aktualisiert_am-Werten keine stabile
+        # Pagination garantiert werden (man bleibt sonst z.B. bei 501/7102 hängen).
+        if isinstance(self._remote_total, int) and self._remote_total > 0 and result.failed == 0 and result.pulled == 0 and not cursor_changed:
+            cur_after = db.conn.cursor()
+            cur_after.execute("SELECT COUNT(*) FROM karteikarten")
+            local_after = int(cur_after.fetchone()[0] or 0)
+            if local_after < self._remote_total:
+                if not server_has_last_pull_id:
+                    msg = (
+                        "Server-Endpunkt ist veraltet: Feld 'last_pull_id' fehlt. "
+                        "Bitte aktuelle lima_sync_endpoint.php hochladen, sonst bleibt der Import hängen."
+                    )
+                    result.failed += 1
+                    result.errors.append(msg)
+                    if not self._warned_missing_last_pull_id:
+                        logger.warning(msg)
+                        self._warned_missing_last_pull_id = True
+                elif self._last_pull_cursor != "1970-01-01 00:00:00" or self._last_pull_id != "":
+                    self._last_pull_cursor = "1970-01-01 00:00:00"
+                    self._last_pull_id = ""
+                    self._config_obj.set_online_sync({
+                        "last_pull_cursor": self._last_pull_cursor,
+                        "last_pull_id": self._last_pull_id,
+                    })
+                    msg = (
+                        "Sync-Cursor wurde auf Vollabgleich zurückgesetzt (lokal unvollständig). "
+                        "Bitte Synchronisieren erneut ausführen."
+                    )
+                    result.failed += 1
+                    result.errors.append(msg)
+                    logger.info(msg)
 
         return result
+
+    def _load_local_record(self, db: KarteikartenDB, global_id: str) -> Optional[Dict[str, Any]]:
+        cur_local = db.conn.cursor()
+        cur_local.execute("SELECT * FROM karteikarten WHERE global_id = ?", (global_id,))
+        row = cur_local.fetchone()
+        if not row:
+            return None
+        record = dict(row)
+        record.pop("id", None)
+        return record
+
+    def _api_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        # Sende als application/x-www-form-urlencoded mit JSON im Feld "payload".
+        # Zuverlässiger als raw JSON body auf Lima-City Shared Hosting (php://input oft leer).
+        from urllib.parse import urlencode
+        json_str = json.dumps(payload, ensure_ascii=False)
+        body = urlencode({"payload": json_str}).encode("utf-8")
+        req = request.Request(
+            self._endpoint_url,
+            data=body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            method="POST",
+        )
+        try:
+            with request.urlopen(req, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", errors="replace")
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
+            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"URL-Fehler: {exc.reason}") from exc
+
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise RuntimeError("Ungültige API-Antwort")
+        if data.get("ok") is False:
+            raise RuntimeError(str(data.get("error") or "API meldet Fehler"))
+        return data
 
     # ------------------------------------------------------------------
     # PUSH: lokale Queue → MySQL
@@ -507,43 +740,6 @@ class OnlineSyncService:
             )
             mysql.commit()
         result.conflicts += 1
-
-    # ------------------------------------------------------------------
-    # Konfiguration parsen
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _parse_endpoint(url: str):
-        """Parst 'host:port/datenbank' oder 'user:pw@host:port/db'."""
-        host = ""
-        port = 3306
-        user = ""
-        password = ""
-        database = ""
-        if not url:
-            return host, port, user, password, database
-        try:
-            # Format: user:pw@host:port/database
-            if "@" in url:
-                creds, rest = url.split("@", 1)
-                if ":" in creds:
-                    user, password = creds.split(":", 1)
-                else:
-                    user = creds
-            else:
-                rest = url
-            if "/" in rest:
-                host_part, database = rest.rsplit("/", 1)
-            else:
-                host_part = rest
-            if ":" in host_part:
-                host, port_str = host_part.rsplit(":", 1)
-                port = int(port_str)
-            else:
-                host = host_part
-        except Exception:
-            pass
-        return host, port, user, password, database
 
     def _connect(self) -> MySQLConnection:
         return MySQLConnection(
