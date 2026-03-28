@@ -215,6 +215,79 @@ class KarteikartenGUI:
         if self.current_image:
             self._check_db_status()
 
+    def _name_token_key(self, token: str) -> str:
+        """Normalisiert ein Namens-Token für robuste Vergleiche."""
+        cleaned = re.sub(r"[^A-Za-zÄÖÜäöüßẞ]", "", str(token or ""))
+        return cleaned.replace('ẞ', 'ß').lower()
+
+    def _expand_abbreviated_first_names(self, value: Optional[str], gender: str = 'unknown') -> Optional[str]:
+        """Ersetzt erkannte Vornamen-Kurzformen durch Vollformen (z.B. Joh -> Johann/Johannes, Elis -> Elisabeth)."""
+        if not value:
+            return value
+
+        male_abbrev = {
+            'andr': 'Andreas',
+            'balt': 'Balthasar',
+            'christ': 'Christian',
+            'conr': 'Conrad',
+            'eberh': 'Eberhard',
+            'frid': 'Friedrich',
+            'fried': 'Friedrich',
+            'geo': 'Georg',
+            'heinr': 'Heinrich',
+            'henr': 'Henrich',
+            'mart': 'Martin',
+            'matth': 'Matthias',
+            'nic': 'Nicolas',
+            'pet': 'Peter',
+            'petr': 'Peter',
+            'phil': 'Philipp',
+            'seb': 'Sebastian',
+            'theoph': 'Theophil',
+            'wilh': 'Wilhelm',
+        }
+        female_abbrev = {
+            'appol': 'Appolonia',
+            'barb': 'Barbara',
+            'cath': 'Catharina',
+            'dor': 'Dorothea',
+            'elis': 'Elisabeth',
+            'gertr': 'Gertraut',
+            'jul': 'Juliana',
+            'kath': 'Katharina',
+            'marg': 'Margaretha',
+            'reg': 'Regina',
+            'sus': 'Susanna',
+        }
+
+        male_keys = {self._name_token_key(v) for v in MAENNLICHE_VORNAMEN if self._name_token_key(v)}
+
+        def is_male_token(token: str) -> bool:
+            key = self._name_token_key(token)
+            return key in male_keys or key in male_abbrev or key == 'joh'
+
+        tokens = [t for t in str(value).split() if t]
+        expanded_tokens = []
+
+        for idx, token in enumerate(tokens):
+            key = self._name_token_key(token)
+            expanded = None
+
+            if gender in ('male', 'unknown'):
+                if key == 'joh':
+                    has_following_male_name = idx + 1 < len(tokens) and is_male_token(tokens[idx + 1])
+                    expanded = 'Johann' if has_following_male_name else 'Johannes'
+                elif key in male_abbrev:
+                    expanded = male_abbrev[key]
+
+            if expanded is None and gender in ('female', 'unknown'):
+                if key in female_abbrev:
+                    expanded = female_abbrev[key]
+
+            expanded_tokens.append(expanded if expanded is not None else token.rstrip(',.;:'))
+
+        return ' '.join(expanded_tokens)
+
     def _extract_marriage_fields(self, text: str) -> dict:
         """
         Extrahiert Felder aus einem Heiratseintrag.
@@ -373,9 +446,19 @@ class KarteikartenGUI:
                 braut_indicator_pos = i
                 print(f"DEBUG Heirat: Braut-Indikator '{w}' gefunden bei Position {i}")
                 break
+
+        # Sonderfall: "mit/mitt/cum Jfr." soll wie "und" als Trenner funktionieren
+        if braut_indicator_pos > 0:
+            prev_word = words[braut_indicator_pos - 1].lower()
+            if prev_word in ['mit', 'mitt', 'cum']:
+                trenner_pos = braut_indicator_pos - 1
+                print(
+                    f"DEBUG Heirat: Spezial-Trenner '{words[trenner_pos]} {words[braut_indicator_pos]}' "
+                    f"gefunden bei Position {trenner_pos}"
+                )
         
         # Wenn Braut-Indikator gefunden, suche rückwärts nach dem letzten Trenner davor
-        if braut_indicator_pos != -1:
+        if braut_indicator_pos != -1 and trenner_pos == -1:
             for i in range(braut_indicator_pos - 1, -1, -1):
                 if words[i].lower() in trenner_woerter:
                     trenner_pos = i
@@ -741,10 +824,12 @@ class KarteikartenGUI:
             
             # Prüfe ob letztes Wort ein Nachname sein könnte (kein bekannter Vorname und keine Zahl)
             # Beispiel: "Anna Güttin" → "Anna" = Partner, "Güttin" = Braut Nachname
+            # ABER: nur wenn braut_nachname noch NICHT bereits gesetzt wurde (z.B. durch -in-Erkennung)
             partner_words = partner_name.split()
-            if (len(partner_words) > 1 
-                and partner_words[-1] not in weibliche_vornamen 
-                and not partner_words[-1].isdigit()):
+            if (not result.get('braut_nachname')
+                    and len(partner_words) > 1 
+                    and partner_words[-1] not in weibliche_vornamen 
+                    and not partner_words[-1].isdigit()):
                 # Letztes Wort ist vermutlich der Nachname
                 result['braut_nachname'] = partner_words[-1]
                 result['partner'] = ' '.join(partner_words[:-1])
@@ -754,8 +839,11 @@ class KarteikartenGUI:
                 result['partner'] = partner_name
                 print(f"DEBUG Heirat: Braut Vorname = {result['partner']}")
         
-        # Überspringe Füllwörter
-        while idx < len(braut_words) and braut_words[idx] in ignore_extended:
+        # Überspringe Füllwörter und Anreden (z.B. "Herrn" vor Vater-Vorname)
+        while idx < len(braut_words) and (
+            braut_words[idx] in ignore_extended or
+            braut_words[idx].lower() in _anreden_lower
+        ):
             idx += 1
         
         # Nach Vornamen: Unterscheide zwei Fälle
@@ -855,6 +943,8 @@ class KarteikartenGUI:
         # Suche Stand-Angaben (z.B. "gewesene hausfrau", "Wittib", "hinterlassene Wittwe", "Tochter")
         # Kombinationen wie "gewesene hausfrau" erkennen
         braut_text_lower = ' '.join(braut_words).lower()
+        # OCR/Abkuerzungs-Variante: "hinterl" -> "hinterlassene"
+        braut_text_lower = re.sub(r'\bhinterl\b', 'hinterlassene', braut_text_lower)
         
         # Verwende STAND_MAPPING für Stand-Erkennung
         # Sortiere nach Länge (längste zuerst), um spezifischere Matches zu bevorzugen
@@ -863,6 +953,11 @@ class KarteikartenGUI:
                 result['stand'] = STAND_MAPPING[stand_key]
                 print(f"DEBUG Heirat: Stand = {result['stand']} (gefunden: '{stand_key}')")
                 break
+
+        result['vorname'] = self._expand_abbreviated_first_names(result.get('vorname'), gender='male')
+        result['partner'] = self._expand_abbreviated_first_names(result.get('partner'), gender='female')
+        result['braeutigam_vater'] = self._expand_abbreviated_first_names(result.get('braeutigam_vater'), gender='male')
+        result['braut_vater'] = self._expand_abbreviated_first_names(result.get('braut_vater'), gender='male')
         
         return result
 
@@ -1799,6 +1894,9 @@ class KarteikartenGUI:
         if partner:
             partner = restore_original_case(partner, words.copy(), words_original_case.copy())
 
+        vorname = self._expand_abbreviated_first_names(vorname, gender='unknown')
+        partner = self._expand_abbreviated_first_names(partner, gender='unknown')
+
         # Ergebnisse in result-Dict speichern
         result['vorname'] = vorname
         result['nachname'] = nachname
@@ -2336,11 +2434,15 @@ class KarteikartenGUI:
             # 4-stellige Varianten - mit Trennzeichen um False Positives zu vermeiden
             f"{media_id_prefix}* S_{seite_str_4}-*.jpg",
             f"{media_id_prefix}* S_*-{seite_str_4}.jpg",
+            f"{media_id_prefix}* S_{seite_str_4}_*.jpg",
+            f"{media_id_prefix}* S_*_{seite_str_4}.jpg",
             f"{media_id_prefix}*_{seite_str_4}.jpg",
             f"{media_id_prefix}*_{seite_str_4} Sterbebuch.jpg",
             # 3-stellige Varianten - mit Trennzeichen um False Positives zu vermeiden
             f"{media_id_prefix}* S_{seite_str_3}-*.jpg",
             f"{media_id_prefix}* S_*-{seite_str_3}.jpg",
+            f"{media_id_prefix}* S_{seite_str_3}_*.jpg",
+            f"{media_id_prefix}* S_*_{seite_str_3}.jpg",
             f"{media_id_prefix}*_{seite_str_3}.jpg",
         ]
         
@@ -3858,11 +3960,15 @@ class KarteikartenGUI:
             # 4-stellige Varianten - mit Trennzeichen um False Positives zu vermeiden
             f"{media_id_prefix}* S_{seite_str_4}-*.jpg",
             f"{media_id_prefix}* S_*-{seite_str_4}.jpg",
+            f"{media_id_prefix}* S_{seite_str_4}_*.jpg",
+            f"{media_id_prefix}* S_*_{seite_str_4}.jpg",
             f"{media_id_prefix}*_{seite_str_4}.jpg",
             f"{media_id_prefix}*_{seite_str_4} Sterbebuch.jpg",
             # 3-stellige Varianten - mit Trennzeichen um False Positives zu vermeiden
             f"{media_id_prefix}* S_{seite_str_3}-*.jpg",
             f"{media_id_prefix}* S_*-{seite_str_3}.jpg",
+            f"{media_id_prefix}* S_{seite_str_3}_*.jpg",
+            f"{media_id_prefix}* S_*_{seite_str_3}.jpg",
             f"{media_id_prefix}*_{seite_str_3}.jpg",
         ]
         
