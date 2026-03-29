@@ -1994,10 +1994,13 @@ class KarteikartenGUI:
                 try:
                     cursor.execute("""
                         UPDATE karteikarten SET
-                            vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, todestag = ?, ort = ?, geb_jahr_gesch = ?, aktualisiert_am = CURRENT_TIMESTAMP
+                            vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, todestag = ?, ort = ?, geb_jahr_gesch = ?,
+                            version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung',
+                            aktualisiert_am = CURRENT_TIMESTAMP
                         WHERE id = ?
                     """, (vorname, nachname, partner, beruf, stand, todestag, ort, geb_jahr_gesch, record_id))
                     self.db.conn.commit()
+                    self.db.mark_record_for_sync(record_id)
                     updated += 1
                 except Exception as e:
                     errors.append(f"ID {record_id}: Fehler beim Speichern: {e}")
@@ -2014,6 +2017,7 @@ class KarteikartenGUI:
                                 vorname = ?, nachname = ?, partner = ?, beruf = ?, ort = ?, stand = ?,
                                 braeutigam_stand = ?, braeutigam_vater = ?, braut_vater = ?, braut_nachname = ?, braut_ort = ?,
                                 todestag = ?,
+                                version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung',
                                 aktualisiert_am = CURRENT_TIMESTAMP
                             WHERE id = ?
                         """, (
@@ -2025,6 +2029,7 @@ class KarteikartenGUI:
                             record_id
                         ))
                         self.db.conn.commit()
+                        self.db.mark_record_for_sync(record_id)
                         updated += 1
                     except Exception as e:
                         errors.append(f"ID {record_id}: Fehler beim Speichern: {e}")
@@ -2262,6 +2267,7 @@ class KarteikartenGUI:
                         kirchenbuchtext = ?,
                         notiz = ?,
                         gramps = ?,
+                        version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung',
                         aktualisiert_am = CURRENT_TIMESTAMP
                     WHERE id = ?
                 """, (
@@ -2282,6 +2288,7 @@ class KarteikartenGUI:
                         kirchenbuchtext = ?,
                         notiz = ?,
                         gramps = ?,
+                        version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung',
                         aktualisiert_am = CURRENT_TIMESTAMP
                     WHERE id = ?
                 """, (
@@ -2295,6 +2302,7 @@ class KarteikartenGUI:
                 ))
             
             self.db.conn.commit()
+            self.db.mark_record_for_sync(self.current_db_record_id)
             
             # Update Status-Label
             self.db_record_status.config(
@@ -2542,6 +2550,13 @@ class KarteikartenGUI:
             
     def _create_widgets(self):
         """Erstellt alle GUI-Elemente."""
+        # Menüleiste
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Über…", command=self._show_about)
+        menubar.add_cascade(label="Hilfe", menu=help_menu)
+        self.root.config(menu=menubar)
+
         # Notebook (Tab-System) erstellen
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
@@ -2570,7 +2585,23 @@ class KarteikartenGUI:
 
         # Tab-Wechsel überwachen
         self.notebook.bind('<<NotebookTabChanged>>', self._on_tab_changed)
-    
+
+    def _show_about(self):
+        """Zeigt den 'Über'-Dialog mit Versionsnummer."""
+        win = tk.Toplevel(self.root)
+        win.title("Über Wetzlar Karteikartenerkennung")
+        win.resizable(False, False)
+        win.grab_set()
+        tk.Label(win, text="Wetzlar Karteikartenerkennung",
+                 font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
+        tk.Label(win, text="Version 0.3.0").pack(padx=30)
+        tk.Label(win, text="© 2026 – Wetzlar Projekt",
+                 foreground="gray").pack(padx=30, pady=(4, 16))
+        tk.Button(win, text="OK", width=10,
+                  command=win.destroy).pack(pady=(0, 20))
+        win.bind("<Return>", lambda _e: win.destroy())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
     def _create_ocr_tab(self, parent):
         """Erstellt den OCR-Tab Inhalt."""
         # Hauptcontainer mit zwei Spalten
@@ -3038,12 +3069,22 @@ class KarteikartenGUI:
                         if new_text == original_text:
                             keine_aenderung += 1
                             continue
-                        cursor.execute("UPDATE karteikarten SET erkannter_text = ?, aktualisiert_am = CURRENT_TIMESTAMP WHERE id = ?", (new_text, record_id))
+                        cursor.execute(
+                            "UPDATE karteikarten SET erkannter_text = ?, "
+                            "version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung', "
+                            "aktualisiert_am = CURRENT_TIMESTAMP WHERE id = ?",
+                            (new_text, record_id))
                         erfolge += 1
                 except Exception as e:
                     fehler += 1
                     print(f"Fehler bei ID {record_id}: {str(e)}")
             self.db.conn.commit()
+            for item in self.tree.selection():
+                rid = self.tree.item(item)["values"][0]
+                try:
+                    self.db.mark_record_for_sync(int(rid))
+                except Exception:
+                    pass
             self._refresh_db_list()
             messagebox.showinfo(
                 "Ersetzen abgeschlossen",
@@ -6300,7 +6341,8 @@ class KarteikartenGUI:
                                 ort = ?,
                                 stand = ?,
                                 kirchenbuchtext = ?,
-                                geb_jahr_gesch = ?
+                                geb_jahr_gesch = ?,
+                                version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung'
                             WHERE id = ?
                             """,
                             (
@@ -6330,6 +6372,11 @@ class KarteikartenGUI:
                     errors += 1
 
             self.db.conn.commit()
+            for record_id in [rid for ids in key_to_ids.values() for rid in ids]:
+                try:
+                    self.db.mark_record_for_sync(record_id)
+                except Exception:
+                    pass
             self._refresh_db_list()
 
             self.db_progress['value'] = 0
