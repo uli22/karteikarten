@@ -105,6 +105,13 @@ class KarteikartenReader:
     # ------------------------------------------------------------------
 
     def _create_widgets(self):
+        # Menüleiste
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Über…", command=self._show_about)
+        menubar.add_cascade(label="Hilfe", menu=help_menu)
+        self.root.config(menu=menubar)
+
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
 
@@ -116,6 +123,26 @@ class KarteikartenReader:
 
         self._create_db_tab(db_tab)
         self._create_settings_tab(settings_tab)
+
+    # ------------------------------------------------------------------
+    # Über-Dialog
+    # ------------------------------------------------------------------
+
+    def _show_about(self):
+        """Zeigt den 'Über'-Dialog mit Versionsnummer."""
+        win = tk.Toplevel(self.root)
+        win.title("Über Wetzlar Karteikarten – Leser")
+        win.resizable(False, False)
+        win.grab_set()
+        tk.Label(win, text="Wetzlar Karteikarten – Leser",
+                 font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
+        tk.Label(win, text="Version 0.3.0").pack(padx=30)
+        tk.Label(win, text="© 2026 – Wetzlar Projekt",
+                 foreground="gray").pack(padx=30, pady=(4, 16))
+        tk.Button(win, text="OK", width=10,
+                  command=win.destroy).pack(pady=(0, 20))
+        win.bind("<Return>", lambda _e: win.destroy())
+        win.bind("<Escape>", lambda _e: win.destroy())
 
     # ------------------------------------------------------------------
     # Datenbank-Tab
@@ -852,7 +879,7 @@ class KarteikartenReader:
     def _backup_full_csv(self):
         """Exportiert Karteikarten + Sync-Queue mit Datum im Dateinamen."""
         from pathlib import Path
-        
+
         # Wähle Verzeichnis
         output_dir = filedialog.askdirectory(title="Verzeichnis für Full Backup wählen")
         if not output_dir:
@@ -885,7 +912,7 @@ class KarteikartenReader:
         """Importiert Karteikarten + Sync-Queue aus Backup-CSVs."""
         import csv
         import os
-        
+
         # Ask for directory with backup files
         backup_dir = filedialog.askdirectory(title="Backup-Verzeichnis mit CSV-Dateien wählen")
         if not backup_dir:
@@ -1038,8 +1065,13 @@ class KarteikartenReader:
         def save_fid():
             new_fid = entry_var.get().strip()
             c = self.db.conn.cursor()
-            c.execute("UPDATE karteikarten SET notiz = ? WHERE id = ?", (new_fid, record_id))
+            c.execute(
+                "UPDATE karteikarten SET notiz = ?, "
+                "version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'reader', "
+                "aktualisiert_am = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_fid, record_id))
             self.db.conn.commit()
+            self.db.mark_record_for_sync(record_id, source='reader')
             values = list(self.tree.item(item)["values"])
             values[22] = new_fid  # Notiz-Spalte (Index 22)
             self.tree.item(item, values=values)
