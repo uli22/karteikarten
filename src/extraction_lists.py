@@ -10,6 +10,47 @@ Dieses Modul enthält alle Listen und Mappings für:
 - Zu ignorierende Wörter
 """
 
+import json
+import sys
+from pathlib import Path
+
+
+def _get_lists_dir() -> Path:
+    """Gibt das Verzeichnis zurück, in dem die JSON-Listendateien liegen."""
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+def _load_list(filename: str, default: list) -> list:
+    """Lädt eine Liste aus einer JSON-Datei; gibt default zurück wenn nicht vorhanden."""
+    path = _get_lists_dir() / filename
+    if not path.exists():
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return default
+
+
+def _load_mapping(filename: str, default: dict) -> dict:
+    """Lädt ein Dict aus einer JSON-Datei; gibt default zurück wenn nicht vorhanden."""
+    path = _get_lists_dir() / filename
+    if not path.exists():
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (json.JSONDecodeError, OSError):
+        pass
+    return default
+
 def get_sources_with_adjusted_paths(config=None):
     """
     Gibt die SOURCES-Liste mit angepassten media_path zurück.
@@ -533,3 +574,14 @@ STAND_PRAEFIXE = [
     # HINWEIS: "verlassen" wird bei Witwe/Witwer ignoriert (in IGNORIERE_WOERTER)
     # Bei Tochter/Sohn bleibt es als eigenständiges Präfix erhalten
 ]
+
+# =============================================================================
+# BENUTZERDEFINIERTE ANPASSUNGEN aus JSON-Dateien (überschreiben die Defaults)
+# =============================================================================
+
+WEIBLICHE_VORNAMEN = _load_list('vornamen_weiblich.json', WEIBLICHE_VORNAMEN)
+MAENNLICHE_VORNAMEN = _load_list('vornamen_maennlich.json', MAENNLICHE_VORNAMEN)
+BERUFE = _load_list('berufe.json', BERUFE)
+STAND_MAPPING = _load_mapping('stand_mapping.json', STAND_MAPPING)
+# Abgeleitete Listen nach möglichem JSON-Überschreiben aktualisieren
+STAND_SYNONYME = list(STAND_MAPPING.keys())

@@ -1,6 +1,9 @@
 """Text-Nachbearbeitungs-Modul für OCR-Ergebnisse."""
 
+import json
 import re
+import sys
+from pathlib import Path
 from typing import Dict
 
 
@@ -102,6 +105,9 @@ class TextPostProcessor:
             'wurden': ['wurden', 'vurden', 'wurcen'],
         }
         
+        # Lade benutzerdefinierte Korrekturen aus JSON (überschreibt Hardcoded-Defaults)
+        self._load_corrections()
+
         # Muster für strukturierte Daten (Kirchenbuch-spezifisch)
         self.patterns = {
             # Datum: YYYY.MM.DD
@@ -110,6 +116,29 @@ class TextPostProcessor:
             'number': re.compile(r'Nr:?\s*(\d+)'),
         }
     
+    @staticmethod
+    def _get_corrections_path() -> Path:
+        """Gibt den Pfad zur ocr_corrections.json zurück (neben EXE oder Projektroot)."""
+        if getattr(sys, 'frozen', False):
+            return Path(sys.executable).resolve().parent / "ocr_corrections.json"
+        return Path(__file__).resolve().parent.parent / "ocr_corrections.json"
+
+    def _load_corrections(self) -> bool:
+        """Lädt OCR-Korrekturen aus JSON-Datei, falls vorhanden."""
+        path = self._get_corrections_path()
+        if not path.exists():
+            return False
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            if 'common_ocr_errors' in data:
+                self.common_ocr_errors = data['common_ocr_errors']
+            if 'kirchenbuch_vocabulary' in data:
+                self.kirchenbuch_vocabulary = data['kirchenbuch_vocabulary']
+            return True
+        except (json.JSONDecodeError, OSError):
+            return False
+
     def process(self, text: str, aggressive: bool = False) -> str:
         """
         Führt Post-Processing auf dem OCR-Text aus.
@@ -519,3 +548,145 @@ class TextPostProcessor:
     def get_vocabulary(self) -> Dict[str, list]:
         """Gibt das aktuelle Wörterbuch zurück."""
         return self.kirchenbuch_vocabulary.copy()
+
+
+# ---------------------------------------------------------------------------
+# Reine Texttransformationsfunktionen (GUI-unabhängig, testbar)
+# ---------------------------------------------------------------------------
+
+def fix_wetzlar_infinity(text: str) -> str:
+    """Korrigiert 'Wetzlar 00' → 'Wetzlar ∞' inkl. Jahreszahl-Umformungen."""
+    # 1a: Wetzlar/Variante 0016/7,14,17 → Wetzlar ∞ 1617.14.17
+    text = re.sub(
+        r'\b(Wetz|Wet|Web|Wef|Witz|Wit)[a-z]{2,5}[.,:\s]*00(1[0-9])[/,.]',
+        r'Wetzlar ∞ 16\2.',
+        text,
+        flags=re.IGNORECASE,
+    )
+    # 1b: Wetzlar/Variante 00XX → Wetzlar ∞ 16XX (2 Nachziffern + Trenner)
+    text = re.sub(
+        r'\b(Wetz|Wet|Web|Wef|Witz|Wit)[a-z]{2,5}[.,:\s]*00(\d{2})[/,.]',
+        r'Wetzlar ∞ 16\2.',
+        text,
+        flags=re.IGNORECASE,
+    )
+    # 1c: Wetzlar/Variante 00XXX/XXXX → Wetzlar ∞ 1XXX
+    text = re.sub(
+        r'\b(Wetz|Wet|Web|Wef|Witz|Wit)[a-z]{2,5}[.,:\s]*00(\d{3,4})\b',
+        r'Wetzlar ∞ 1\2',
+        text,
+        flags=re.IGNORECASE,
+    )
+    # 2: Wetzlar/Variante 00 (kein Datum) → Wetzlar ∞
+    text = re.sub(
+        r'\b(Wetz|Wet|Web|Wef|Witz|Wit)[a-z]{2,5}[.,:\s]*00\b',
+        'Wetzlar ∞',
+        text,
+        flags=re.IGNORECASE,
+    )
+    return text
+
+
+def fix_infinity_year(text: str) -> str:
+    """Korrigiert '∞16.X' → '∞ 16XX' Muster nach dem ∞-Symbol."""
+    # ∞16.XX.XX.XX → ∞ 16XX.XX.XX
+    text = re.sub(r'∞(\d{2})\.(\d{2})\.(\d{2})\.(\d{2})', r'∞ 16\1.\2.\3', text)
+    # ∞16.X (einstellig) → ∞161X
+    text = re.sub(r'∞16\.(\d)\b', r'∞161\1', text)
+    # ∞16.XX (zweistellig) → ∞16XX
+    text = re.sub(r'∞16\.(\d{2})\b', r'∞16\1', text)
+    return text
+
+
+def insert_burial_symbol(text: str) -> str:
+    """Fügt ⚰ zwischen 'ev. Kb. Wetzlar' und direkt folgender Jahreszahl ein."""
+    return re.sub(r'^(ev\. Kb\. Wetzlar)\s+(\d)', r'\1 ⚰ \2', text)
+
+
+def insert_marriage_symbol(text: str) -> str:
+    """Fügt ∞ zwischen 'ev. Kb. Wetzlar' und direkt folgender Jahreszahl ein."""
+    return re.sub(r'^(ev\. Kb\. Wetzlar)\s+(\d)', r'\1 ∞ \2', text)
+
+
+def replace_ev_kb_wetzlar_special(text: str) -> str:
+    """Ersetzt 'ev. Kb. Wetzlar. □ 1' → 'ev. Kb. Wetzlar ⚰ 1'."""
+    return text.replace("ev. Kb. Wetzlar. □ 1", "ev. Kb. Wetzlar ⚰ 1")
+
+
+def fix_header_prefix(text: str) -> str:
+    """Stellt sicher, dass der Text mit 'ev. Kb. Wetzlar' beginnt.
+
+    Alles vor der ersten Ziffer wird abgeschnitten und durch 'ev. Kb. Wetzlar ' ersetzt.
+    Wenn der Text bereits korrekt beginnt, wird er unverändert zurückgegeben.
+    """
+    if text.strip().startswith('ev. Kb. Wetzlar'):
+        return text
+    match = re.search(r'\d', text)
+    if not match:
+        return text
+    return f"ev. Kb. Wetzlar {text[match.start():]}"
+
+
+def standardize_p_nr(text: str) -> str:
+    """Vereinheitlicht p./Nr.-Angaben in Kirchenbuch-Zitaten.
+
+    Beispiele: 'p. 95m. 24' → 'p. 95 Nr. 24', 'p.118 n.1' → 'p. 118 Nr. 1'
+    """
+    text = re.sub(r"p\.\s*(\d+)m\.\s*(\d+)", r"p. \1 Nr. \2", text)
+    text = re.sub(r"p\.?\s*(\d+)n\.\s*(\d+)", r"p. \1 Nr. \2", text)
+    text = re.sub(r"p\.?\s*(\d+)\.?n\.\s*(\d+)", r"p. \1 Nr. \2", text)
+    text = re.sub(r"(?<!Nr\.)n\.\s*(\d+)", r"Nr. \1", text)
+    text = re.sub(r"(?<!Nr\.)m\.\s*(\d+)", r"Nr. \1", text)
+    text = re.sub(r"Nr\.\s*\.\s*(\d+)", r"Nr. \1", text)
+    text = re.sub(r"p\.?\s*(\d+)\s*Nr\.?\s*(\d+)", r"p. \1 Nr. \2", text)
+    return text
+
+
+def fix_p_number(text: str) -> str:
+    """Normalisiert 'p(Zahl)' / 'P(Zahl)' → 'p. (Zahl)'."""
+    return re.sub(r"[Pp]\.?\s?(\d+)", r"p. \1", text)
+
+
+def format_citation(text: str) -> str:
+    """Bringt die Zitation in einheitliches Format 'ev. Kb. Wetzlar ⚰/∞ YYYY.MM.DD. p. X Nr. Y '.
+
+    Gibt den Text unverändert zurück wenn die Zitation nicht erkennbar ist.
+    """
+    # Vorbereinigung
+    text = re.sub(r'(ev\.?\s*Kb\.?\s*Wetzlar)\.', r'\1', text, flags=re.IGNORECASE)
+    text = re.sub(r'(\d{4})\.(\d{1,2})\.(\d{1,2}),', r'\1.\2.\3.', text)
+    text = re.sub(r'\bpp\.', 'p.', text, flags=re.IGNORECASE)
+    text = re.sub(r'Nr\.\s+(\d)', r'Nr. \1', text)
+
+    pattern = (
+        r"^\s*(ev\.?\s*Kb\.?\s*Wetzlar)?\s*([⚰∞\u26B0])?\s*"
+        r"(\d{4})[\.,\s]*(\d{1,2})[\.,\s]*(\d{1,2})[\.,\s]*[\d\.\s]*"
+        r"[Pp]{1,2}\.?\s*(\d+)[\.\s]*,?\s*Nr\.?\s*(\d+)\.?\s*"
+    )
+    match = re.match(pattern, text, re.IGNORECASE)
+    if match:
+        symbol = match.group(2) if match.group(2) else "∞"
+        jahr = match.group(3)
+        monat = match.group(4).zfill(2)
+        tag = match.group(5).zfill(2)
+        seite = match.group(6)
+        nummer = match.group(7)
+        rest = text[match.end():]
+        return f"ev. Kb. Wetzlar {symbol} {jahr}.{monat}.{tag}. p. {seite} Nr. {nummer} {rest}"
+
+    pattern_alt = (
+        r"^\s*([⚰∞\u26B0])\s*(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?"
+        r"\s*[Pp]\.?\s*(\d+)\.?\s*,?\s*Nr\.?\s*(\d+)\.?\s*"
+    )
+    match_alt = re.match(pattern_alt, text)
+    if match_alt:
+        symbol = match_alt.group(1)
+        jahr = match_alt.group(2)
+        monat = match_alt.group(3).zfill(2)
+        tag = match_alt.group(4).zfill(2)
+        seite = match_alt.group(5)
+        nummer = match_alt.group(6)
+        rest = text[match_alt.end():]
+        return f"ev. Kb. Wetzlar {symbol} {jahr}.{monat}.{tag}. p. {seite} Nr. {nummer} {rest}"
+
+    return text  # kein Match → unverändert
