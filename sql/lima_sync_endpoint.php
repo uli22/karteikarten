@@ -145,28 +145,34 @@ try {
         }
 
         if ($sv > $baseVersion) {
-            $errors[] = ['id' => $queueId, 'error' => 'Versionkonflikt'];
+            $errors[] = ['id' => $queueId, 'error' => 'Versionkonflikt', 'server_version' => $sv];
             continue;
         }
 
         $cols = ['global_id'];
         $vals = [$globalId];
         foreach ($allFields as $f) {
+            if ($f === 'aktualisiert_am') continue; // wird server-seitig mit NOW() gesetzt
             if (array_key_exists($f, $record)) {
                 $cols[] = $f;
                 $vals[] = $record[$f];
             }
         }
 
-        $placeholders = implode(', ', array_fill(0, count($cols), '?'));
+        // aktualisiert_am immer mit Server-NOW() setzen, damit der Pull-Cursor korrekt
+        // funktioniert unabhaengig von lokaler Client-Zeitzone (UTC vs. UTC+1).
+        $colsWithNow = array_merge($cols, ['aktualisiert_am']);
+        $placeholders = implode(', ', array_fill(0, count($cols), '?')) . ', NOW()';
+
         $updates = [];
         foreach ($cols as $c) {
             if ($c !== 'global_id') {
                 $updates[] = "`$c` = VALUES(`$c`)";
             }
         }
+        $updates[] = '`aktualisiert_am` = NOW()';
 
-        $sql = 'INSERT INTO karteikarten (`' . implode('`,`', $cols) . '`) VALUES (' . $placeholders . ') '
+        $sql = 'INSERT INTO karteikarten (`' . implode('`,`', $colsWithNow) . '`) VALUES (' . $placeholders . ') '
              . 'ON DUPLICATE KEY UPDATE ' . implode(', ', $updates);
 
         $stmt = $mysqli->prepare($sql);

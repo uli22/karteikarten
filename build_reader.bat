@@ -38,12 +38,12 @@ echo.
 echo Starte Build-Prozess...
 echo.
 
-REM Fuehre PyInstaller mit onefile-Konfiguration aus
+REM Fuehre PyInstaller mit onefile-Konfiguration aus (kein Konsolenfenster)
 .venv-build\Scripts\python.exe -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --onefile ^
-    --console ^
+    --windowed ^
     --name WetzlarReader ^
     %ICON_PARAM% ^
     reader_main.py

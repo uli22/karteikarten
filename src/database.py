@@ -71,6 +71,8 @@ class KarteikartenDB:
                 braut_vater TEXT,
                 braut_nachname TEXT,
                 braut_ort TEXT,
+                mutter_vorname TEXT,
+                datum_geburt TEXT,
                 
                 -- Notiz (kurzer Text bis 10 Zeichen)
                 notiz TEXT,
@@ -140,6 +142,8 @@ class KarteikartenDB:
             ('braut_vater', 'TEXT'),
             ('braut_nachname', 'TEXT'),
             ('braut_ort', 'TEXT'),
+            ('mutter_vorname', 'TEXT'),
+            ('datum_geburt', 'TEXT'),
             ('kirchenbuchtext', 'TEXT'),
             ('fid', 'TEXT'),  # Familien-ID aus families_ok.tsv
             ('gramps', 'TEXT'),  # Gramps ID
@@ -235,7 +239,10 @@ class KarteikartenDB:
         """
         if not datum:
             return None
-        
+
+        # XX (unbekannter Tag/Monat) → 00
+        datum = re.sub(r'\bXX\b', '00', datum, flags=re.IGNORECASE)
+
         # Parse DD.MM.YYYY Format
         match = re.match(r'^(\d{2})\.(\d{2})\.(\d{4})$', datum)
         if match:
@@ -312,6 +319,7 @@ class KarteikartenDB:
                         vorname: str = None, nachname: str = None, partner: str = None, beruf: str = None, todestag: str = None, ort: str = None,
                         geb_jahr_gesch: int = None,
                         braeutigam_vater: str = None, braut_vater: str = None, braut_nachname: str = None, braut_ort: str = None,
+                        mutter_vorname: str = None, datum_geburt: str = None,
                         kirchenbuchtext: str = None,
                         updated_by: str = 'erkennung') -> int:
         """
@@ -362,6 +370,8 @@ class KarteikartenDB:
                     braut_vater = ?,
                     braut_nachname = ?,
                     braut_ort = ?,
+                    mutter_vorname = ?,
+                    datum_geburt = ?,
                     kirchenbuchtext = ?,
                     global_id = ?,
                     version = COALESCE(version, 1) + 1,
@@ -376,6 +386,7 @@ class KarteikartenDB:
                 vorname, nachname, partner, beruf, todestag, ort,
                 geb_jahr_gesch,
                 braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                mutter_vorname, datum_geburt,
                 kirchenbuchtext,
                 global_id,
                 updated_by,
@@ -396,9 +407,10 @@ class KarteikartenDB:
                     vorname, nachname, partner, beruf, todestag, ort,
                     geb_jahr_gesch,
                     braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                    mutter_vorname, datum_geburt,
                     kirchenbuchtext,
                     version, updated_by, sync_status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 global_id, dateiname, dateipfad, parsed['kirchengemeinde'], parsed['ereignis_typ'],
                 parsed['jahr'], parsed['datum'], parsed['iso_datum'], parsed['seite'], parsed['nummer'],
@@ -406,6 +418,7 @@ class KarteikartenDB:
                 vorname, nachname, partner, beruf, todestag, ort,
                 geb_jahr_gesch,
                 braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                mutter_vorname, datum_geburt,
                 kirchenbuchtext,
                 1,
                 updated_by,
@@ -475,6 +488,32 @@ class KarteikartenDB:
             (error_message[:500], queue_id)
         )
         self.conn.commit()
+
+    def reset_sync_item_for_conflict(self, queue_id: int, global_id: str, server_version: int) -> None:
+        """Bei Versionkonflikt: base_version auf server_version setzen und lokale Version
+        hochsetzen, damit der nächste Push-Versuch den Konflikt überwindet."""
+        cursor = self.conn.cursor()
+        cursor.execute(
+            "UPDATE karteikarten SET version = MAX(COALESCE(version, 1), ?) WHERE global_id = ?",
+            (server_version, global_id)
+        )
+        cursor.execute(
+            "UPDATE sync_queue SET base_version = ?, retries = 0, last_error = NULL WHERE id = ?",
+            (server_version, queue_id)
+        )
+        self.conn.commit()
+
+    def mark_record_for_sync(self, record_id: int, source: str = 'erkennung') -> None:
+        """Liest global_id und aktuelle version eines vorhandenen Datensatzes und erzeugt
+        einen Sync-Queue-Eintrag. Muss NACH einem direkten UPDATE-Commit aufgerufen werden."""
+        cursor = self.conn.cursor()
+        row = cursor.execute(
+            "SELECT global_id, version FROM karteikarten WHERE id = ?", (record_id,)
+        ).fetchone()
+        if row and row[0]:
+            self._enqueue_sync(cursor, global_id=row[0], op='upsert',
+                               source=source, base_version=int(row[1] or 1))
+            self.conn.commit()
     
     def search_by_year(self, year: int) -> List[Dict]:
         """Sucht Karteikarten nach Jahr."""
@@ -690,6 +729,8 @@ class KarteikartenDB:
                     braut_vater = row.get('braut_vater')
                     braut_nachname = row.get('braut_nachname')
                     braut_ort = row.get('braut_ort')
+                    mutter_vorname = row.get('mutter_vorname')
+                    datum_geburt = row.get('datum_geburt')
                     
                     # Kirchenbuchtext
                     kirchenbuchtext = row.get('kirchenbuchtext')
@@ -734,6 +775,8 @@ class KarteikartenDB:
                                 braut_vater = ?,
                                 braut_nachname = ?,
                                 braut_ort = ?,
+                                mutter_vorname = ?,
+                                datum_geburt = ?,
                                 kirchenbuchtext = ?,
                                 aktualisiert_am = CURRENT_TIMESTAMP
                             WHERE dateipfad = ?
@@ -742,6 +785,7 @@ class KarteikartenDB:
                               vorname, nachname, partner, stand, beruf, todestag, ort,
                               geb_jahr_gesch,
                               braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                              mutter_vorname, datum_geburt,
                               kirchenbuchtext,
                               dateipfad))
                         aktualisiert += 1
@@ -755,12 +799,14 @@ class KarteikartenDB:
                                     jahr, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz, gramps,
                                     vorname, nachname, partner, stand, beruf, todestag, ort, geb_jahr_gesch,
                                     braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                                    mutter_vorname, datum_geburt,
                                     kirchenbuchtext
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (int(original_id), dateiname, dateipfad, kirchengemeinde, ereignis_typ,
                                   jahr_int, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz, row.get('gramps'),
                                   vorname, nachname, partner, stand, beruf, todestag, ort, geb_jahr_gesch,
                                   braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                                  mutter_vorname, datum_geburt,
                                   kirchenbuchtext))
                         else:
                             # Automatische ID-Vergabe
@@ -770,12 +816,14 @@ class KarteikartenDB:
                                     jahr, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz, gramps,
                                     vorname, nachname, partner, stand, beruf, todestag, ort, geb_jahr_gesch,
                                     braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                                    mutter_vorname, datum_geburt,
                                     kirchenbuchtext
-                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, (dateiname, dateipfad, kirchengemeinde, ereignis_typ,
                                   jahr_int, datum, iso_datum, seite, nummer, erkannter_text, ocr_methode, notiz, row.get('gramps'),
                                   vorname, nachname, partner, stand, beruf, todestag, ort, geb_jahr_gesch,
                                   braeutigam_stand, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
+                                  mutter_vorname, datum_geburt,
                                   kirchenbuchtext))
                         erfolge += 1
                         

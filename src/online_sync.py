@@ -69,6 +69,7 @@ _SYNC_FIELDS = [
     "vorname", "nachname", "partner", "beruf", "todestag", "ort",
     "geb_jahr_gesch", "stand", "braeutigam_stand", "braeutigam_vater",
     "braut_vater", "braut_nachname", "braut_ort",
+    "mutter_vorname", "datum_geburt",
     "notiz", "fid", "gramps",
     "fid_reader", "fid_erkennung",
     "version", "updated_by", "aktualisiert_am",
@@ -159,6 +160,8 @@ class MySQLConnection:
                 braut_vater VARCHAR(256),
                 braut_nachname VARCHAR(256),
                 braut_ort VARCHAR(256),
+                mutter_vorname VARCHAR(256),
+                datum_geburt VARCHAR(64),
                 notiz VARCHAR(32),
                 fid VARCHAR(64),
                 gramps VARCHAR(32),
@@ -437,11 +440,25 @@ class OnlineSyncService:
                 db.mark_sync_item_sent(queue_id)
                 result.pushed += 1
 
+        # Lookup-Map queue_id → global_id für Konfliktauflösung
+        pending_by_queue_id = {item["id"]: item["global_id"] for item in pending}
+
         for err in response.get("errors", []):
             queue_id = err.get("id")
             if queue_id is None:
                 continue
-            db.mark_sync_item_error(int(queue_id), str(err.get("error") or "Unbekannter API-Fehler"))
+            error_msg = str(err.get("error") or "Unbekannter API-Fehler")
+            server_version = err.get("server_version")
+            if error_msg == "Versionkonflikt" and server_version is not None:
+                # base_version in der Queue auf server_version setzen und Retries zurücksetzen,
+                # damit der nächste Sync-Zyklus den Push erfolgreich durchführt.
+                global_id = pending_by_queue_id.get(int(queue_id))
+                if global_id:
+                    db.reset_sync_item_for_conflict(int(queue_id), global_id, int(server_version))
+                    result.conflicts += 1
+                    logger.info("Versionkonflikt für %s behoben: base_version → %d", global_id, server_version)
+                    continue
+            db.mark_sync_item_error(int(queue_id), error_msg)
             result.failed += 1
 
         for server_row in response.get("pull", []):
