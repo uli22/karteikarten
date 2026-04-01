@@ -529,7 +529,7 @@ STAND_PRAEFIXE = [
     "hinterlassene",
     "hinterlassen",
     "hinterl.",
-    "hinterl"
+    "hinterl",    
     # HINWEIS: "verlassen" wird bei Witwe/Witwer ignoriert (in IGNORIERE_WOERTER)
     # Bei Tochter/Sohn bleibt es als eigenständiges Präfix erhalten
 ]

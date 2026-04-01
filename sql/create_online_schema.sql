@@ -31,6 +31,8 @@ CREATE TABLE IF NOT EXISTS `karteikarten` (
     `braut_vater`       VARCHAR(256)   DEFAULT NULL,
     `braut_nachname`    VARCHAR(256)   DEFAULT NULL,
     `braut_ort`         VARCHAR(256)   DEFAULT NULL,
+    `mutter_vorname`    VARCHAR(256)   DEFAULT NULL,
+    `datum_geburt`      VARCHAR(64)    DEFAULT NULL,
     `notiz`             VARCHAR(32)    DEFAULT NULL,
     `fid`               VARCHAR(64)    DEFAULT NULL,
     `gramps`            VARCHAR(32)    DEFAULT NULL,

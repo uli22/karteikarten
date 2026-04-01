@@ -2229,6 +2229,8 @@ class KarteikartenGUI:
             braut_vater = self._get_ocr_field_value('braut vater') or fields.get('braut_vater')
             braut_nachname = self._get_ocr_field_value('braut nachname') or fields.get('braut_nachname')
             braut_ort = self._get_ocr_field_value('braut ort') or fields.get('braut_ort')
+            mutter_vorname = self._get_ocr_field_value('mutter vorname')
+            datum_geburt = self._get_ocr_field_value('datum geburt')
             kirchenbuchtext = self.kirchenbuch_text_display.get("1.0", tk.END).strip()
             kirchenbuchtext = kirchenbuchtext if kirchenbuchtext else None
             fid = self.fid_entry.get().strip()
@@ -2264,6 +2266,7 @@ class KarteikartenGUI:
                     UPDATE karteikarten SET
                         vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, ort = ?, seite = ?, nummer = ?,
                         braeutigam_stand = ?, braeutigam_vater = ?, braut_vater = ?, braut_nachname = ?, braut_ort = ?,
+                        mutter_vorname = ?, datum_geburt = ?,
                         kirchenbuchtext = ?,
                         notiz = ?,
                         gramps = ?,
@@ -2275,6 +2278,7 @@ class KarteikartenGUI:
                     beruf, braut_stand or stand, ort, seite, nummer,
                     braeutigam_stand, braeutigam_vater, braut_vater,
                     braut_nachname, braut_ort,
+                    mutter_vorname, datum_geburt,
                     kirchenbuchtext,
                     fid,
                     gramps,
@@ -2285,6 +2289,7 @@ class KarteikartenGUI:
                 cursor.execute("""
                     UPDATE karteikarten SET
                         vorname = ?, nachname = ?, partner = ?, beruf = ?, stand = ?, todestag = ?, ort = ?, seite = ?, nummer = ?, geb_jahr_gesch = ?,
+                        mutter_vorname = ?, datum_geburt = ?,
                         kirchenbuchtext = ?,
                         notiz = ?,
                         gramps = ?,
@@ -2295,6 +2300,7 @@ class KarteikartenGUI:
                     vorname, nachname, partner,
                     beruf, stand, todestag, ort, seite, nummer,
                     geb_jahr_gesch,
+                    mutter_vorname, datum_geburt,
                     kirchenbuchtext,
                     fid,
                     gramps,
@@ -2594,7 +2600,7 @@ class KarteikartenGUI:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikartenerkennung",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.3.0").pack(padx=30)
+        tk.Label(win, text="Version 0.4.0").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
@@ -2638,10 +2644,18 @@ class KarteikartenGUI:
         
         self.prev_btn = ttk.Button(nav_frame_1, text="◀ Vorherige", command=self._previous_card)
         self.prev_btn.pack(side=tk.LEFT, padx=5)
-        
+
+        # Sprung zu Karte Nr.
+        ttk.Label(nav_frame_1, text="Nr:").pack(side=tk.LEFT, padx=(10, 2))
+        self.jump_var = tk.StringVar()
+        jump_entry = ttk.Entry(nav_frame_1, textvariable=self.jump_var, width=6)
+        jump_entry.pack(side=tk.LEFT, padx=(0, 2))
+        jump_entry.bind("<Return>", lambda e: self._jump_to_card())
+        ttk.Button(nav_frame_1, text="→", width=3, command=self._jump_to_card).pack(side=tk.LEFT, padx=(0, 10))
+
         self.next_btn = ttk.Button(nav_frame_1, text="Nächste ▶", command=self._next_card)
         self.next_btn.pack(side=tk.LEFT, padx=5)
-        
+
         self.position_label = ttk.Label(nav_frame_1, text="Karte 0 von 0")
         self.position_label.pack(side=tk.LEFT, padx=20)
         
@@ -2910,7 +2924,8 @@ class KarteikartenGUI:
         # 2-Spalten-Layout für erkannte Felder
         # Labels für Feldnamen (links) und editierbare Werte (rechts)
         field_names = ["Vorname:", "Nachname:", "Partner:", "Stand:", "Braut Stand:", "Beruf:", "Ort:", 
-                      "Seite:", "Nummer:", "Todestag:", "Geb.Jahr (gesch.):", "Bräutigam Stand:", "Bräutigam Vater:", "Braut Vater:", "Braut Nachname:", "Braut Ort:"]
+                      "Seite:", "Nummer:", "Todestag:", "Geb.Jahr (gesch.):", "Bräutigam Stand:", "Bräutigam Vater:", "Braut Vater:", "Braut Nachname:", "Braut Ort:",
+                      "Mutter Vorname:", "Datum Geburt:"]
         self.ocr_field_labels = {}
         self.ocr_field_vars = {}
         
@@ -3000,11 +3015,21 @@ class KarteikartenGUI:
         filter_row2.pack(fill=tk.X, pady=(0, 5))
 
         # Namenssuche
-        ttk.Label(filter_row2, text="Name:").pack(side=tk.LEFT, padx=5)
+        ttk.Label(filter_row2, text="Text:").pack(side=tk.LEFT, padx=5)
         self.name_search = ttk.Entry(filter_row2, width=20)
         self.name_search.pack(side=tk.LEFT, padx=5)
         # Enter-Taste im Namens-Suchfeld löst Suche aus
         self.name_search.bind('<Return>', lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Nachname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.nachname_search = ttk.Entry(filter_row2, width=16)
+        self.nachname_search.pack(side=tk.LEFT, padx=5)
+        self.nachname_search.bind('<Return>', lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Braut Nachname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.braut_nachname_search = ttk.Entry(filter_row2, width=16)
+        self.braut_nachname_search.pack(side=tk.LEFT, padx=5)
+        self.braut_nachname_search.bind('<Return>', lambda e: self._refresh_db_list())
 
         # Checkbox für Regex-Suche
         self.regex_search_var = tk.BooleanVar(value=False)
@@ -3139,7 +3164,7 @@ class KarteikartenGUI:
             'ID', 'Jahr', 'Datum', 'ISO_datum', 'Typ', 'Seite', 'Nr', 'Gemeinde',
             'Vorname', 'Nachname', 'Partner', 'Beruf', 'Ort',
             'Bräutigam Vater', 'Braut Vater', 'Braut Nachname', 'Braut Ort',
-            'Bräutigam Stand', 'Braut Stand', 'Todestag', 'Geb.Jahr (gesch.)',
+            'Bräutigam Stand', 'Braut Stand', 'Mutter Vorname', 'Datum Geburt', 'Todestag', 'Geb.Jahr (gesch.)',
             'Dateiname', 'Notiz', 'Gramps', 'Text')
         self.tree = ttk.Treeview(
             tree_frame,
@@ -3172,6 +3197,8 @@ class KarteikartenGUI:
         self.tree.heading('Braut Ort', text='Braut Ort', command=lambda: self._sort_column('Braut Ort'))
         self.tree.heading('Bräutigam Stand', text='Bräutigam Stand', command=lambda: self._sort_column('Bräutigam Stand'))
         self.tree.heading('Braut Stand', text='Braut Stand', command=lambda: self._sort_column('Braut Stand'))
+        self.tree.heading('Mutter Vorname', text='Mutter Vorname', command=lambda: self._sort_column('Mutter Vorname'))
+        self.tree.heading('Datum Geburt', text='Datum Geburt', command=lambda: self._sort_column('Datum Geburt'))
         self.tree.heading('Todestag', text='Todestag', command=lambda: self._sort_column('Todestag'))
         self.tree.heading('Geb.Jahr (gesch.)', text='Geb.Jahr (gesch.)', command=lambda: self._sort_column('Geb.Jahr (gesch.)'))
         self.tree.heading('Dateiname', text='Dateiname', command=lambda: self._sort_column('Dateiname'))
@@ -3198,6 +3225,8 @@ class KarteikartenGUI:
         self.tree.column('Braut Ort', width=80, anchor='w')
         self.tree.column('Bräutigam Stand', width=60, anchor='w')
         self.tree.column('Braut Stand', width=60, anchor='w')
+        self.tree.column('Mutter Vorname', width=100, anchor='w')
+        self.tree.column('Datum Geburt', width=80, anchor='w')
         self.tree.column('Todestag', width=80, anchor='w')
         self.tree.column('Geb.Jahr (gesch.)', width=60, anchor='center')
         self.tree.column('Dateiname', width=80, anchor='w')
@@ -4421,7 +4450,7 @@ class KarteikartenGUI:
 
         viewer = tk.Toplevel(self.root)
         viewer.title(f"Bildanzeige: {Path(pfad).name}")
-        viewer.geometry("1200x900")
+        viewer.geometry("1200x800")
 
         img = PIL.Image.open(pfad)
         zoom = 1.0
@@ -4823,12 +4852,14 @@ class KarteikartenGUI:
             filename_filter = self.filename_filter.get()
             kirchenbuch_filter = self.kirchenbuch_filter.get()
             name_search = self.name_search.get().strip()
+            nachname_search = self.nachname_search.get().strip()
+            braut_nachname_search = self.braut_nachname_search.get().strip()
 
             query = (
                 "SELECT id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, "
                 "vorname, nachname, partner, beruf, ort, "
                 "braeutigam_vater, braut_vater, braut_nachname, braut_ort, "
-                "braeutigam_stand, stand, todestag, geb_jahr_gesch, "
+                "braeutigam_stand, stand, mutter_vorname, datum_geburt, todestag, geb_jahr_gesch, "
                 "dateiname, notiz, erkannter_text, kirchenbuchtext, gramps "
                 "FROM karteikarten WHERE 1=1"
             )
@@ -4859,6 +4890,14 @@ class KarteikartenGUI:
                 query += " AND LOWER(dateiname) LIKE ?"
                 params.append(f'%{filename_filter.lower()}%')
 
+            if nachname_search:
+                query += " AND nachname LIKE ?"
+                params.append(f'%{nachname_search}%')
+
+            if braut_nachname_search:
+                query += " AND braut_nachname LIKE ?"
+                params.append(f'%{braut_nachname_search}%')
+
 
             regex_mode = getattr(self, 'regex_search_var', None)
             if name_search:
@@ -4885,19 +4924,19 @@ class KarteikartenGUI:
                     self.db_status_label.config(text="0 Datensätze gefunden (Regex-Fehler)")
                     return
                 # Filtere rows, bei denen erkannter_text auf das Pattern matcht
-                rows = [row for row in rows if pattern.search(str(row[23]))]  # Index 23 = erkannter_text
+                rows = [row for row in rows if pattern.search(str(row[25]))]  # Index 25 = erkannter_text
 
             if kirchenbuch_filter and kirchenbuch_filter != 'Alle':
                 rows = [
                     row for row in rows
-                    if self._extract_kirchenbuch_titel(row[21]) == kirchenbuch_filter
+                    if self._extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
                 ]
 
             for row in rows:
                 # row: id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, 
                 # vorname, nachname, partner, beruf, ort,
                 # braeutigam_vater, braut_vater, braut_nachname, braut_ort,
-                # braeutigam_stand, stand, todestag, geb_jahr_gesch,
+                # braeutigam_stand, stand, mutter_vorname, datum_geburt, todestag, geb_jahr_gesch,
                 # dateiname, notiz, erkannter_text, kirchenbuchtext, gramps
                 def safe(idx):
                     try:
@@ -4925,20 +4964,22 @@ class KarteikartenGUI:
                     safe(16), # Braut Ort
                     safe(17), # Bräutigam Stand
                     safe(18), # Braut Stand (ehemals 'stand')
-                    safe(19), # Todestag
-                    safe(20), # Geb.Jahr (gesch.)
-                    safe(21), # Dateiname
-                    safe(22), # Notiz
-                    safe(25), # Gramps
-                    safe(23), # Erkannter Text
+                    safe(19), # Mutter Vorname
+                    safe(20), # Datum Geburt
+                    safe(21), # Todestag
+                    safe(22), # Geb.Jahr (gesch.)
+                    safe(23), # Dateiname
+                    safe(24), # Notiz
+                    safe(27), # Gramps
+                    safe(25), # Erkannter Text
                 )
 
                 # NEU: Prüfe ob Datum gültig ist
                 jahr = safe(1)
                 datum = safe(2)
-                notiz = safe(22)
-                kirchenbuchtext = safe(24)  # Index 24 = kirchenbuchtext
-                gramps = safe(25)  # Index 25 = gramps
+                notiz = safe(24)
+                kirchenbuchtext = safe(26)  # Index 26 = kirchenbuchtext
+                gramps = safe(27)  # Index 27 = gramps
                 is_valid_date = self._is_valid_date(datum, jahr)
 
                 # Tags setzen
@@ -5023,8 +5064,8 @@ class KarteikartenGUI:
             if jahr_aus_datum < 1500 or jahr_aus_datum > 1754:
                 return False
             
-            # Monat muss zwischen 1 und 12 liegen
-            if monat < 1 or monat > 12:
+            # Monat muss zwischen 0 und 12 liegen (0 = unbekannter Monat)
+            if monat < 0 or monat > 12:
                 return False
             
             # Tag kann 00 sein (unbekannter Tag) oder zwischen 1 und 31
@@ -5212,6 +5253,8 @@ class KarteikartenGUI:
         self.filename_filter.current(0)
         self.kirchenbuch_filter.current(0)
         self.name_search.delete(0, tk.END)
+        self.nachname_search.delete(0, tk.END)
+        self.braut_nachname_search.delete(0, tk.END)
         self._refresh_db_list()
     
     def _sort_column(self, col):
@@ -5362,7 +5405,7 @@ class KarteikartenGUI:
             """
             SELECT vorname, nachname, partner, stand, braeutigam_stand, beruf, ort, seite, nummer, todestag,
                    geb_jahr_gesch, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
-                   ereignis_typ
+                   ereignis_typ, mutter_vorname, datum_geburt
             FROM karteikarten WHERE id = ?
             """,
             (record_id,)
@@ -5373,7 +5416,7 @@ class KarteikartenGUI:
 
         (vorname, nachname, partner, stand, braeutigam_stand, beruf, ort, seite, nummer, todestag,
          geb_jahr_gesch, braeutigam_vater, braut_vater, braut_nachname, braut_ort,
-         ereignis_typ) = row
+         ereignis_typ, mutter_vorname, datum_geburt) = row
 
         is_marriage = bool(ereignis_typ and str(ereignis_typ).lower().startswith('heirat'))
 
@@ -5391,6 +5434,8 @@ class KarteikartenGUI:
         self._set_ocr_field_value('braut vater', braut_vater)
         self._set_ocr_field_value('braut nachname', braut_nachname)
         self._set_ocr_field_value('braut ort', braut_ort)
+        self._set_ocr_field_value('mutter vorname', mutter_vorname)
+        self._set_ocr_field_value('datum geburt', datum_geburt)
 
         if is_marriage:
             self._set_ocr_field_value('braut stand', stand)
@@ -6165,18 +6210,17 @@ class KarteikartenGUI:
                 return None
 
         def normalize_date(value, wb_epoch):
+            # Datum-Felder (Datum Taufe, Datum Geburt) in dieser XLSX sind immer
+            # als Strings gespeichert, da Excel keine Daten vor ~1900 als echtes
+            # Datumsformat speichern kann. Deshalb wird from_excel() nicht verwendet;
+            # alle Werte werden direkt als Text behandelt.
             if value is None or str(value).strip() == "":
                 return None
             if hasattr(value, "strftime"):
                 return value.strftime("%d.%m.%Y")
-            if isinstance(value, (int, float)):
-                try:
-                    dt = from_excel(value, wb_epoch)
-                    if hasattr(dt, "strftime"):
-                        return dt.strftime("%d.%m.%Y")
-                except Exception:
-                    return None
             text = str(value).strip()
+            # XX (unbekannter Tag/Monat) → 00
+            text = re.sub(r'\bXX\b', '00', text, flags=re.IGNORECASE)
             match = re.match(r"^(\d{1,2})[\./-](\d{1,2})[\./-](\d{4})$", text)
             if match:
                 day, month, year = match.groups()
@@ -6190,11 +6234,35 @@ class KarteikartenGUI:
         def iso_from_datum(datum):
             if not datum:
                 return None
+            # XX (unbekannter Tag/Monat) → 00
+            datum = re.sub(r'\bXX\b', '00', datum, flags=re.IGNORECASE)
+            # DD.MM.YYYY (auch mit 00 für unbekannte Teile, z.B. 00.10.1630)
             match = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", datum)
-            if not match:
+            if match:
+                day, month, year = match.groups()
+                return f"{year}-{month}-{day}"
+            # YYYY.MM.DD (alternatives Format aus todestag-Feld)
+            match = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})$", datum)
+            if match:
+                year, month, day = match.groups()
+                return f"{year}-{month}-{day}"
+            # Reine Jahreszahl → YYYY-00-00
+            match = re.match(r"^(\d{4})$", datum)
+            if match:
+                return f"{match.group(1)}-00-00"
+            return None
+
+        def to_ymd_dot(date_str):
+            """Wandelt DD.MM.YYYY in YYYY.MM.DD um (Format für todestag/datum_geburt).
+            Unvollständige Daten (00.MM.YYYY, DD.00.YYYY) bleiben korrekt erhalten.
+            Reine Jahreszahlen (z.B. '1613') werden unverändert zurückgegeben."""
+            if not date_str:
                 return None
-            day, month, year = match.groups()
-            return f"{year}-{month}-{day}"
+            match = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", date_str)
+            if match:
+                day, month, year = match.groups()
+                return f"{year}.{month}.{day}"
+            return date_str  # Fallback: Jahreszahl o.ä. unverändert
 
         def stand_from_gender(value):
             if value is None:
@@ -6308,6 +6376,8 @@ class KarteikartenGUI:
                     jahr = normalize_year(row[headers["Jahr"]])
                     datum_taufe = normalize_date(row[headers["Datum Taufe"]], wb.epoch)
                     datum_geburt = normalize_date(row[headers["Datum Geburt"]], wb.epoch)
+                    # todestag: nur Datum Taufe (kein Fallback auf Datum Geburt)
+                    # datum/iso_datum: Datum Taufe, sonst Datum Geburt als Fallback
                     datum = datum_taufe or datum_geburt
                     iso_datum = iso_from_datum(datum)
                     seite = normalize_number(row[headers["Seite"]])
@@ -6318,6 +6388,7 @@ class KarteikartenGUI:
                     partner = normalize_text(row[headers["Vorname Vater"]])
                     stand = stand_from_gender(row[headers["Geschlecht Täufling"]])
                     kirchenbuchtext = normalize_text(row[headers["Kirchenbucheintrag"]])
+                    mutter_vorname = normalize_text(row[headers["Vorname Mutter"]]) if "Vorname Mutter" in headers else None
 
                     for record_id in matched_ids:
                         cursor.execute(
@@ -6342,6 +6413,8 @@ class KarteikartenGUI:
                                 stand = ?,
                                 kirchenbuchtext = ?,
                                 geb_jahr_gesch = ?,
+                                mutter_vorname = ?,
+                                datum_geburt = ?,
                                 version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung'
                             WHERE id = ?
                             """,
@@ -6359,11 +6432,13 @@ class KarteikartenGUI:
                                 vorname,
                                 nachname,
                                 partner,
-                                datum,
+                                to_ymd_dot(datum_taufe),  # todestag: YYYY.MM.DD, nur Datum Taufe
                                 "Wetzlar",
                                 stand,
                                 kirchenbuchtext,
                                 jahr,
+                                mutter_vorname,
+                                to_ymd_dot(datum_taufe or datum_geburt),  # datum_geburt: YYYY.MM.DD, Taufe bevorzugt
                                 record_id
                             )
                         )
@@ -6371,14 +6446,29 @@ class KarteikartenGUI:
                 except Exception:
                     errors += 1
 
+            # --- Nachbearbeitungsphase: Commit, Sync-Markierung, Listenaktualisierung ---
+            self.db_progress.config(mode='indeterminate')
+            self.db_progress.start(15)
+            self.db_status_label.config(text="⏳ Speichere Änderungen …")
+            self.root.update_idletasks()
+
             self.db.conn.commit()
-            for record_id in [rid for ids in key_to_ids.values() for rid in ids]:
+
+            self.db_status_label.config(text="⏳ Synchronisations-Queue wird aktualisiert …")
+            self.root.update_idletasks()
+            all_record_ids = [rid for ids in key_to_ids.values() for rid in ids]
+            for record_id in all_record_ids:
                 try:
                     self.db.mark_record_for_sync(record_id)
                 except Exception:
                     pass
+
+            self.db_status_label.config(text="⏳ Datenbank-Ansicht wird aktualisiert …")
+            self.root.update_idletasks()
             self._refresh_db_list()
 
+            self.db_progress.stop()
+            self.db_progress.config(mode='determinate')
             self.db_progress['value'] = 0
             messagebox.showinfo(
                 "XLSX-Import abgeschlossen",
@@ -6389,6 +6479,8 @@ class KarteikartenGUI:
             )
 
         except Exception as e:
+            self.db_progress.stop()
+            self.db_progress.config(mode='determinate')
             self.db_progress['value'] = 0
             messagebox.showerror("Fehler", f"Fehler beim XLSX-Import:\n{str(e)}")
     
@@ -6421,11 +6513,21 @@ class KarteikartenGUI:
         
         try:
             image = Image.open(current_file)
-            
-            display_width = 800
-            aspect_ratio = image.height / image.width
-            display_height = int(display_width * aspect_ratio)
-            
+
+            # Bild so skalieren, dass es in den verfügbaren Platz passt
+            self.image_label.update_idletasks()
+            max_w = max(self.image_label.winfo_width(), 400)
+            max_h = max(self.image_label.winfo_height(), 300)
+
+            # Skalierung auf Breite
+            scale_w = max_w / image.width
+            # Skalierung auf Höhe
+            scale_h = max_h / image.height
+            # Kleinerer Faktor bestimmt die Skalierung (Bild muss in beide Dimensionen passen)
+            scale = min(scale_w, scale_h, 1.0)  # niemals vergrößern
+            display_width = max(1, int(image.width * scale))
+            display_height = max(1, int(image.height * scale))
+
             image_resized = image.resize((display_width, display_height), Image.Resampling.LANCZOS)
             self.photo_image = ImageTk.PhotoImage(image_resized)
             
@@ -6477,14 +6579,37 @@ class KarteikartenGUI:
             self.current_index += 1
             self.current_db_record_id = None
             self._display_current_card()
-    
+
     def _previous_card(self):
         """Zeigt die vorherige Karteikarte."""
         if self.current_index > 0:
             self.current_index -= 1
             self.current_db_record_id = None
             self._display_current_card()
-    
+
+    def _jump_to_card(self):
+        """Springt zu einer bestimmten Kartennummer (1-basiert)."""
+        if not self.image_files:
+            return
+        raw = self.jump_var.get().strip()
+        if not raw:
+            return
+        try:
+            nr = int(raw)
+        except ValueError:
+            messagebox.showwarning("Ungültige Eingabe", "Bitte eine gültige Kartennummer eingeben.")
+            return
+        idx = nr - 1  # 1-basiert → 0-basiert
+        if idx < 0 or idx >= len(self.image_files):
+            messagebox.showwarning(
+                "Außerhalb des Bereichs",
+                f"Bitte eine Zahl zwischen 1 und {len(self.image_files)} eingeben."
+            )
+            return
+        self.current_index = idx
+        self.current_db_record_id = None
+        self._display_current_card()
+
     def _run_ocr(self):
         """Führt OCR auf der aktuellen Karte aus."""
         if not self.current_image:

@@ -136,7 +136,7 @@ class KarteikartenReader:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikarten – Leser",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.3.0").pack(padx=30)
+        tk.Label(win, text="Version 0.4.0").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
@@ -191,10 +191,20 @@ class KarteikartenReader:
         filter_row2 = ttk.Frame(filter_frame)
         filter_row2.pack(fill=tk.X, pady=(0, 5))
 
-        ttk.Label(filter_row2, text="Name/Text:").pack(side=tk.LEFT, padx=5)
+        ttk.Label(filter_row2, text="Text:").pack(side=tk.LEFT, padx=5)
         self.name_search = ttk.Entry(filter_row2, width=30)
         self.name_search.pack(side=tk.LEFT, padx=5)
         self.name_search.bind("<Return>", lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Nachname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.nachname_search = ttk.Entry(filter_row2, width=16)
+        self.nachname_search.pack(side=tk.LEFT, padx=5)
+        self.nachname_search.bind("<Return>", lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Braut Nachname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.braut_nachname_search = ttk.Entry(filter_row2, width=16)
+        self.braut_nachname_search.pack(side=tk.LEFT, padx=5)
+        self.braut_nachname_search.bind("<Return>", lambda e: self._refresh_db_list())
 
         self.regex_search_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(filter_row2, text="Regex", variable=self.regex_search_var).pack(side=tk.LEFT, padx=5)
@@ -230,7 +240,7 @@ class KarteikartenReader:
             "ID", "Jahr", "Datum", "ISO_datum", "Typ", "Seite", "Nr", "Gemeinde",
             "Vorname", "Nachname", "Partner", "Beruf", "Ort",
             "Bräutigam Vater", "Braut Vater", "Braut Nachname", "Braut Ort",
-            "Bräutigam Stand", "Braut Stand", "Todestag", "Geb.Jahr (gesch.)",
+            "Bräutigam Stand", "Braut Stand", "Mutter Vorname", "Datum Geburt", "Todestag", "Geb.Jahr (gesch.)",
             "Dateiname", "Notiz", "Gramps", "Text",
         )
         self.tree = ttk.Treeview(
@@ -256,6 +266,7 @@ class KarteikartenReader:
             "Vorname": 80, "Nachname": 80, "Partner": 100, "Beruf": 80, "Ort": 80,
             "Bräutigam Vater": 100, "Braut Vater": 100, "Braut Nachname": 100, "Braut Ort": 80,
             "Bräutigam Stand": 70, "Braut Stand": 70,
+            "Mutter Vorname": 100, "Datum Geburt": 80,
             "Todestag": 80, "Geb.Jahr (gesch.)": 60,
             "Dateiname": 80, "Notiz": 50, "Gramps": 50, "Text": 400,
         }
@@ -568,12 +579,14 @@ class KarteikartenReader:
             filename_filter = self.filename_filter.get()
             kirchenbuch_filter = self.kirchenbuch_filter.get()
             name_search = self.name_search.get().strip()
+            nachname_search = self.nachname_search.get().strip()
+            braut_nachname_search = self.braut_nachname_search.get().strip()
 
             query = (
                 "SELECT id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, "
                 "vorname, nachname, partner, beruf, ort, "
                 "braeutigam_vater, braut_vater, braut_nachname, braut_ort, "
-                "braeutigam_stand, stand, todestag, geb_jahr_gesch, "
+                "braeutigam_stand, stand, mutter_vorname, datum_geburt, todestag, geb_jahr_gesch, "
                 "dateiname, notiz, erkannter_text, kirchenbuchtext, gramps "
                 "FROM karteikarten WHERE 1=1"
             )
@@ -602,6 +615,14 @@ class KarteikartenReader:
                 query += " AND LOWER(dateiname) LIKE ?"
                 params.append(f"%{filename_filter.lower()}%")
 
+            if nachname_search:
+                query += " AND nachname LIKE ?"
+                params.append(f"%{nachname_search}%")
+
+            if braut_nachname_search:
+                query += " AND braut_nachname LIKE ?"
+                params.append(f"%{braut_nachname_search}%")
+
             regex_mode = getattr(self, "regex_search_var", None)
             if name_search:
                 if regex_mode and regex_mode.get():
@@ -624,12 +645,12 @@ class KarteikartenReader:
                     messagebox.showerror("Regex-Fehler", f"Ungültiger regulärer Ausdruck:\n{e}")
                     self.db_status_label.config(text="0 Datensätze gefunden (Regex-Fehler)")
                     return
-                rows = [row for row in rows if pattern.search(str(row[23]))]
+                rows = [row for row in rows if pattern.search(str(row[25]))]
 
             if kirchenbuch_filter and kirchenbuch_filter != "Alle":
                 rows = [
                     row for row in rows
-                    if self._extract_kirchenbuch_titel(row[21]) == kirchenbuch_filter
+                    if self._extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
                 ]
 
             for row in rows:
@@ -644,12 +665,13 @@ class KarteikartenReader:
                     safe(5), safe(6), safe(7), safe(8), safe(9),
                     safe(10), safe(11), safe(12), safe(13), safe(14),
                     safe(15), safe(16), safe(17), safe(18), safe(19),
-                    safe(20), safe(21), safe(22), safe(25), safe(23),
+                    safe(20), safe(21), safe(22), safe(23), safe(24),
+                    safe(27), safe(25),
                 )
 
-                notiz = safe(22)
-                kirchenbuchtext = safe(24)
-                gramps = safe(25)
+                notiz = safe(24)
+                kirchenbuchtext = safe(26)
+                gramps = safe(27)
                 jahr = safe(1)
                 datum = safe(2)
                 is_valid_date = self._is_valid_date(datum, jahr)
@@ -737,6 +759,8 @@ class KarteikartenReader:
         self.filename_filter.current(0)
         self.kirchenbuch_filter.current(0)
         self.name_search.delete(0, tk.END)
+        self.nachname_search.delete(0, tk.END)
+        self.braut_nachname_search.delete(0, tk.END)
         self._refresh_db_list()
 
     # ------------------------------------------------------------------
