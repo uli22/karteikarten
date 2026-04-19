@@ -1,4 +1,4 @@
-"""Grafische Benutzeroberfläche für die Karteikartenerkennung."""
+﻿"""Grafische Benutzeroberfläche für die Karteikartenerkennung."""
 
 import csv
 import json
@@ -15,8 +15,9 @@ from PIL import Image, ImageTk
 from .config import get_config
 from .database import KarteikartenDB
 from .extraction_lists import SOURCES
-from .extractor import (extract_burial_fields, extract_kirchenbuch_titel,
-                        extract_marriage_fields, is_valid_date)
+from .extractor import (extract_baptism_fields, extract_burial_fields,
+                        extract_kirchenbuch_titel, extract_marriage_fields,
+                        is_valid_date)
 from .gedcom_exporter import GedcomExporter
 from .ocr_engine import OCREngine
 from .online_sync import OnlineSyncService
@@ -26,6 +27,7 @@ from .text_postprocessor import (fix_header_prefix, fix_infinity_year,
                                  insert_marriage_symbol,
                                  replace_ev_kb_wetzlar_special,
                                  standardize_p_nr)
+from .xlsx_importer import run_xlsx_import
 
 
 class KarteikartenGUI:
@@ -219,8 +221,35 @@ class KarteikartenGUI:
                 except Exception as e:
                     errors.append(f"ID {record_id}: Fehler beim Speichern: {e}")
             else:
+                # --- Taufe-Erkennung ---
+                is_taufe = (
+                    (typ and typ.lower() in ('taufe', 'geburt'))
+                    or re.search(r'ev\.?\s*Kb\.?\s*\w+\s*\*\s*\d{4}', text) is not None
+                )
+                if is_taufe:
+                    fields = extract_baptism_fields(text)
+                    try:
+                        cursor.execute("""
+                            UPDATE karteikarten SET
+                                vorname = ?, nachname = ?, partner = ?,
+                                mutter_vorname = ?, datum_geburt = ?, todestag = ?,
+                                seite = ?, nummer = ?,
+                                version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung',
+                                aktualisiert_am = CURRENT_TIMESTAMP
+                            WHERE id = ?
+                        """, (
+                            fields['vorname'], fields['nachname'], fields['partner'],
+                            fields['mutter_vorname'], fields['datum_geburt'], fields['todestag'],
+                            fields.get('seite'), fields.get('nummer'),
+                            record_id
+                        ))
+                        self.db.conn.commit()
+                        self.db.mark_record_for_sync(record_id)
+                        updated += 1
+                    except Exception as e:
+                        errors.append(f"ID {record_id}: Fehler beim Speichern: {e}")
                 # --- Heirats-Erkennung ---
-                if typ and (typ.lower().startswith('heirat') or '∞' in text):
+                elif typ and (typ.lower().startswith('heirat') or '∞' in text):
                     # Nutze spezialisierte Heirats-Extraktion
                     fields = extract_marriage_fields(text)
                     
@@ -292,20 +321,46 @@ class KarteikartenGUI:
         
         # Setze alle Felder zurück
         self._clear_ocr_field_labels()
-        
+
+        # --- Taufe-Erkennung: ev. Kb. Wetzlar * YYYY ---
+        is_taufe = bool(re.search(r'ev\.?\s*Kb\.?\s*\w+\s*\*\s*\d{4}', text))
+
         # Erkenne den Typ (Begräbnis ⚰ oder Heirat ∞)
         is_heirat = '∞' in text
         is_begraebnis = '⚰' in text or '\u26B0' in text
-        
+
         # Falls beide Symbole oder keines vorhanden, versuche anhand Keywords zu erkennen
-        if (is_heirat and is_begraebnis) or (not is_heirat and not is_begraebnis):
+        if not is_taufe and ((is_heirat and is_begraebnis) or (not is_heirat and not is_begraebnis)):
             if 'begraben' in text.lower() or 'begr' in text.lower():
                 is_begraebnis = True
                 is_heirat = False
             elif 'heirat' in text.lower() or 'getraut' in text.lower() or 'und' in text.lower():
                 is_heirat = True
                 is_begraebnis = False
-        
+
+        # --- TAUFE-ERKENNUNG ---
+        if is_taufe:
+            fields = extract_baptism_fields(text)
+
+            self._set_ocr_field_value('vorname', fields.get('vorname'))
+            self._set_ocr_field_value('nachname', fields.get('nachname'))
+            self._set_ocr_field_value('partner', fields.get('partner'))
+            if 'mutter vorname' in self.ocr_field_labels:
+                self._set_ocr_field_value('mutter vorname', fields.get('mutter_vorname'))
+            if 'datum geburt' in self.ocr_field_labels:
+                self._set_ocr_field_value('datum geburt', fields.get('datum_geburt'))
+            if 'todestag' in self.ocr_field_labels:
+                self._set_ocr_field_value('todestag', fields.get('todestag'))
+            if 'seite' in self.ocr_field_labels and fields.get('seite'):
+                self._set_ocr_field_value('seite', str(fields.get('seite')))
+            if 'nummer' in self.ocr_field_labels and fields.get('nummer'):
+                self._set_ocr_field_value('nummer', str(fields.get('nummer')))
+
+            self._last_recognized_fields = fields
+            self.db_record_status.config(text="", foreground="blue")
+            messagebox.showinfo("Erkennung", "Taufe-Felder erkannt.")
+            return
+
         # --- HEIRAT-ERKENNUNG ---
         if is_heirat:
             result = extract_marriage_fields(text)
@@ -406,6 +461,14 @@ class KarteikartenGUI:
             text="✓ Felder erkannt. Nutzen Sie 'DB aktualisieren', um die Änderungen zu speichern.",
             foreground="blue"
         )
+
+    def _fill_kb_text_from_ocr(self):
+        """Kopiert den erkannten Text nach der Nr.-Zahl in das Kirchenbuchtext-Feld."""
+        full_text = self.text_display.get("1.0", tk.END).strip()
+        match = re.search(r'Nr\.\s*\d+\s*', full_text)
+        remainder = full_text[match.end():].strip() if match else full_text
+        self.kirchenbuch_text_display.delete("1.0", tk.END)
+        self.kirchenbuch_text_display.insert("1.0", remainder)
 
     def _update_db_fields(self):
         """Aktualisiert die erkannten Felder in der Datenbank."""
@@ -812,7 +875,7 @@ class KarteikartenGUI:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikartenerkennung",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.4.0").pack(padx=30)
+        tk.Label(win, text="Version 0.4.1").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
@@ -845,8 +908,12 @@ class KarteikartenGUI:
         left_frame = ttk.Frame(main_frame)
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         
-        # Label für Bildanzeige
-        self.image_label = ttk.Label(left_frame, text="Karteikarte wird geladen...", 
+        # Label für Bildanzeige – Höhe fest begrenzen, damit Buttons nicht herausgedrückt werden
+        image_frame = ttk.Frame(left_frame, height=420)
+        image_frame.pack(fill=tk.X, expand=False)
+        image_frame.pack_propagate(False)
+
+        self.image_label = ttk.Label(image_frame, text="Karteikarte wird geladen...",
                                      relief=tk.SUNKEN, anchor=tk.CENTER)
         self.image_label.pack(fill=tk.BOTH, expand=True)
         
@@ -887,32 +954,35 @@ class KarteikartenGUI:
                                            variable=self.postprocess_var)
         postprocess_check.pack(side=tk.LEFT, padx=5)
         
-        # Batch-Scan Frame (rechts)
+        self.ocr_btn = ttk.Button(nav_frame_2, text="🔍 Text erkennen", command=self._run_ocr)
+        self.ocr_btn.pack(side=tk.LEFT, padx=5)
+
+        self.register_btn = ttk.Button(nav_frame_2, text="📋 Registrieren (ohne OCR)", command=self._batch_register_files)
+        self.register_btn.pack(side=tk.LEFT, padx=2)
+
+        # Batch-Scan Frame
         batch_frame = ttk.Frame(nav_frame_2)
-        batch_frame.pack(side=tk.RIGHT, padx=5)
-        
+        batch_frame.pack(side=tk.LEFT, padx=5)
+
         # Bildtyp-Filter für Batch-Scan
         ttk.Label(batch_frame, text="Typ:").pack(side=tk.LEFT, padx=2)
         self.batch_type_var = tk.StringVar(value="Alle")
         batch_type_combo = ttk.Combobox(
-            batch_frame, 
-            textvariable=self.batch_type_var, 
+            batch_frame,
+            textvariable=self.batch_type_var,
             width=8,
             values=["Alle", "Hb", "Gb", "Sb"],
             state="readonly"
         )
         batch_type_combo.pack(side=tk.LEFT, padx=2)
-        
+
         ttk.Label(batch_frame, text="Anzahl:").pack(side=tk.LEFT, padx=(10, 2))
         self.batch_count_var = tk.StringVar(value="10")
         batch_count_entry = ttk.Entry(batch_frame, textvariable=self.batch_count_var, width=5)
         batch_count_entry.pack(side=tk.LEFT, padx=2)
-        
+
         self.batch_btn = ttk.Button(batch_frame, text="⚡ Batch-Scan", command=self._batch_scan)
         self.batch_btn.pack(side=tk.LEFT, padx=2)
-        
-        self.ocr_btn = ttk.Button(nav_frame_2, text="🔍 Text erkennen", command=self._run_ocr)
-        self.ocr_btn.pack(side=tk.RIGHT, padx=5)
         
         # OCR-Methode Auswahl - ZEILE 3
         ocr_frame = ttk.Frame(left_frame)
@@ -1076,6 +1146,10 @@ class KarteikartenGUI:
         recognize_btn = ttk.Button(action_buttons_frame, text="🧠 Felder erkennen", command=self._run_recognition_ocr_tab)
         recognize_btn.pack(side=tk.LEFT, padx=5)
         
+        # Button zum Belegen des Kirchenbuchtext-Felds aus dem erkannten Text
+        fill_kb_btn = ttk.Button(action_buttons_frame, text="Kb Text belegen", command=self._fill_kb_text_from_ocr)
+        fill_kb_btn.pack(side=tk.LEFT, padx=5)
+
         # DB-Update-Button (für erkannte Felder)
         update_db_btn = ttk.Button(action_buttons_frame, text="📤 DB aktualisieren", command=self._update_db_fields)
         update_db_btn.pack(side=tk.LEFT, padx=5)
@@ -1233,10 +1307,20 @@ class KarteikartenGUI:
         # Enter-Taste im Namens-Suchfeld löst Suche aus
         self.name_search.bind('<Return>', lambda e: self._refresh_db_list())
 
+        ttk.Label(filter_row2, text="Partner Vorname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.partner_vorname_search = ttk.Entry(filter_row2, width=16)
+        self.partner_vorname_search.pack(side=tk.LEFT, padx=5)
+        self.partner_vorname_search.bind('<Return>', lambda e: self._refresh_db_list())
+
         ttk.Label(filter_row2, text="Nachname:").pack(side=tk.LEFT, padx=(10, 5))
         self.nachname_search = ttk.Entry(filter_row2, width=16)
         self.nachname_search.pack(side=tk.LEFT, padx=5)
         self.nachname_search.bind('<Return>', lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Braut Vorname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.braut_vorname_search = ttk.Entry(filter_row2, width=16)
+        self.braut_vorname_search.pack(side=tk.LEFT, padx=5)
+        self.braut_vorname_search.bind('<Return>', lambda e: self._refresh_db_list())
 
         ttk.Label(filter_row2, text="Braut Nachname:").pack(side=tk.LEFT, padx=(10, 5))
         self.braut_nachname_search = ttk.Entry(filter_row2, width=16)
@@ -1481,7 +1565,8 @@ class KarteikartenGUI:
         self.tree_menu.add_command(label="Text anzeigen", command=self._show_selected_text)
         self.tree_menu.add_command(label="F-ID bearbeiten", command=self._edit_fid)
         self.tree_menu.add_command(label="Auswahl kopieren", command=self._copy_selected_rows_to_clipboard)
-        self.tree_menu.add_command(label="GEDCOM exportieren (Auswahl)", command=self._export_gedcom_selected_from_context)
+        self.tree_menu.add_command(label="GEDCOM (GRAMPS) exportieren (Auswahl)", command=self._export_gedcom_selected_from_context)
+        self.tree_menu.add_command(label="GEDCOM (TNG) exportieren (Auswahl)", command=self._export_gedcom_tng_selected_from_context)
         self.tree_menu.add_separator()
         self.tree_menu.add_command(label="Datensatz(e) löschen", command=self._delete_selected)
         self.tree.bind('<Button-3>', self._show_tree_menu)
@@ -1505,7 +1590,8 @@ class KarteikartenGUI:
         ttk.Button(button_row1, text="📤 Export CSV", command=self._export_csv).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row1, text="🔒 Full Backup", command=self._export_full_csv).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row1, text="↩️ Restore", command=self._import_full_backup).pack(side=tk.LEFT, padx=3)
-        ttk.Button(button_row1, text="� Export GEDCOM", command=self._export_gedcom).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="🌳 GEDCOM (GRAMPS)", command=self._export_gedcom).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row1, text="🌐 GEDCOM (TNG)", command=self._export_gedcom_tng).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row1, text="�📥 Import CSV", command=self._import_csv).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row1, text="📥 Import XLSX", command=self._import_xlsx).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row1, text="🔄 Abgleich families_ok", command=self._abgleich_families_ok).pack(side=tk.LEFT, padx=3)
@@ -2863,7 +2949,9 @@ class KarteikartenGUI:
             filename_filter = self.filename_filter.get()
             kirchenbuch_filter = self.kirchenbuch_filter.get()
             name_search = self.name_search.get().strip()
+            partner_vorname_search = self.partner_vorname_search.get().strip()
             nachname_search = self.nachname_search.get().strip()
+            braut_vorname_search = self.braut_vorname_search.get().strip()
             braut_nachname_search = self.braut_nachname_search.get().strip()
 
             query = (
@@ -2901,9 +2989,17 @@ class KarteikartenGUI:
                 query += " AND LOWER(dateiname) LIKE ?"
                 params.append(f'%{filename_filter.lower()}%')
 
+            if partner_vorname_search:
+                query += " AND vorname LIKE ?"
+                params.append(f'%{partner_vorname_search}%')
+
             if nachname_search:
                 query += " AND nachname LIKE ?"
                 params.append(f'%{nachname_search}%')
+
+            if braut_vorname_search:
+                query += " AND partner LIKE ?"
+                params.append(f'%{braut_vorname_search}%')
 
             if braut_nachname_search:
                 query += " AND braut_nachname LIKE ?"
@@ -4006,7 +4102,7 @@ class KarteikartenGUI:
             messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export:\n{str(e)}")
 
     def _export_gedcom_selected_from_context(self):
-        """Exportiert per Kontextmenue nur die ausgewaehlten Datensaetze als GEDCOM."""
+        """Exportiert per Kontextmenue nur die ausgewaehlten Datensaetze als GEDCOM (GRAMPS)."""
         selection = self.tree.selection()
         if not selection:
             messagebox.showwarning("Keine Auswahl", "Bitte waehlen Sie mindestens einen Datensatz aus.")
@@ -4014,7 +4110,7 @@ class KarteikartenGUI:
 
         filepath = filedialog.asksaveasfilename(
             defaultextension=".ged",
-            initialfile="karteikarten_export_auswahl.ged",
+            initialfile="karteikarten_export_auswahl_gra.ged",
             filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")]
         )
 
@@ -4044,6 +4140,85 @@ class KarteikartenGUI:
             messagebox.showwarning("Keine Daten", str(e))
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export:\n{str(e)}")
+
+    def _export_gedcom_tng(self):
+        """Exportiert die Datenbank als GEDCOM-Datei (TNG-Dialekt)."""
+        selection = self.tree.selection()
+
+        export_all = True
+        if selection:
+            result = messagebox.askyesnocancel(
+                "Export-Auswahl",
+                f"{len(selection)} Einträge sind ausgewählt.\n\n"
+                f"Ja = Nur Auswahl exportieren\n"
+                f"Nein = Alle Einträge exportieren\n"
+                f"Abbrechen = Export abbrechen"
+            )
+            if result is None:
+                return
+            export_all = not result
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".ged",
+            initialfile="karteikarten_export_tng.ged",
+            filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")]
+        )
+        if not filepath:
+            return
+
+        try:
+            exporter = GedcomExporter(self.db.conn, dialect='TNG')
+            filter_params = {}
+            if not export_all and selection:
+                filter_params['id_list'] = [self.tree.item(item)['values'][0] for item in selection]
+
+            exported_count = exporter.export_to_gedcom(filepath, filter_params)
+
+            messagebox.showinfo(
+                "Erfolg",
+                f"✅ GEDCOM-Export erfolgreich!\n\n"
+                f"Datei: {Path(filepath).name}\n"
+                f"Exportierte Datensätze: {exported_count}\n"
+                f"Format: TNG-Dialekt\n\n"
+                f"Die Datei kann jetzt in The Next Generation (TNG)\n"
+                f"importiert werden."
+            )
+        except ValueError as e:
+            messagebox.showwarning("Keine Daten", str(e))
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export (TNG):\n{str(e)}")
+
+    def _export_gedcom_tng_selected_from_context(self):
+        """Exportiert per Kontextmenü nur die ausgewählten Datensätze als GEDCOM (TNG)."""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Keine Auswahl", "Bitte wählen Sie mindestens einen Datensatz aus.")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".ged",
+            initialfile="karteikarten_export_auswahl_tng.ged",
+            filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")]
+        )
+        if not filepath:
+            return
+
+        try:
+            exporter = GedcomExporter(self.db.conn, dialect='TNG')
+            id_list = [self.tree.item(item)['values'][0] for item in selection]
+            exported_count = exporter.export_to_gedcom(filepath, {'id_list': id_list})
+
+            messagebox.showinfo(
+                "Erfolg",
+                f"✅ GEDCOM-Export erfolgreich!\n\n"
+                f"Datei: {Path(filepath).name}\n"
+                f"Exportierte Datensätze (Auswahl): {exported_count}\n"
+                f"Format: TNG-Dialekt"
+            )
+        except ValueError as e:
+            messagebox.showwarning("Keine Daten", str(e))
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export (TNG):\n{str(e)}")
 
     
     def _import_csv(self):
@@ -4096,11 +4271,8 @@ class KarteikartenGUI:
     def _import_xlsx(self):
         """Importiert Daten aus einer XLSX-Datei und aktualisiert vorhandene Datensätze."""
         try:
-            import unicodedata
-
-            from openpyxl import load_workbook
-            from openpyxl.utils.datetime import from_excel
-        except Exception:
+            import openpyxl  # noqa: F401
+        except ImportError:
             messagebox.showerror(
                 "Fehlendes Paket",
                 "Zum XLSX-Import wird das Paket 'openpyxl' benötigt.\n"
@@ -4117,7 +4289,6 @@ class KarteikartenGUI:
             initialfile=default_path.name,
             filetypes=[("Excel-Dateien", "*.xlsx"), ("Alle Dateien", "*.*")]
         )
-
         if not filepath:
             return
 
@@ -4132,286 +4303,19 @@ class KarteikartenGUI:
         ):
             return
 
-        def normalize_text(value):
-            if value is None:
-                return None
-            text = str(value).strip()
-            return text if text else None
+        def _progress(current, total):
+            self.db_progress['maximum'] = total
+            self.db_progress['value'] = current
+            self.root.update_idletasks()
 
-        def normalize_number(value):
-            if value is None:
-                return None
-            try:
-                if isinstance(value, float) and value.is_integer():
-                    return str(int(value))
-                if isinstance(value, int):
-                    return str(value)
-            except Exception:
-                pass
-            return str(value).strip() if str(value).strip() else None
-
-        def normalize_year(value):
-            if value is None or str(value).strip() == "":
-                return None
-            try:
-                return int(float(value))
-            except Exception:
-                return None
-
-        def normalize_date(value, wb_epoch):
-            # Datum-Felder (Datum Taufe, Datum Geburt) in dieser XLSX sind immer
-            # als Strings gespeichert, da Excel keine Daten vor ~1900 als echtes
-            # Datumsformat speichern kann. Deshalb wird from_excel() nicht verwendet;
-            # alle Werte werden direkt als Text behandelt.
-            if value is None or str(value).strip() == "":
-                return None
-            if hasattr(value, "strftime"):
-                return value.strftime("%d.%m.%Y")
-            text = str(value).strip()
-            # XX (unbekannter Tag/Monat) → 00
-            text = re.sub(r'\bXX\b', '00', text, flags=re.IGNORECASE)
-            match = re.match(r"^(\d{1,2})[\./-](\d{1,2})[\./-](\d{4})$", text)
-            if match:
-                day, month, year = match.groups()
-                return f"{day.zfill(2)}.{month.zfill(2)}.{year}"
-            match = re.match(r"^(\d{4})[\./-](\d{1,2})[\./-](\d{1,2})$", text)
-            if match:
-                year, month, day = match.groups()
-                return f"{day.zfill(2)}.{month.zfill(2)}.{year}"
-            return text
-
-        def iso_from_datum(datum):
-            if not datum:
-                return None
-            # XX (unbekannter Tag/Monat) → 00
-            datum = re.sub(r'\bXX\b', '00', datum, flags=re.IGNORECASE)
-            # DD.MM.YYYY (auch mit 00 für unbekannte Teile, z.B. 00.10.1630)
-            match = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", datum)
-            if match:
-                day, month, year = match.groups()
-                return f"{year}-{month}-{day}"
-            # YYYY.MM.DD (alternatives Format aus todestag-Feld)
-            match = re.match(r"^(\d{4})\.(\d{2})\.(\d{2})$", datum)
-            if match:
-                year, month, day = match.groups()
-                return f"{year}-{month}-{day}"
-            # Reine Jahreszahl → YYYY-00-00
-            match = re.match(r"^(\d{4})$", datum)
-            if match:
-                return f"{match.group(1)}-00-00"
-            return None
-
-        def to_ymd_dot(date_str):
-            """Wandelt DD.MM.YYYY in YYYY.MM.DD um (Format für todestag/datum_geburt).
-            Unvollständige Daten (00.MM.YYYY, DD.00.YYYY) bleiben korrekt erhalten.
-            Reine Jahreszahlen (z.B. '1613') werden unverändert zurückgegeben."""
-            if not date_str:
-                return None
-            match = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", date_str)
-            if match:
-                day, month, year = match.groups()
-                return f"{year}.{month}.{day}"
-            return date_str  # Fallback: Jahreszahl o.ä. unverändert
-
-        def stand_from_gender(value):
-            if value is None:
-                return None
-            text = str(value).strip().lower()
-            if text in {"m", "maennlich", "männlich", "male", "1"}:
-                return "Sohn"
-            if text in {"w", "weiblich", "female", "f", "2"}:
-                return "Tochter"
-            if "m" in text and "weib" not in text:
-                return "Sohn"
-            if "w" in text or "weib" in text:
-                return "Tochter"
-            return None
-
-        def normalize_key(value):
-            if value is None:
-                return None
-            text = str(value).strip()
-            if not text:
-                return None
-            text = text.replace("\u00A0", " ")
-            text = unicodedata.normalize("NFKC", text)
-            text = re.sub(r"\s+", " ", text)
-            return text.casefold()
-
-        def build_match_keys(value):
-            keys = set()
-            if value is None:
-                return keys
-            raw = str(value).strip()
-            if not raw:
-                return keys
-            raw = re.sub(r"_erf(?=\.(jpg|jpeg|png|tif|tiff)$)", "", raw, flags=re.IGNORECASE)
-            base = re.sub(r"\.(jpg|jpeg|png|tif|tiff)$", "", raw, flags=re.IGNORECASE)
-            base_no_inf = re.sub(r"_inf$", "", base, flags=re.IGNORECASE)
-            base_no_erf = re.sub(r"_erf$", "", base, flags=re.IGNORECASE)
-            base_no_inf_erf = re.sub(r"_erf$", "", base_no_inf, flags=re.IGNORECASE)
-            for candidate in (raw, base, base_no_inf, base_no_erf, base_no_inf_erf):
-                key = normalize_key(candidate)
-                if key:
-                    keys.add(key)
-            return keys
-
+        self.db_status_label.config(text="⏳ XLSX-Import läuft …")
+        self.db_progress['value'] = 0
+        self.root.update_idletasks()
         try:
-            wb = load_workbook(filename=filepath, read_only=True, data_only=True)
-            ws = wb.active
+            result = run_xlsx_import(self.db, filepath, row_progress_callback=_progress)
 
-            header_row = None
-            for row in ws.iter_rows(min_row=1, max_row=5, values_only=True):
-                if row and any(cell is not None for cell in row):
-                    header_row = row
-                    break
-
-            if not header_row:
-                messagebox.showerror("Fehler", "Keine Header-Zeile in der XLSX-Datei gefunden.")
-                return
-
-            headers = {str(name).strip(): idx for idx, name in enumerate(header_row) if name is not None}
-
-            required = [
-                "Karteikarte", "Jahr", "Datum Taufe", "Datum Geburt", "Seite", "Nummer",
-                "Karteikartentext", "Vorname Täufling", "Klarname", "Vorname Vater",
-                "Geschlecht Täufling", "Kirchenbucheintrag"
-            ]
-            missing = [name for name in required if name not in headers]
-            if missing:
-                messagebox.showerror(
-                    "Fehlende Spalten",
-                    "In der XLSX-Datei fehlen folgende Spalten:\n" + "\n".join(missing)
-                )
-                return
-
-            cursor = self.db.conn.cursor()
-            cursor.execute(
-                "SELECT id, dateiname FROM karteikarten WHERE dateiname IS NOT NULL AND dateiname <> ''"
-            )
-            key_to_ids = {}
-            for record_id, name in cursor.fetchall():
-                for key in build_match_keys(name):
-                    key_to_ids.setdefault(key, []).append(record_id)
-
-            updated = 0
-            not_found = 0
-            errors = 0
-
-            total_rows = max(ws.max_row - 1, 0)
-            self.db_progress['maximum'] = total_rows
-            self.db_progress['value'] = 0
-
-            created_at = "2026-01-16 00:00:00"
-            for row_index, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=1):
-                self.db_progress['value'] = row_index
-                self.root.update_idletasks()
-                try:
-                    dateiname = normalize_text(row[headers["Karteikarte"]])
-                    if not dateiname:
-                        continue
-
-                    row_keys = build_match_keys(dateiname)
-                    matched_ids = []
-                    for key in row_keys:
-                        if key in key_to_ids:
-                            matched_ids.extend(key_to_ids[key])
-                    matched_ids = list(dict.fromkeys(matched_ids))
-
-                    if not matched_ids:
-                        not_found += 1
-                        continue
-
-                    jahr = normalize_year(row[headers["Jahr"]])
-                    datum_taufe = normalize_date(row[headers["Datum Taufe"]], wb.epoch)
-                    datum_geburt = normalize_date(row[headers["Datum Geburt"]], wb.epoch)
-                    # todestag: nur Datum Taufe (kein Fallback auf Datum Geburt)
-                    # datum/iso_datum: Datum Taufe, sonst Datum Geburt als Fallback
-                    datum = datum_taufe or datum_geburt
-                    iso_datum = iso_from_datum(datum)
-                    seite = normalize_number(row[headers["Seite"]])
-                    nummer = normalize_number(row[headers["Nummer"]])
-                    erkannter_text = normalize_text(row[headers["Karteikartentext"]])
-                    vorname = normalize_text(row[headers["Vorname Täufling"]])
-                    nachname = normalize_text(row[headers["Klarname"]])
-                    partner = normalize_text(row[headers["Vorname Vater"]])
-                    stand = stand_from_gender(row[headers["Geschlecht Täufling"]])
-                    kirchenbuchtext = normalize_text(row[headers["Kirchenbucheintrag"]])
-                    mutter_vorname = normalize_text(row[headers["Vorname Mutter"]]) if "Vorname Mutter" in headers else None
-
-                    for record_id in matched_ids:
-                        cursor.execute(
-                            """
-                            UPDATE karteikarten
-                            SET kirchengemeinde = ?,
-                                ereignis_typ = ?,
-                                jahr = ?,
-                                datum = ?,
-                                seite = ?,
-                                nummer = ?,
-                                erkannter_text = ?,
-                                ocr_methode = ?,
-                                erstellt_am = ?,
-                                aktualisiert_am = CURRENT_TIMESTAMP,
-                                iso_datum = ?,
-                                vorname = ?,
-                                nachname = ?,
-                                partner = ?,
-                                todestag = ?,
-                                ort = ?,
-                                stand = ?,
-                                kirchenbuchtext = ?,
-                                geb_jahr_gesch = ?,
-                                mutter_vorname = ?,
-                                datum_geburt = ?,
-                                version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'erkennung'
-                            WHERE id = ?
-                            """,
-                            (
-                                "ev. Kb. Wetzlar",
-                                "Taufe",
-                                jahr,
-                                datum,
-                                seite,
-                                nummer,
-                                erkannter_text,
-                                "Import",
-                                created_at,
-                                iso_datum,
-                                vorname,
-                                nachname,
-                                partner,
-                                to_ymd_dot(datum_taufe),  # todestag: YYYY.MM.DD, nur Datum Taufe
-                                "Wetzlar",
-                                stand,
-                                kirchenbuchtext,
-                                jahr,
-                                mutter_vorname,
-                                to_ymd_dot(datum_taufe or datum_geburt),  # datum_geburt: YYYY.MM.DD, Taufe bevorzugt
-                                record_id
-                            )
-                        )
-                    updated += len(matched_ids)
-                except Exception:
-                    errors += 1
-
-            # --- Nachbearbeitungsphase: Commit, Sync-Markierung, Listenaktualisierung ---
             self.db_progress.config(mode='indeterminate')
             self.db_progress.start(15)
-            self.db_status_label.config(text="⏳ Speichere Änderungen …")
-            self.root.update_idletasks()
-
-            self.db.conn.commit()
-
-            self.db_status_label.config(text="⏳ Synchronisations-Queue wird aktualisiert …")
-            self.root.update_idletasks()
-            all_record_ids = [rid for ids in key_to_ids.values() for rid in ids]
-            for record_id in all_record_ids:
-                try:
-                    self.db.mark_record_for_sync(record_id)
-                except Exception:
-                    pass
-
             self.db_status_label.config(text="⏳ Datenbank-Ansicht wird aktualisiert …")
             self.root.update_idletasks()
             self._refresh_db_list()
@@ -4422,11 +4326,34 @@ class KarteikartenGUI:
             messagebox.showinfo(
                 "XLSX-Import abgeschlossen",
                 f"✅ XLSX-Import abgeschlossen!\n\n"
-                f"Aktualisiert: {updated}\n"
-                f"Nicht gefunden (kein Match): {not_found}\n"
-                f"Fehler: {errors}"
+                f"Aktualisiert: {result['updated']}\n"
+                f"Nicht gefunden (kein Match): {result['not_found']}\n"
+                f"Fehler: {result['errors']}"
             )
 
+            # Nicht gefundene Namen in Datei speichern
+            not_found_names = result.get("not_found_names", [])
+            if not_found_names:
+                import datetime
+                out_path = Path("output/xlsx_not_found.txt")
+                out_path.parent.mkdir(exist_ok=True)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(f"# XLSX-Import: nicht gematchte Einträge ({len(not_found_names)})\n")
+                    f.write(f"# Importdatei: {Path(filepath).name}\n")
+                    f.write(f"# Zeitpunkt: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+                    for name in not_found_names:
+                        f.write(f"{name}\n")
+                if messagebox.askyesno(
+                    "Nicht gefundene Einträge",
+                    f"{len(not_found_names)} Einträge konnten nicht zugeordnet werden.\n\n"
+                    f"Die Dateinamen wurden gespeichert in:\n{out_path}\n\n"
+                    f"Datei jetzt öffnen?"
+                ):
+                    import os
+                    os.startfile(out_path)
+        except ValueError as e:
+            self.db_progress['value'] = 0
+            messagebox.showerror("Fehlende Spalten", str(e))
         except Exception as e:
             self.db_progress.stop()
             self.db_progress.config(mode='determinate')
@@ -4783,6 +4710,83 @@ class KarteikartenGUI:
             f"Wechseln Sie zum Tab '📊 Datenbank' um die Einträge zu sehen."
         )
     
+    def _batch_register_files(self):
+        """Registriert alle Dateien des aktuellen Bildtyp-Filters in der DB ohne OCR.
+        Bereits vorhandene Einträge werden übersprungen (skip_if_exists=True).
+        Danach kann der XLSX-Import die Felder befüllen."""
+        if not self.image_files:
+            messagebox.showwarning("Warnung", "Keine Karteikarten geladen.")
+            return
+
+        batch_type = self.batch_type_var.get()
+
+        # Dateien filtern
+        if batch_type == "Alle":
+            candidates = list(self.image_files)
+        else:
+            candidates = [f for f in self.image_files if f" {batch_type} " in f.name]
+
+        if not candidates:
+            messagebox.showwarning(
+                "Keine Dateien",
+                f"Keine Dateien mit Bildtyp '{batch_type}' in der geladenen Liste gefunden."
+            )
+            return
+
+        antwort = messagebox.askyesno(
+            "Registrieren bestätigen",
+            f"{len(candidates)} Dateien werden in die Datenbank eingetragen (ohne OCR).\n\n"
+            f"Bildtyp-Filter: {batch_type}\n"
+            f"Bereits vorhandene Einträge werden übersprungen.\n\n"
+            f"Möchten Sie fortfahren?"
+        )
+        if not antwort:
+            return
+
+        neu = 0
+        uebersprungen = 0
+        fehler = 0
+
+        self.register_btn.config(state=tk.DISABLED)
+        for idx, filepath in enumerate(candidates):
+            self.text_display.delete("1.0", tk.END)
+            self.text_display.insert(
+                "1.0",
+                f"📋 Registrierung läuft...\n\n"
+                f"Fortschritt: {idx + 1} / {len(candidates)}\n"
+                f"Neu: {neu}  Übersprungen: {uebersprungen}  Fehler: {fehler}\n\n"
+                f"Aktuell: {filepath.name}"
+            )
+            self.root.update()
+            try:
+                result_id = self.db.save_karteikarte(
+                    dateiname=filepath.name,
+                    dateipfad=str(filepath),
+                    erkannter_text="",
+                    ocr_methode="Import",
+                    skip_if_exists=True,
+                )
+                if result_id is None:
+                    uebersprungen += 1
+                else:
+                    neu += 1
+            except Exception as e:
+                fehler += 1
+                print(f"[REGISTER] Fehler bei {filepath.name}: {e}")
+
+        self.register_btn.config(state=tk.NORMAL)
+        self.text_display.delete("1.0", tk.END)
+        messagebox.showinfo(
+            "Registrierung abgeschlossen",
+            f"Fertig.\n\n"
+            f"Neu eingetragen:    {neu}\n"
+            f"Bereits vorhanden:  {uebersprungen}\n"
+            f"Fehler:             {fehler}\n\n"
+            f"Die Einträge können jetzt per XLSX-Import befüllt werden."
+        )
+        if hasattr(self, "tree"):
+            self._refresh_db_list()
+
     # NEU: Funktion zum Abbrechen des Batch-Scans
     def _cancel_batch_scan(self):
         """Setzt Flag zum Abbrechen des Batch-Scans."""

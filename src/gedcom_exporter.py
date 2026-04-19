@@ -29,16 +29,18 @@ from .sources_lib import SOURCE_NAME_TO_ID, SOURCES_DATA
 
 
 class GedcomExporter:
-    """Exportiert Karteikarten-Daten als GEDCOM-Datei (GRAMPS-Dialekt)."""
+    """Exportiert Karteikarten-Daten als GEDCOM-Datei (GRAMPS- oder TNG-Dialekt)."""
     
-    def __init__(self, db_connection: sqlite3.Connection):
+    def __init__(self, db_connection: sqlite3.Connection, dialect: str = 'GRAMPS'):
         """
         Initialisiert den GEDCOM-Exporter.
         
         Args:
             db_connection: Aktive SQLite-Datenbankverbindung
+            dialect: 'GRAMPS' (Standard) oder 'TNG'
         """
         self.conn = db_connection
+        self._dialect = dialect.upper()
         
         # ID-Generatoren
         self._person_id = count(1)
@@ -105,23 +107,29 @@ class GedcomExporter:
         return str(value).strip()
     
     def _determine_sex_from_vorname(self, vorname: str) -> Optional[str]:
-        """Bestimmt Geschlecht basierend auf dem Vornamen."""
+        """Bestimmt Geschlecht basierend auf dem Vornamen.
+        
+        Ignoriert Suffixe wie '(~)', '(*)' oder andere Klammerausdrücke.
+        """
         if not vorname:
             return None
-        
-        vorname_lower = vorname.lower().strip()
-        
+
+        # Nur den ersten Namensteil verwenden, Klammern/Sonderzeichen abschneiden
+        # z.B. "Balthasar (~)" -> "balthasar", "Gertrud (~)" -> "gertrud"
+        clean = re.sub(r'\s*[\(\[].*', '', vorname).strip()
+        vorname_lower = clean.lower() if clean else vorname.lower().strip()
+
         # Prüfe gegen die Namenslisten aus extraction_lists
         if any(v.lower() == vorname_lower for v in MAENNLICHE_VORNAMEN):
             return 'M'
-        
+
         if any(v.lower() == vorname_lower for v in WEIBLICHE_VORNAMEN):
             return 'F'
-        
+
         # Fallback: Einfache Endungs-Heuristik
         if vorname_lower.endswith(('a', 'e', 'i', 'h', 'n')):
             return 'F'
-        
+
         return None
     
     def _escape_gedcom_text(self, text: str) -> str:
@@ -225,11 +233,17 @@ class GedcomExporter:
     
     def _get_note_id(self) -> str:
         """Erstellt eine neue Note-ID."""
-        return f"@N{next(self._note_id):06d}@"
+        n = next(self._note_id)
+        if self._dialect == 'TNG':
+            return f"@N{n}@"
+        return f"@N{n:06d}@"
     
     def _get_obje_id(self) -> str:
         """Erstellt eine neue OBJE-ID."""
-        return f"@O{next(self._obje_id):06d}@"
+        n = next(self._obje_id)
+        if self._dialect == 'TNG':
+            return f"@{200999 + n}@"  # TNG: @201000@, @201001@, ...
+        return f"@O{n:06d}@"
     
     def _add_note(self, title: str, text: str) -> str:
         """
@@ -439,6 +453,18 @@ class GedcomExporter:
             return f"Nr. {page}"
         
         return ""
+
+    def _format_second_page_info(self, seite: str, nummer: Optional[str], image_path: Optional[str]) -> str:
+        """Erstellt den PAGE-Inhalt für die Kirchenbuch-Citation.
+        
+        Format: Seite X; Nr. Y; Bild <Dateinamen-Stamm>
+        """
+        parts = [f"Seite {seite}"]
+        if nummer:
+            parts.append(f"Nr. {nummer}")
+        if image_path:
+            parts.append(f"Bild {Path(image_path).stem}")
+        return '; '.join(parts)
     
     def _extract_nummer_from_text(self, erkannter_text: str) -> Optional[str]:
         """Extrahiert die Nummer aus dem erkannten Text (z.B. 'Nr. 38')."""
@@ -533,37 +559,59 @@ class GedcomExporter:
         
         return None
     
-    def _format_gedcom_date(self, iso_datum: str) -> str:
-        """Konvertiert ISO-Datum zu GEDCOM-Format."""
-        if not iso_datum:
+    def _format_gedcom_date(self, datum: str) -> str:
+        """Konvertiert ein Datum beliebigen Formats in gültiges GEDCOM-Format (D MON YYYY).
+
+        Unterstützte Eingangsformate:
+            YYYY-MM-DD  (ISO mit Bindestrich)
+            DD.MM.YYYY  (deutsches Format mit Punkten)
+            YYYY.MM.DD  (älteres ISO-Format mit Punkten)
+        Platzhalterwert 00 für Tag oder Monat wird korrekt behandelt.
+        """
+        if not datum:
             return ""
-        
+
         months = ["", "JAN", "FEB", "MAR", "APR", "MAY", "JUN",
-                 "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
-        
+                  "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"]
+
         try:
-            parts = iso_datum.split('-')
-            if len(parts) != 3:
-                return ""
-            
-            jahr = parts[0]
-            monat = int(parts[1])
-            tag = int(parts[2])
-            
-            # Wenn Tag 00, nur Monat und Jahr
-            if tag == 0:
-                if monat > 0:
-                    return f"{months[monat]} {jahr}"
+            datum = datum.strip()
+            if '-' in datum:
+                # YYYY-MM-DD
+                parts = datum.split('-')
+                if len(parts) != 3:
+                    return ""
+                jahr = parts[0].strip()
+                monat = int(parts[1])
+                tag = int(parts[2])
+            elif '.' in datum:
+                parts = [p.strip() for p in datum.split('.')]
+                if len(parts) != 3:
+                    return ""
+                # Erkennung: erstes Teil 4-stellig und ≥ 1000 → YYYY.MM.DD
+                if len(parts[0]) == 4 and parts[0].isdigit() and int(parts[0]) >= 1000:
+                    jahr = parts[0]
+                    monat = int(parts[1])
+                    tag = int(parts[2])
                 else:
-                    return jahr
-            
-            # Wenn Monat 00, nur Tag und Jahr
+                    # DD.MM.YYYY
+                    tag = int(parts[0])
+                    monat = int(parts[1])
+                    jahr = parts[2]
+            else:
+                # Nur Jahreszahl?
+                return datum if datum.isdigit() and len(datum) == 4 else ""
+
+            if tag == 0 and monat == 0:
+                return jahr
+            if tag == 0:
+                return f"{months[monat]} {jahr}" if 1 <= monat <= 12 else jahr
             if monat == 0:
                 return f"{tag} {jahr}"
-            
-            # Vollständiges Datum
-            return f"{tag} {months[monat]} {jahr}"
-        
+            if 1 <= monat <= 12:
+                return f"{tag} {months[monat]} {jahr}"
+            return f"{tag} {jahr}"
+
         except (ValueError, IndexError):
             return ""
     
@@ -600,7 +648,8 @@ class GedcomExporter:
         f.write("1 SOUR Wetzlar Karteikarten Erkennung\n")
         f.write(f"2 VERS 1.0\n")
         f.write(f"2 NAME Wetzlar Karteikarten Erkennung\n")
-        f.write("1 DEST GRAMPS\n")
+        dest = 'TNG' if self._dialect == 'TNG' else 'GRAMPS'
+        f.write(f"1 DEST {dest}\n")
         f.write(f"1 DATE {date_str}\n")
         f.write(f"2 TIME {time_str}\n")
         f.write("1 GEDC\n")
@@ -610,6 +659,24 @@ class GedcomExporter:
         f.write("0 @SUBM@ SUBM\n")
         f.write("1 NAME Karteikartenerkennung\n")
     
+    def _write_inline_note(self, f, note_id: str, level: int = 2) -> None:
+        """Schreibt Notiztext direkt inline als NOTE-Tag (TNG-Stil).
+        
+        Zeilenlänge: max 80 Zeichen Inhalt + 7 Zeichen Tag-Prefix = 87 gesamt.
+        Längere Texte werden durch CONC-Zeilen aufgeteilt.
+        """
+        if not note_id or note_id not in self._notes:
+            return
+        text = self._notes[note_id]
+        max_len = 80
+        if len(text) <= max_len:
+            f.write(f"{level} NOTE {text}\n")
+        else:
+            chunks = [text[i:i + max_len] for i in range(0, len(text), max_len)]
+            f.write(f"{level} NOTE {chunks[0]}\n")
+            for chunk in chunks[1:]:
+                f.write(f"{level + 1} CONC {chunk}\n")
+
     def _write_all_sources(self, f):
         """Schreibt alle verwendeten SOUR-Records."""
         for source_id in sorted(self._source_cache.values(), key=lambda x: int(x[2:-1]) if x[2:-1].isdigit() else 999):
@@ -643,21 +710,20 @@ class GedcomExporter:
         
     def _write_notes_and_objes(self, f):
         """Schreibt alle gesammelten NOTE und OBJE Einträge am Ende."""
-        # Schreibe NOTE-Einträge (sortiert)
-        for note_id in sorted(self._notes.keys()):
-            note_text = self._notes[note_id]
-            f.write(f"0 {note_id} NOTE")
-        
-            # Schreibe Note mit CONC für lange Texte
-            if len(note_text) > 248:
-                lines = [note_text[i:i+248] for i in range(0, len(note_text), 248)]
-                f.write(f" {lines[0]}\n")
-                for line in lines[1:]:
-                    f.write(f"1 CONC {line}\n")
-            else:
-                f.write(f" {note_text}\n")
+        # NOTE-Records: nur für GRAMPS (TNG schreibt Notizen inline)
+        if self._dialect == 'GRAMPS':
+            for note_id in sorted(self._notes.keys()):
+                note_text = self._notes[note_id]
+                f.write(f"0 {note_id} NOTE")
+                if len(note_text) > 248:
+                    lines = [note_text[i:i+248] for i in range(0, len(note_text), 248)]
+                    f.write(f" {lines[0]}\n")
+                    for line in lines[1:]:
+                        f.write(f"1 CONC {line}\n")
+                else:
+                    f.write(f" {note_text}\n")
     
-        # Schreibe OBJE-Einträge (sortiert)
+        # OBJE-Records: für beide Dialekte
         for obje_id in sorted(self._objes.keys()):
             file_path, form = self._objes[obje_id]
             f.write(f"0 {obje_id} OBJE\n")
@@ -673,13 +739,15 @@ class GedcomExporter:
         
         vorname_clean = self._clean(vorname)
         nachname_clean = self._clean(nachname)
+        # TNG-Dialekt: Nachname immer groß
+        surn_display = nachname_clean.upper() if self._dialect == 'TNG' and nachname_clean else nachname_clean
         
         if vorname_clean or nachname_clean:
-            f.write(f"1 NAME {vorname_clean} /{nachname_clean}/\n")
+            f.write(f"1 NAME {vorname_clean} /{surn_display}/\n")
             if vorname_clean:
                 f.write(f"2 GIVN {vorname_clean}\n")
-            if nachname_clean:
-                f.write(f"2 SURN {nachname_clean}\n")
+            if surn_display:
+                f.write(f"2 SURN {surn_display}\n")
         
         # Schreibe Geschlecht wenn gespeichert
         if person_id in self._person_sex_cache:
@@ -747,56 +815,51 @@ class GedcomExporter:
         """Schreibt Heirats-Event mit vollständiger Citation (inkl. optionaler zweiter Quelle)."""
         f.write("1 MARR\n")
         
-        if date:
-            gedcom_date = self._format_gedcom_date(date)
-            if gedcom_date:
-                f.write(f"2 DATE {gedcom_date}\n")
+        gedcom_date = self._format_gedcom_date(date) if date else ""
+        if gedcom_date:
+            f.write(f"2 DATE {gedcom_date}\n")
         
         if place:
             f.write(f"2 PLAC {self._clean(place)}\n")
         
         # Erste Citation mit SOURCE (Karteikarte)
+        if self._dialect == 'TNG' and note_id:
+            self._write_inline_note(f, note_id, level=2)
         f.write(f"2 SOUR {source_id}\n")
         f.write("3 DATA\n")
-        
-        if date:
-            gedcom_date = self._format_gedcom_date(date)
-            if gedcom_date:
-                f.write(f"4 DATE {gedcom_date}\n")
-        
+        if gedcom_date:
+            f.write(f"4 DATE {gedcom_date}\n")
         if page_info:
             f.write(f"3 PAGE {page_info}\n")
-        
         f.write("3 QUAY 3\n")
-        
-        if note_id:
-            f.write(f"3 NOTE {note_id}\n")
-        
-        for obje_id in obje_ids:
-            f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'GRAMPS':
+            if note_id:
+                f.write(f"3 NOTE {note_id}\n")
+            for obje_id in obje_ids:
+                f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'TNG':
+            for obje_id in obje_ids:
+                f.write(f"2 OBJE {obje_id}\n")
         
         # Zweite Citation mit SOURCE (Kirchenbuch, falls vorhanden)
         if second_source_id:
+            if self._dialect == 'TNG' and second_note_id:
+                self._write_inline_note(f, second_note_id, level=2)
             f.write(f"2 SOUR {second_source_id}\n")
             f.write("3 DATA\n")
-            
-            if date:
-                gedcom_date = self._format_gedcom_date(date)
-                if gedcom_date:
-                    f.write(f"4 DATE {gedcom_date}\n")
-            
+            if gedcom_date:
+                f.write(f"4 DATE {gedcom_date}\n")
             if second_page_info:
                 f.write(f"3 PAGE {second_page_info}\n")
-            
             f.write("3 QUAY 3\n")
-            
-            # NOTE und OBJE für Kirchenbuch-Citation
-            if second_note_id:
-                f.write(f"3 NOTE {second_note_id}\n")
-            
-            if second_obje_ids:
-                for obje_id in second_obje_ids:
+            if self._dialect == 'GRAMPS':
+                if second_note_id:
+                    f.write(f"3 NOTE {second_note_id}\n")
+                for obje_id in (second_obje_ids or []):
                     f.write(f"3 OBJE {obje_id}\n")
+            if self._dialect == 'TNG':
+                for obje_id in (second_obje_ids or []):
+                    f.write(f"2 OBJE {obje_id}\n")
     
     def _write_burial_event(self, f, date: str, place: str,
                            source_id: str, note_id: Optional[str], obje_ids: List[str],
@@ -806,62 +869,110 @@ class GedcomExporter:
         """Schreibt Begräbnis-Event mit Citation (inkl. optionaler zweiter Quelle)."""
         f.write("1 BURI\n")
         
-        if date:
-            gedcom_date = self._format_gedcom_date(date)
-            if gedcom_date:
-                f.write(f"2 DATE {gedcom_date}\n")
+        gedcom_date = self._format_gedcom_date(date) if date else ""
+        if gedcom_date:
+            f.write(f"2 DATE {gedcom_date}\n")
         
         if place:
             f.write(f"2 PLAC {self._clean(place)}\n")
         
         # Erste Citation mit SOURCE (Karteikarte)
+        if self._dialect == 'TNG' and note_id:
+            self._write_inline_note(f, note_id, level=2)
         f.write(f"2 SOUR {source_id}\n")
         f.write("3 DATA\n")
-        
-        if date:
-            gedcom_date = self._format_gedcom_date(date)
-            if gedcom_date:
-                f.write(f"4 DATE {gedcom_date}\n")
-        
+        if gedcom_date:
+            f.write(f"4 DATE {gedcom_date}\n")
         if page_info:
             f.write(f"3 PAGE {page_info}\n")
-        
         f.write("3 QUAY 3\n")
-        
-        if note_id:
-            f.write(f"3 NOTE {note_id}\n")
-        
-        for obje_id in obje_ids:
-            f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'GRAMPS':
+            if note_id:
+                f.write(f"3 NOTE {note_id}\n")
+            for obje_id in obje_ids:
+                f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'TNG':
+            for obje_id in obje_ids:
+                f.write(f"2 OBJE {obje_id}\n")
         
         # Zweite Citation mit SOURCE (Kirchenbuch, falls vorhanden)
         if second_source_id:
+            if self._dialect == 'TNG' and second_note_id:
+                self._write_inline_note(f, second_note_id, level=2)
             f.write(f"2 SOUR {second_source_id}\n")
             f.write("3 DATA\n")
-            
-            if date:
-                gedcom_date = self._format_gedcom_date(date)
-                if gedcom_date:
-                    f.write(f"4 DATE {gedcom_date}\n")
-            
+            if gedcom_date:
+                f.write(f"4 DATE {gedcom_date}\n")
             if second_page_info:
                 f.write(f"3 PAGE {second_page_info}\n")
-            
             f.write("3 QUAY 3\n")
-            
-            # NOTE und OBJE für Kirchenbuch-Citation
-            if second_note_id:
-                f.write(f"3 NOTE {second_note_id}\n")
-            
-            if second_obje_ids:
-                for obje_id in second_obje_ids:
+            if self._dialect == 'GRAMPS':
+                if second_note_id:
+                    f.write(f"3 NOTE {second_note_id}\n")
+                for obje_id in (second_obje_ids or []):
                     f.write(f"3 OBJE {obje_id}\n")
+            if self._dialect == 'TNG':
+                for obje_id in (second_obje_ids or []):
+                    f.write(f"2 OBJE {obje_id}\n")
     
     def _write_birth_event(self, f, date: str):
         """Schreibt Geburts-Event (BIRT) mit bereits formatiertem GEDCOM-Datum."""
         f.write("1 BIRT\n")
         if date:
             f.write(f"2 DATE {date}\n")
+
+    def _format_ddmmyyyy_to_gedcom(self, datum: str) -> str:
+        """Delegiert an _format_gedcom_date (erkennt DD.MM.YYYY, YYYY.MM.DD und YYYY-MM-DD)."""
+        return self._format_gedcom_date(datum)
+
+    def _write_chr_event(self, f, tauf_date_gedcom: str, place: str,
+                         source_id: str, note_id: Optional[str], obje_ids: List[str],
+                         page_info: str,
+                         second_source_id: Optional[str] = None, second_page_info: Optional[str] = None,
+                         second_note_id: Optional[str] = None, second_obje_ids: Optional[List[str]] = None):
+        """Schreibt Tauf-Event (CHR) mit Citation."""
+        f.write("1 CHR\n")
+        if tauf_date_gedcom:
+            f.write(f"2 DATE {tauf_date_gedcom}\n")
+        if place:
+            f.write(f"2 PLAC {self._clean(place)}\n")
+
+        if self._dialect == 'TNG' and note_id:
+            self._write_inline_note(f, note_id, level=2)
+        f.write(f"2 SOUR {source_id}\n")
+        f.write("3 DATA\n")
+        if tauf_date_gedcom:
+            f.write(f"4 DATE {tauf_date_gedcom}\n")
+        if page_info:
+            f.write(f"3 PAGE {page_info}\n")
+        f.write("3 QUAY 3\n")
+        if self._dialect == 'GRAMPS':
+            if note_id:
+                f.write(f"3 NOTE {note_id}\n")
+            for obje_id in obje_ids:
+                f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'TNG':
+            for obje_id in obje_ids:
+                f.write(f"2 OBJE {obje_id}\n")
+
+        if second_source_id:
+            if self._dialect == 'TNG' and second_note_id:
+                self._write_inline_note(f, second_note_id, level=2)
+            f.write(f"2 SOUR {second_source_id}\n")
+            f.write("3 DATA\n")
+            if tauf_date_gedcom:
+                f.write(f"4 DATE {tauf_date_gedcom}\n")
+            if second_page_info:
+                f.write(f"3 PAGE {second_page_info}\n")
+            f.write("3 QUAY 3\n")
+            if self._dialect == 'GRAMPS':
+                if second_note_id:
+                    f.write(f"3 NOTE {second_note_id}\n")
+                for obje_id in (second_obje_ids or []):
+                    f.write(f"3 OBJE {obje_id}\n")
+            if self._dialect == 'TNG':
+                for obje_id in (second_obje_ids or []):
+                    f.write(f"2 OBJE {obje_id}\n")
 
     def _write_occupation_event(self, f, occupation: str, date: str, place: str,
                                source_id: str, note_id: Optional[str], obje_ids: List[str],
@@ -871,56 +982,51 @@ class GedcomExporter:
         """Schreibt Berufs-Event mit Citation (inkl. optionaler zweiter Quelle)."""
         f.write(f"1 OCCU {self._clean(occupation)}\n")
         
-        if date:
-            gedcom_date = self._format_gedcom_date(date)
-            if gedcom_date:
-                f.write(f"2 DATE {gedcom_date}\n")
+        gedcom_date = self._format_gedcom_date(date) if date else ""
+        if gedcom_date:
+            f.write(f"2 DATE {gedcom_date}\n")
         
         if place:
             f.write(f"2 PLAC {self._clean(place)}\n")
         
         # Erste Citation mit SOURCE (Karteikarte)
+        if self._dialect == 'TNG' and note_id:
+            self._write_inline_note(f, note_id, level=2)
         f.write(f"2 SOUR {source_id}\n")
         f.write("3 DATA\n")
-        
-        if date:
-            gedcom_date = self._format_gedcom_date(date)
-            if gedcom_date:
-                f.write(f"4 DATE {gedcom_date}\n")
-        
+        if gedcom_date:
+            f.write(f"4 DATE {gedcom_date}\n")
         if page_info:
             f.write(f"3 PAGE {page_info}\n")
-        
         f.write("3 QUAY 3\n")
-        
-        if note_id:
-            f.write(f"3 NOTE {note_id}\n")
-        
-        for obje_id in obje_ids:
-            f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'GRAMPS':
+            if note_id:
+                f.write(f"3 NOTE {note_id}\n")
+            for obje_id in obje_ids:
+                f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'TNG':
+            for obje_id in obje_ids:
+                f.write(f"2 OBJE {obje_id}\n")
         
         # Zweite Citation mit SOURCE (Kirchenbuch, falls vorhanden)
         if second_source_id:
+            if self._dialect == 'TNG' and second_note_id:
+                self._write_inline_note(f, second_note_id, level=2)
             f.write(f"2 SOUR {second_source_id}\n")
             f.write("3 DATA\n")
-            
-            if date:
-                gedcom_date = self._format_gedcom_date(date)
-                if gedcom_date:
-                    f.write(f"4 DATE {gedcom_date}\n")
-            
+            if gedcom_date:
+                f.write(f"4 DATE {gedcom_date}\n")
             if second_page_info:
                 f.write(f"3 PAGE {second_page_info}\n")
-            
             f.write("3 QUAY 3\n")
-            
-            # NOTE und OBJE für Kirchenbuch-Citation
-            if second_note_id:
-                f.write(f"3 NOTE {second_note_id}\n")
-            
-            if second_obje_ids:
-                for obje_id in second_obje_ids:
+            if self._dialect == 'GRAMPS':
+                if second_note_id:
+                    f.write(f"3 NOTE {second_note_id}\n")
+                for obje_id in (second_obje_ids or []):
                     f.write(f"3 OBJE {obje_id}\n")
+            if self._dialect == 'TNG':
+                for obje_id in (second_obje_ids or []):
+                    f.write(f"2 OBJE {obje_id}\n")
     
     def _write_residence_event(self, f, date: str, place: str,
                               source_id: str, note_id: Optional[str], obje_ids: List[str],
@@ -933,53 +1039,48 @@ class GedcomExporter:
         if place:
             f.write(f"2 PLAC {self._clean(place)}\n")
         
-        if date:
-            gedcom_date = self._format_gedcom_date(date)
-            if gedcom_date:
-                f.write(f"2 DATE {gedcom_date}\n")
+        gedcom_date = self._format_gedcom_date(date) if date else ""
+        if gedcom_date:
+            f.write(f"2 DATE {gedcom_date}\n")
         
         # Erste Citation mit SOURCE (Karteikarte)
+        if self._dialect == 'TNG' and note_id:
+            self._write_inline_note(f, note_id, level=2)
         f.write(f"2 SOUR {source_id}\n")
         f.write("3 DATA\n")
-        
-        if date:
-            gedcom_date = self._format_gedcom_date(date)
-            if gedcom_date:
-                f.write(f"4 DATE {gedcom_date}\n")
-        
+        if gedcom_date:
+            f.write(f"4 DATE {gedcom_date}\n")
         if page_info:
             f.write(f"3 PAGE {page_info}\n")
-        
         f.write("3 QUAY 3\n")
-        
-        if note_id:
-            f.write(f"3 NOTE {note_id}\n")
-        
-        for obje_id in obje_ids:
-            f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'GRAMPS':
+            if note_id:
+                f.write(f"3 NOTE {note_id}\n")
+            for obje_id in obje_ids:
+                f.write(f"3 OBJE {obje_id}\n")
+        if self._dialect == 'TNG':
+            for obje_id in obje_ids:
+                f.write(f"2 OBJE {obje_id}\n")
         
         # Zweite Citation mit SOURCE (Kirchenbuch, falls vorhanden)
         if second_source_id:
+            if self._dialect == 'TNG' and second_note_id:
+                self._write_inline_note(f, second_note_id, level=2)
             f.write(f"2 SOUR {second_source_id}\n")
             f.write("3 DATA\n")
-            
-            if date:
-                gedcom_date = self._format_gedcom_date(date)
-                if gedcom_date:
-                    f.write(f"4 DATE {gedcom_date}\n")
-            
+            if gedcom_date:
+                f.write(f"4 DATE {gedcom_date}\n")
             if second_page_info:
                 f.write(f"3 PAGE {second_page_info}\n")
-            
             f.write("3 QUAY 3\n")
-            
-            # NOTE und OBJE für Kirchenbuch-Citation
-            if second_note_id:
-                f.write(f"3 NOTE {second_note_id}\n")
-            
-            if second_obje_ids:
-                for obje_id in second_obje_ids:
+            if self._dialect == 'GRAMPS':
+                if second_note_id:
+                    f.write(f"3 NOTE {second_note_id}\n")
+                for obje_id in (second_obje_ids or []):
                     f.write(f"3 OBJE {obje_id}\n")
+            if self._dialect == 'TNG':
+                for obje_id in (second_obje_ids or []):
+                    f.write(f"2 OBJE {obje_id}\n")
     
     def _process_marriage_record(self, record: dict) -> List[str]:
         """Verarbeitet einen Hochzeits-Datensatz."""
@@ -1010,40 +1111,38 @@ class GedcomExporter:
         
         # IDs erstellen
         source_id = self._get_source_id(source_name)
-        page_info = self._format_page_number(dateiname)
-        
+
         # Zweite Quelle (Kirchenbuch) ermitteln
         ereignis_typ = self._clean(record.get('ereignis_typ', ''))
         jahr = record.get('jahr')
         seite = self._clean(record.get('seite', ''))
         kirchenbuchtext = self._clean(record.get('kirchenbuchtext', ''))
+        nummer = self._extract_nummer_from_text(erkannter_text)
         second_source_name = None
         second_source_id = None
         second_page_info = None
         second_note_id = None
         second_obje_ids = []
+        kirchenbuch_image_path = None
         
         if jahr and seite:
             second_source_name = self._find_kirchenbuch_source(ereignis_typ, jahr, seite)
             if second_source_name:
                 second_source_id = self._get_source_id(second_source_name)
-                
-                # Extrahiere Nummer aus erkanntem Text für PAGE
-                nummer = self._extract_nummer_from_text(erkannter_text)
-                if nummer:
-                    second_page_info = f"Seite {seite}, Nr. {nummer}"
-                else:
-                    second_page_info = f"Seite {seite}"
+                kirchenbuch_image_path = self._get_kirchenbuch_image_path(second_source_name, seite)
+                second_page_info = self._format_second_page_info(seite, nummer, kirchenbuch_image_path)
                 
                 # Erstelle NOTE für Kirchenbuchtext, falls vorhanden
                 if kirchenbuchtext:
                     second_note_id = self._add_note("Kirchenbuchabschrift", kirchenbuchtext)
                 
                 # Erstelle OBJE für Kirchenbuch-Bild
-                kirchenbuch_image_path = self._get_kirchenbuch_image_path(second_source_name, seite)
                 if kirchenbuch_image_path:
                     second_obje_id = self._add_obje(kirchenbuch_image_path)
                     second_obje_ids.append(second_obje_id)
+
+        # PAGE für Karteikarte: Seite/Nr./Bild-Format (Kirchenbuch-Referenz)
+        page_info = self._format_second_page_info(seite, nummer, dateipfad) if seite else self._format_page_number(dateiname)
         
         # Obje hinzufügen
         obje_ids = []
@@ -1334,40 +1433,38 @@ class GedcomExporter:
         
         # IDs erstellen
         source_id = self._get_source_id(source_name)
-        page_info = self._format_page_number(dateiname)
-        
+
         # Zweite Quelle (Kirchenbuch) ermitteln
         ereignis_typ = self._clean(record.get('ereignis_typ', ''))
         jahr = record.get('jahr')
         seite = self._clean(record.get('seite', ''))
         kirchenbuchtext = self._clean(record.get('kirchenbuchtext', ''))
+        nummer = self._extract_nummer_from_text(erkannter_text)
         second_source_name = None
         second_source_id = None
         second_page_info = None
         second_note_id = None
         second_obje_ids = []
+        kirchenbuch_image_path = None
         
         if jahr and seite:
             second_source_name = self._find_kirchenbuch_source(ereignis_typ, jahr, seite)
             if second_source_name:
                 second_source_id = self._get_source_id(second_source_name)
-                
-                # Extrahiere Nummer aus erkanntem Text für PAGE
-                nummer = self._extract_nummer_from_text(erkannter_text)
-                if nummer:
-                    second_page_info = f"Seite {seite}, Nr. {nummer}"
-                else:
-                    second_page_info = f"Seite {seite}"
+                kirchenbuch_image_path = self._get_kirchenbuch_image_path(second_source_name, seite)
+                second_page_info = self._format_second_page_info(seite, nummer, kirchenbuch_image_path)
                 
                 # Erstelle NOTE für Kirchenbuchtext, falls vorhanden
                 if kirchenbuchtext:
                     second_note_id = self._add_note("Kirchenbuchabschrift", kirchenbuchtext)
                 
                 # Erstelle OBJE für Kirchenbuch-Bild
-                kirchenbuch_image_path = self._get_kirchenbuch_image_path(second_source_name, seite)
                 if kirchenbuch_image_path:
                     second_obje_id = self._add_obje(kirchenbuch_image_path)
                     second_obje_ids.append(second_obje_id)
+
+        # PAGE für Karteikarte: Seite/Nr./Bild-Format (Kirchenbuch-Referenz)
+        page_info = self._format_second_page_info(seite, nummer, dateipfad) if seite else self._format_page_number(dateiname)
         
         # Obje hinzufügen
         obje_ids = []
@@ -1408,7 +1505,182 @@ class GedcomExporter:
         self._add_person_event(person_id, burial_event_buffer.getvalue())
         
         return [person_id]
-    
+
+    def _process_baptism_record(self, record: dict) -> List[str]:
+        """Verarbeitet einen Taufeintrag.
+
+        Feld-Mapping:
+            vorname        → Täufling-Vorname
+            nachname       → Familienname (Vater-Nachname)
+            partner        → Vater-Vorname
+            mutter_vorname → Mutter-Vorname
+            datum_geburt   → Geburtsdatum   (DD.MM.YYYY)
+            todestag       → Taufdatum      (DD.MM.YYYY)
+            ort            → Tauf- und Geburtsort
+            stand          → Geschlecht des Täuflings ('M'/'F'), Fallback via Vorname
+        """
+        taeufl_vorname = self._clean(record.get('vorname', ''))
+        nachname = self._clean(record.get('nachname', ''))
+        vater_vorname = self._clean(record.get('partner', ''))
+        mutter_vorname = self._clean(record.get('mutter_vorname', ''))
+        datum_geburt_raw = self._clean(record.get('datum_geburt', ''))
+        taufdatum_raw = self._clean(record.get('todestag', ''))
+        ort = self._clean(record.get('ort', '')) or 'Wetzlar'
+
+        # Geschlecht: zuerst aus 'stand' (Braut Stand), dann aus Vorname
+        sex_raw = self._clean(record.get('stand', '') or record.get('braeutigam_stand', ''))
+        if sex_raw.upper() in ('M', 'F'):
+            sex = sex_raw.upper()
+        else:
+            sex = self._determine_sex_from_vorname(taeufl_vorname)
+
+        # Datumsformate (DD.MM.YYYY oder YYYY.MM.DD) → GEDCOM
+        geb_gedcom = self._format_gedcom_date(datum_geburt_raw)
+        tauf_gedcom = self._format_gedcom_date(taufdatum_raw)
+
+        # Citation-Daten
+        erkannter_text = self._clean(record.get('erkannter_text', ''))
+        dateiname = self._clean(record.get('dateiname', ''))
+        dateipfad = self._clean(record.get('dateipfad', ''))
+        ereignis_typ = self._clean(record.get('ereignis_typ', ''))
+        jahr = record.get('jahr')
+        seite = self._clean(record.get('seite', ''))
+        kirchenbuchtext = self._clean(record.get('kirchenbuchtext', ''))
+
+        # Primärquelle (Karteikarte)
+        source_name = self._resolve_source_name(dateiname, record.get('iso_datum', ''))
+        source_id = self._get_source_id(source_name)
+
+        # Zweite Quelle (Kirchenbuch)
+        nummer = self._extract_nummer_from_text(erkannter_text)
+        second_source_id = None
+        second_page_info = None
+        second_note_id = None
+        second_obje_ids = []
+        kb_image = None
+        if jahr and seite:
+            second_source_name = self._find_kirchenbuch_source(ereignis_typ, jahr, seite)
+            if second_source_name:
+                second_source_id = self._get_source_id(second_source_name)
+                kb_image = self._get_kirchenbuch_image_path(second_source_name, seite)
+                second_page_info = self._format_second_page_info(seite, nummer, kb_image)
+                if kirchenbuchtext:
+                    second_note_id = self._add_note("Kirchenbuchabschrift", kirchenbuchtext)
+                if kb_image:
+                    second_obje_ids.append(self._add_obje(kb_image))
+
+        # PAGE für Karteikarte: Seite/Nr./Bild-Format (Kirchenbuch-Referenz)
+        page_info = self._format_second_page_info(seite, nummer, dateipfad) if seite else self._format_page_number(dateiname)
+
+        obje_ids = []
+        if dateipfad:
+            obje_ids.append(self._add_obje(dateipfad))
+
+        note_id = None
+        if erkannter_text:
+            note_id = self._add_note("Abschrift Karteikarte", self._clean_note_text(erkannter_text))
+
+        # --- Personen anlegen ---
+        # Täufling
+        kind_id = self._get_person_id(taeufl_vorname, nachname, "Täufling", sex=sex)
+        # Vater
+        vater_id = self._get_person_id(vater_vorname, nachname, "Vater", sex='M') if vater_vorname else None
+        # Mutter (Nachname unbekannt → leer lassen)
+        mutter_id = self._get_person_id(mutter_vorname, '', "Mutter", sex='F') if mutter_vorname else None
+
+        if not kind_id:
+            return []
+
+        # Eltern-Familie anlegen
+        eltern_familie_id = None
+        if vater_id or mutter_id:
+            eltern_familie_id = self._get_family_id()
+            if vater_id:
+                self._person_families.setdefault(vater_id, []).append(eltern_familie_id)
+            if mutter_id:
+                self._person_families.setdefault(mutter_id, []).append(eltern_familie_id)
+            self._person_child_families[kind_id] = eltern_familie_id
+
+        # Personen registrieren
+        self._register_person(kind_id, taeufl_vorname, nachname)
+        if vater_id:
+            self._register_person(vater_id, vater_vorname, nachname)
+        if mutter_id:
+            self._register_person(mutter_id, mutter_vorname, '')
+
+        # BIRT-Event für Täufling
+        if geb_gedcom:
+            birt_buf = StringIO()
+            birt_buf.write("1 BIRT\n")
+            birt_buf.write(f"2 DATE {geb_gedcom}\n")
+            if ort:
+                birt_buf.write(f"2 PLAC {ort}\n")
+            # TNG: NOTE vor SOUR
+            if self._dialect == 'TNG' and note_id:
+                self._write_inline_note(birt_buf, note_id, level=2)
+            birt_buf.write(f"2 SOUR {source_id}\n")
+            birt_buf.write("3 DATA\n")
+            birt_buf.write(f"4 DATE {geb_gedcom}\n")
+            if page_info:
+                birt_buf.write(f"3 PAGE {page_info}\n")
+            birt_buf.write("3 QUAY 3\n")
+            if self._dialect == 'GRAMPS':
+                if note_id:
+                    birt_buf.write(f"3 NOTE {note_id}\n")
+                for oid in obje_ids:
+                    birt_buf.write(f"3 OBJE {oid}\n")
+            if self._dialect == 'TNG':
+                for oid in obje_ids:
+                    birt_buf.write(f"2 OBJE {oid}\n")
+            if second_source_id:
+                if self._dialect == 'TNG' and second_note_id:
+                    self._write_inline_note(birt_buf, second_note_id, level=2)
+                birt_buf.write(f"2 SOUR {second_source_id}\n")
+                birt_buf.write("3 DATA\n")
+                birt_buf.write(f"4 DATE {geb_gedcom}\n")
+                if second_page_info:
+                    birt_buf.write(f"3 PAGE {second_page_info}\n")
+                birt_buf.write("3 QUAY 3\n")
+                if self._dialect == 'GRAMPS':
+                    if second_note_id:
+                        birt_buf.write(f"3 NOTE {second_note_id}\n")
+                    for oid in second_obje_ids:
+                        birt_buf.write(f"3 OBJE {oid}\n")
+                if self._dialect == 'TNG':
+                    for oid in second_obje_ids:
+                        birt_buf.write(f"2 OBJE {oid}\n")
+            self._add_person_event(kind_id, birt_buf.getvalue())
+
+        # TNG: Approximiertes BIRT aus Taufdatum, falls kein Geburtsdatum vorhanden
+        if self._dialect == 'TNG' and not geb_gedcom and tauf_gedcom:
+            approx_birt_buf = StringIO()
+            approx_birt_buf.write("1 BIRT\n")
+            approx_birt_buf.write(f"2 DATE ABT {tauf_gedcom}\n")
+            approx_birt_buf.write(f"2 PLAC {ort}\n")
+            approx_birt_buf.write("2 NOTE Geschätzt aus Taufdatum\n")
+            self._add_person_event(kind_id, approx_birt_buf.getvalue())
+
+        # CHR-Event für Täufling
+        if tauf_gedcom:
+            chr_buf = StringIO()
+            self._write_chr_event(chr_buf, tauf_gedcom, ort,
+                                  source_id, note_id, obje_ids, page_info,
+                                  second_source_id, second_page_info, second_note_id, second_obje_ids)
+            self._add_person_event(kind_id, chr_buf.getvalue())
+
+        # Eltern-FAM-Block
+        if eltern_familie_id:
+            fam_buf = StringIO()
+            fam_buf.write(f"0 {eltern_familie_id} FAM\n")
+            if vater_id:
+                fam_buf.write(f"1 HUSB {vater_id}\n")
+            if mutter_id:
+                fam_buf.write(f"1 WIFE {mutter_id}\n")
+            fam_buf.write(f"1 CHIL {kind_id}\n")
+            self._add_family_record(eltern_familie_id, fam_buf.getvalue())
+
+        return [kind_id] + ([vater_id] if vater_id else []) + ([mutter_id] if mutter_id else [])
+
     def export_to_gedcom(self, output_file: str, filter_params: Optional[dict] = None) -> int:
         """
         Exportiert die Datenbank als GEDCOM-Datei.
@@ -1483,12 +1755,15 @@ class GedcomExporter:
             exported_count = 0
             for record in records:
                 ereignis_typ = self._clean(record.get('ereignis_typ', ''))
-                
+
                 if 'heirat' in ereignis_typ.lower() or '∞' in ereignis_typ:
                     self._process_marriage_record(record)
                     exported_count += 1
                 elif 'begr' in ereignis_typ.lower() or 'sb' in ereignis_typ.lower():
                     self._process_burial_record(record)
+                    exported_count += 1
+                elif 'tauf' in ereignis_typ.lower() or 'gb' in ereignis_typ.lower():
+                    self._process_baptism_record(record)
                     exported_count += 1
 
             # 3. Strikte Reihenfolge: erst alle INDI, dann alle FAM

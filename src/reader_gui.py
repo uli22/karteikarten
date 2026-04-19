@@ -19,6 +19,7 @@ from PIL import ImageTk
 from .config import bootstrap_config, get_config, resolve_config_path
 from .database import KarteikartenDB
 from .extraction_lists import get_sources_with_adjusted_paths
+from .extractor import extract_kirchenbuch_titel
 from .gedcom_exporter import GedcomExporter
 from .online_sync import OnlineSyncService
 
@@ -136,7 +137,7 @@ class KarteikartenReader:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikarten – Leser",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.4.0").pack(padx=30)
+        tk.Label(win, text="Version 0.4.1").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
@@ -192,14 +193,24 @@ class KarteikartenReader:
         filter_row2.pack(fill=tk.X, pady=(0, 5))
 
         ttk.Label(filter_row2, text="Text:").pack(side=tk.LEFT, padx=5)
-        self.name_search = ttk.Entry(filter_row2, width=30)
+        self.name_search = ttk.Entry(filter_row2, width=20)
         self.name_search.pack(side=tk.LEFT, padx=5)
         self.name_search.bind("<Return>", lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Partner Vorname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.partner_vorname_search = ttk.Entry(filter_row2, width=16)
+        self.partner_vorname_search.pack(side=tk.LEFT, padx=5)
+        self.partner_vorname_search.bind("<Return>", lambda e: self._refresh_db_list())
 
         ttk.Label(filter_row2, text="Nachname:").pack(side=tk.LEFT, padx=(10, 5))
         self.nachname_search = ttk.Entry(filter_row2, width=16)
         self.nachname_search.pack(side=tk.LEFT, padx=5)
         self.nachname_search.bind("<Return>", lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Braut Vorname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.braut_vorname_search = ttk.Entry(filter_row2, width=16)
+        self.braut_vorname_search.pack(side=tk.LEFT, padx=5)
+        self.braut_vorname_search.bind("<Return>", lambda e: self._refresh_db_list())
 
         ttk.Label(filter_row2, text="Braut Nachname:").pack(side=tk.LEFT, padx=(10, 5))
         self.braut_nachname_search = ttk.Entry(filter_row2, width=16)
@@ -294,7 +305,8 @@ class KarteikartenReader:
         self.tree_menu.add_command(label="Karteikarte anzeigen", command=self._show_selected_card_image)
         self.tree_menu.add_command(label="Kirchenbuch anzeigen", command=self._show_selected_kirchenbuch)
         self.tree_menu.add_command(label="Text anzeigen", command=self._show_selected_text)
-        self.tree_menu.add_command(label="GEDCOM exportieren (Auswahl)", command=self._export_gedcom_selected_from_context)
+        self.tree_menu.add_command(label="GEDCOM (GRAMPS) exportieren (Auswahl)", command=self._export_gedcom_selected_from_context)
+        self.tree_menu.add_command(label="GEDCOM (TNG) exportieren (Auswahl)", command=self._export_gedcom_tng_selected_from_context)
         self.tree_menu.add_command(label="Auswahl kopieren", command=self._copy_selected_rows_to_clipboard)
         self.tree.bind("<Button-3>", self._show_tree_menu)
 
@@ -580,6 +592,8 @@ class KarteikartenReader:
             kirchenbuch_filter = self.kirchenbuch_filter.get()
             name_search = self.name_search.get().strip()
             nachname_search = self.nachname_search.get().strip()
+            partner_vorname_search = self.partner_vorname_search.get().strip()
+            braut_vorname_search = self.braut_vorname_search.get().strip()
             braut_nachname_search = self.braut_nachname_search.get().strip()
 
             query = (
@@ -619,6 +633,14 @@ class KarteikartenReader:
                 query += " AND nachname LIKE ?"
                 params.append(f"%{nachname_search}%")
 
+            if partner_vorname_search:
+                query += " AND vorname LIKE ?"
+                params.append(f"%{partner_vorname_search}%")
+
+            if braut_vorname_search:
+                query += " AND partner LIKE ?"
+                params.append(f"%{braut_vorname_search}%")
+
             if braut_nachname_search:
                 query += " AND braut_nachname LIKE ?"
                 params.append(f"%{braut_nachname_search}%")
@@ -650,7 +672,7 @@ class KarteikartenReader:
             if kirchenbuch_filter and kirchenbuch_filter != "Alle":
                 rows = [
                     row for row in rows
-                    if self._extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
+                    if extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
                 ]
 
             for row in rows:
@@ -699,7 +721,7 @@ class KarteikartenReader:
             kb_values = sorted({
                 titel
                 for (dateiname,) in cursor.fetchall()
-                for titel in [self._extract_kirchenbuch_titel(dateiname)]
+                for titel in [extract_kirchenbuch_titel(dateiname)]
                 if titel
             })
             current_kb = self.kirchenbuch_filter.get()
@@ -713,40 +735,15 @@ class KarteikartenReader:
             messagebox.showerror("Fehler", f"Fehler beim Laden der Daten:\n{str(e)}")
 
     def _is_valid_date(self, datum: str, jahr) -> bool:
-        if not datum:
-            return True
-        if jahr is not None:
-            try:
-                if int(jahr) < 1500 or int(jahr) > 1754:
-                    return False
-            except (ValueError, TypeError):
-                pass
-        match = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", str(datum))
-        if not match:
-            return False
-        tag_str, monat_str, jahr_str = match.groups()
+        from .extractor import is_valid_date
         try:
-            tag = int(tag_str)
-            monat = int(monat_str)
-            j = int(jahr_str)
-            if j < 1500 or j > 1754:
-                return False
-            if monat < 1 or monat > 12:
-                return False
-            if tag != 0 and (tag < 1 or tag > 31):
-                return False
-            return True
+            jahr_int = int(jahr) if jahr is not None else None
         except (ValueError, TypeError):
-            return False
+            jahr_int = None
+        return is_valid_date(datum, jahr_int)
 
     def _extract_kirchenbuch_titel(self, dateiname: str) -> str:
-        """Extrahiert 'Hb 1695-1718' aus Dateinamen wie '3282 Hb 1717 - 1695-1718 - F....jpg'."""
-        if not dateiname:
-            return ""
-        match = re.search(r"\b([A-Z][a-z])\s+\d{4}\s+-\s*(\d{4}-\d{4})", str(dateiname))
-        if not match:
-            return ""
-        return f"{match.group(1)} {match.group(2)}"
+        return extract_kirchenbuch_titel(dateiname)
 
     # ------------------------------------------------------------------
     # Filter-Aktionen
@@ -760,6 +757,8 @@ class KarteikartenReader:
         self.kirchenbuch_filter.current(0)
         self.name_search.delete(0, tk.END)
         self.nachname_search.delete(0, tk.END)
+        self.partner_vorname_search.delete(0, tk.END)
+        self.braut_vorname_search.delete(0, tk.END)
         self.braut_nachname_search.delete(0, tk.END)
         self._refresh_db_list()
 
@@ -1358,7 +1357,7 @@ class KarteikartenReader:
         txt_kb.config(state=tk.DISABLED)
 
     def _export_gedcom_selected_from_context(self):
-        """Exportiert die ausgewählten Datensätze aus dem Kontextmenü als GEDCOM."""
+        """Exportiert die ausgewählten Datensätze aus dem Kontextmenü als GEDCOM (GRAMPS)."""
         selection = self.tree.selection()
         if not selection:
             messagebox.showwarning("Keine Auswahl", "Bitte wählen Sie mindestens einen Datensatz aus.")
@@ -1366,7 +1365,7 @@ class KarteikartenReader:
 
         filepath = filedialog.asksaveasfilename(
             defaultextension=".ged",
-            initialfile="karteikarten_export_auswahl.ged",
+            initialfile="karteikarten_export_auswahl_gra.ged",
             filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")],
         )
         if not filepath:
@@ -1392,6 +1391,38 @@ class KarteikartenReader:
             messagebox.showwarning("Keine Daten", str(e))
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export:\n{str(e)}")
+
+    def _export_gedcom_tng_selected_from_context(self):
+        """Exportiert die ausgewählten Datensätze aus dem Kontextmenü als GEDCOM (TNG)."""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Keine Auswahl", "Bitte wählen Sie mindestens einen Datensatz aus.")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".ged",
+            initialfile="karteikarten_export_auswahl_tng.ged",
+            filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")],
+        )
+        if not filepath:
+            return
+
+        try:
+            exporter = GedcomExporter(self.db.conn, dialect='TNG')
+            id_list = [self.tree.item(item)["values"][0] for item in selection]
+            exported_count = exporter.export_to_gedcom(filepath, {"id_list": id_list})
+
+            messagebox.showinfo(
+                "Erfolg",
+                f"GEDCOM-Export erfolgreich!\n\n"
+                f"Datei: {Path(filepath).name}\n"
+                f"Exportierte Datensätze (Auswahl): {exported_count}\n"
+                f"Format: TNG-Dialekt",
+            )
+        except ValueError as e:
+            messagebox.showwarning("Keine Daten", str(e))
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export (TNG):\n{str(e)}")
 
     def _copy_selected_rows_to_clipboard(self):
         selection = self.tree.selection()

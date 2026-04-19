@@ -1308,3 +1308,256 @@ def extract_burial_fields(text: str) -> dict:
     result['geb_jahr_gesch'] = geb_jahr_gesch
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Taufen-Extraktion
+# ---------------------------------------------------------------------------
+
+# Historische Monatsnamen → Monatsnummer
+_MONAT_MAP: dict[str, int] = {
+    'jan': 1, 'januar': 1, 'januarii': 1, 'januarij': 1, 'january': 1,
+    'feb': 2, 'februar': 2, 'februarii': 2, 'februarij': 2, 'february': 2,
+    'mer': 3, 'mertz': 3, 'mart': 3, 'martii': 3, 'martij': 3, 'march': 3, 'märz': 3,
+    'apr': 4, 'april': 4, 'aprilis': 4,
+    'mai': 5, 'may': 5, 'maii': 5, 'maij': 5,
+    'jun': 6, 'juni': 6, 'junii': 6, 'junij': 6, 'june': 6,
+    'jul': 7, 'juli': 7, 'julii': 7, 'julij': 7, 'july': 7,
+    'aug': 8, 'august': 8, 'augusti': 8, 'augustij': 8,
+    'sep': 9, 'sept': 9, 'september': 9, 'septembris': 9, 'septembr': 9, '7bris': 9,
+    'oct': 10, 'okt': 10, 'october': 10, 'oktober': 10, 'octobris': 10, 'octobr': 10, '8bris': 10,
+    'nov': 11, 'november': 11, 'novembris': 11, 'novemb': 11, 'novembr': 11, '9bris': 11,
+    'dec': 12, 'dez': 12, 'december': 12, 'dezember': 12, 'decembris': 12, 'decembr': 12, 'xbris': 12,
+}
+
+# "huius" (= dieses Monats) – Taufdatum übernimmt Geburtsmonat
+_HUIUS_TOKENS = frozenset({'hs', 'h', 'huj', 'huius', 'hujus', 'ejusdem', 'ej', 'eodem', 'eod'})
+
+
+def _parse_historical_date(day_str: str, month_str: str, year_str: Optional[str], base_year: Optional[int]) -> Optional[str]:
+    """Konvertiert historisches Datum (DD. MONAT [Ao YY]) → DD.MM.YYYY."""
+    try:
+        day = int(day_str)
+    except (ValueError, TypeError):
+        day = 0
+
+    month_key = re.sub(r'[^a-z0-9]', '', (month_str or '').lower())
+    month = _MONAT_MAP.get(month_key, 0)
+
+    if year_str:
+        try:
+            yr = int(year_str)
+            if yr < 100 and base_year:
+                century = (base_year // 100) * 100
+                year = century + yr
+                if abs(year - base_year) > 10:
+                    year = base_year
+            else:
+                year = yr
+        except (ValueError, TypeError):
+            year = base_year
+    elif base_year:
+        year = base_year
+    else:
+        return None
+
+    if month == 0:
+        return f"00.00.{year}" if year else None
+    return f"{day:02d}.{month:02d}.{year}"
+
+
+def extract_baptism_fields(text: str) -> dict:
+    """
+    Extrahiert Felder aus einem Taufeintrag des Formats:
+      ev. Kb. Wetzlar * YYYY.MM.DD p. X Nr. Y
+      [Vater-VN] [Vater-NN] mit [Mutter-VN] seiner ehel. hausfr[au].
+      ein[e]. Son|Tochter * DD. MONAT Ao YY, ~ DD. MONAT [Ao YY]
+      Gev[atter] ... [Täufling-Vorname(n)]
+
+    Feld-Mapping:
+        vorname        – Täufling-Vorname(n)
+        nachname       – Vater-Nachname
+        partner        – Vater-Vorname
+        mutter_vorname – Mutter-Vorname
+        datum_geburt   – Geburtsdatum (TT.MM.JJJJ)
+        todestag       – Taufdatum   (TT.MM.JJJJ)
+        seite, nummer
+    """
+    result: dict = {
+        'vorname': None,
+        'nachname': None,
+        'partner': None,
+        'mutter_vorname': None,
+        'datum_geburt': None,
+        'todestag': None,
+        'seite': None,
+        'nummer': None,
+    }
+
+    # --- 1. Zitation parsen ---
+    zitation_pattern = (
+        r"^\s*ev\.?\s*Kb\.?\s*\w+\s*\*\s*"
+        r"(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?\s*"
+        r"[Pp]\.?\s*(\d+)\.?\s*,?\s*Nr\.?\s*(\d+)\.?\s*"
+    )
+    m = re.match(zitation_pattern, text, re.IGNORECASE)
+    if m:
+        jahr = int(m.group(1))
+        result['seite'] = int(m.group(4))
+        result['nummer'] = int(m.group(5))
+        after_zitation = text[m.end():].strip()
+    else:
+        after_zitation = text.strip()
+        yr_match = re.search(r'\b(1[456]\d{2})\b', text)
+        jahr = int(yr_match.group(1)) if yr_match else None
+
+    # Annotationen [NEU], [?] etc. entfernen
+    after_zitation = re.sub(r'\[[^\]]*\]', '', after_zitation).strip()
+
+    # --- 2. Vater-Block und Mutter-Vorname ---
+    # Unterstützte Trennwörter: "mit", "und ... eheleuten" und "und seiner Ehel. hausfrawen"
+    trenn_m = re.search(r'\bmit\b', after_zitation, re.IGNORECASE)
+    # Variante "und [Mutter-VN(s)] eheleuten/eheleute"
+    und_ehe_m = re.search(
+        r'\bund\b\s+(\S+)\s+eheleut(?:en|e)?\b',
+        after_zitation, re.IGNORECASE
+    )
+    # Variante "und seiner/ihrer Ehel. hausfr[au/awen] [Mutter-VN]"
+    und_hausfr_m = re.search(
+        r'\bund\s+sein(?:er?)?\s+[Ee]hel[a-z\.]*\s+[Hh]ausfr[a-zäöü\.]*\s+(\S+)',
+        after_zitation, re.IGNORECASE
+    )
+
+    if trenn_m or und_ehe_m or und_hausfr_m:
+        if trenn_m:
+            vater_block = after_zitation[:trenn_m.start()].strip()
+            after_trenn = after_zitation[trenn_m.end():].strip()
+        elif und_ehe_m:
+            # "und [Name] eheleuten"-Format: Vater steht vor dem "und"
+            vater_block = after_zitation[:und_ehe_m.start()].strip()
+            after_trenn = after_zitation[und_ehe_m.end():].strip()
+        else:
+            # "und seiner Ehel. hausfrawen"-Format: Vater steht vor dem "und"
+            vater_block = after_zitation[:und_hausfr_m.start()].strip()
+            after_trenn = after_zitation[und_hausfr_m.end():].strip()
+
+        # Vater: Anreden überspringen → VN + NN
+        vater_tokens = [t for t in re.split(r'[\s,;.]+', vater_block) if t]
+        skip = {name_token_key(a) for a in ANREDEN} | {'hr', 'h', 'm', 'sr'}
+        vater_tokens = [t for t in vater_tokens if name_token_key(t) not in skip]
+        if vater_tokens:
+            result['partner'] = vater_tokens[0]
+        if len(vater_tokens) >= 2:
+            result['nachname'] = vater_tokens[1]
+
+        if und_ehe_m and not trenn_m:
+            # Mutter-Vorname direkt aus der "und [Name(s)] eheleuten"-Gruppe
+            roh = und_ehe_m.group(1).rstrip('s')  # Genitiv-s entfernen
+            result['mutter_vorname'] = roh if roh else None
+        elif und_hausfr_m and not trenn_m:
+            # Mutter-Vorname direkt nach "Ehel. hausfrawen"
+            result['mutter_vorname'] = und_hausfr_m.group(1).strip() or None
+        else:
+            # Variante A: "mit [Name] seiner ehel."
+            mut_a = re.search(
+                r'^((?:[A-ZÄÖÜ][a-zäöüß]+\s+){0,2}[A-ZÄÖÜ][a-zäöüß]+)\s+sein(?:er?)?\s',
+                after_trenn, re.IGNORECASE
+            )
+            # Variante B: "seiner ehel. Hausfr... [Name]"
+            mut_b = re.search(
+                r'sein(?:er?)?\s+ehel[a-zä\.]*\s+[Hh]ausfr[a-zäöü\.]*\s*'
+                r'((?:[A-ZÄÖÜ][a-zäöüß]+\s+){0,1}[A-ZÄÖÜ][a-zäöüß]+)',
+                after_trenn, re.IGNORECASE
+            )
+            if mut_a:
+                raw = mut_a.group(1).strip()
+                parts = [p for p in raw.split() if name_token_key(p) not in {name_token_key(w) for w in IGNORIERE_WOERTER}]
+                result['mutter_vorname'] = ' '.join(parts) if parts else None
+            elif mut_b:
+                result['mutter_vorname'] = mut_b.group(1).strip()
+            else:
+                # Fallback: erster großgeschriebener Token
+                fb_tokens = [t for t in re.split(r'[\s,;.]+', after_trenn) if t]
+                for fb in fb_tokens:
+                    if fb[0].isupper() and name_token_key(fb) not in {name_token_key(w) for w in IGNORIERE_WOERTER}:
+                        result['mutter_vorname'] = fb
+                        break
+
+    # --- 3. Geschlecht des Kindes ---
+    sohn_re = re.compile(r'\bein(?:en?)?\s*\.?\s*So[hn]n?\b', re.IGNORECASE)
+    tochter_re = re.compile(r'\bein(?:e)?\s*\.?\s*T[oö]chter(?:lein)?\b', re.IGNORECASE)
+    if sohn_re.search(after_zitation):
+        geschlecht = 'm'
+    elif tochter_re.search(after_zitation):
+        geschlecht = 'f'
+    else:
+        geschlecht = 'unknown'
+
+    # --- 4. Geburtsdatum: * DD. MONAT [Ao YY] ---
+    geb_re = re.compile(
+        r'\*\s*(\d{1,2})\.?\s*([A-Za-zä]+)\.?\s*(?:Ao?\.?\s*(\d{2,4}))?',
+        re.IGNORECASE
+    )
+    for gm in geb_re.finditer(after_zitation):
+        d = _parse_historical_date(gm.group(1), gm.group(2), gm.group(3), jahr)
+        if d:
+            result['datum_geburt'] = d
+            break
+
+    # --- 5. Taufdatum: ~ DD. MONAT [Ao YY] ---
+    tauf_re = re.compile(
+        r'~\s*(\d{1,2})\.?\s*([A-Za-zä]+)\.?\s*(?:Ao?\.?\s*(\d{2,4}))?',
+        re.IGNORECASE
+    )
+    tm = tauf_re.search(after_zitation)
+    if tm:
+        monat_token = re.sub(r'[^a-z]', '', tm.group(2).lower())
+        if monat_token in _HUIUS_TOKENS:
+            # "huius"/"hs" = dieses Monats → Monat aus Geburtsdatum übernehmen
+            geb_monat = None
+            if result.get('datum_geburt'):
+                gm2 = re.match(r'(\d{2})\.(\d{2})\.(\d{4})', result['datum_geburt'])
+                if gm2:
+                    geb_monat = int(gm2.group(2))
+            if geb_monat:
+                try:
+                    tauf_tag = int(tm.group(1))
+                    result['todestag'] = f"{tauf_tag:02d}.{geb_monat:02d}.{jahr}"
+                except (ValueError, TypeError):
+                    pass
+        else:
+            d = _parse_historical_date(tm.group(1), tm.group(2), tm.group(3), jahr)
+            if d:
+                result['todestag'] = d
+
+    # --- 6. Täufling-Vorname: letzte bekannte Vornamen am Textende ---
+    body_clean = re.sub(r'[,;]+', ' ', after_zitation)
+    # Annotationen wie [NEU] bereits entfernt (Schritt 0), aber sicherheitshalber nochmals
+    end_tokens = [t.rstrip('.-') for t in body_clean.split() if re.sub(r'[^a-zäöüß]', '', t.lower())]
+
+    all_vornamen_keys = {name_token_key(v) for v in MAENNLICHE_VORNAMEN} | \
+                        {name_token_key(v) for v in WEIBLICHE_VORNAMEN}
+
+    ignore_suffixes = {name_token_key(w) for w in IGNORIERE_WOERTER}
+
+    child_parts: list[str] = []
+    for token in reversed(end_tokens):
+        key = name_token_key(token)
+        if not key or key in ignore_suffixes:
+            continue  # Stopwort / Satzzeichen überspringen, nicht abbrechen
+        if key in all_vornamen_keys:
+            child_parts.insert(0, token)
+        else:
+            break  # Erstes unbekanntes Nicht-Stopwort → Ende der Namensliste
+
+    if child_parts:
+        result['vorname'] = expand_abbreviated_first_names(
+            ' '.join(child_parts),
+            gender=geschlecht
+        )
+
+    # --- 7. Abkürzungen expandieren ---
+    result['partner'] = expand_abbreviated_first_names(result.get('partner'), gender='male')
+    result['mutter_vorname'] = expand_abbreviated_first_names(result.get('mutter_vorname'), gender='female')
+
+    return result
