@@ -300,7 +300,95 @@ karteikarten.db
 
 ---
 
-## 📞 Weitere Informationen
+## � XLSX-Import (Taufen-Karteikarten aus vorhandener Erfassung)
+
+Mit dem XLSX-Import können bereits erfasste Kirchenbuch-Daten (z.B. aus einer Excel-Tabelle)
+direkt in die Datenbank übernommen werden, ohne dass eine OCR-Erkennung notwendig ist.
+
+### Voraussetzungen für die XLSX-Datei
+
+Die Datei muss in der ersten Zeile folgende Spaltenköpfe enthalten (exakte Schreibweise):
+
+| Spalte | Inhalt |
+|--------|--------|
+| `Karteikarte` | Dateiname des Karteikarten-Bildes (Schlüsselspalte!) |
+| `Jahr` | Taufjahr |
+| `Datum Taufe` | Taufdatum (DD.MM.YYYY) |
+| `Datum Geburt` | Geburtsdatum (DD.MM.YYYY, optional wenn Taufdatum vorhanden) |
+| `Seite` | Seitenzahl im Kirchenbuch |
+| `Nummer` | Laufende Nummer auf der Seite |
+| `Karteikartentext` | Inhalt der Karteikarte (OCR-Text) |
+| `Vorname Täufling` | Vorname des Täuflings |
+| `Klarname` | Nachname (= Vatersnachname) |
+| `Vorname Vater` | Vorname des Vaters |
+| `Geschlecht Täufling` | `m` oder `w` → wird zu `Sohn`/`Tochter` |
+| `Kirchenbucheintrag` | Transkription des Kirchenbucheintrags |
+| `Vorname Mutter` | Vorname der Mutter (optional) |
+
+### Schritt 1 – Karteikarten ohne OCR in die Datenbank registrieren
+
+Bevor der XLSX-Import laufen kann, müssen die Bilddateien der Karteikarten in der Datenbank
+bekannt sein. Falls sie noch nicht per Batch-Scan erfasst wurden:
+
+1. Im Tab **📸 OCR-Erkennung** den Ordner mit den Karteikarten-Bildern öffnen
+   (**📁 Ändern** → Ordner wählen → **🔄 Neu laden**).
+2. Bildtyp-Filter setzen (z.B. **Gb** für Taufbuch-Karteikarten).
+3. **📋 Registrieren (ohne OCR)** klicken.
+4. Bestätigen – alle passenden Dateien werden als leere Einträge in die DB eingetragen.
+   Bereits vorhandene Einträge werden automatisch übersprungen.
+5. Am Ende erscheint eine Zusammenfassung: *Neu eingetragen / Bereits vorhanden / Fehler*.
+
+> **Hinweis:** Dieser Schritt ist nur einmalig nötig. Bei einem erneuten Import werden
+> bereits registrierte Dateien übersprungen (kein Überschreiben).
+
+### Schritt 2 – XLSX importieren
+
+1. Im Tab **📊 Datenbank** auf **📥 Import XLSX** klicken.
+2. XLSX-Datei auswählen und Bestätigung bestätigen.
+3. Der Abgleich erfolgt ausschließlich über den Dateinamen:  
+   XLSX-Spalte `Karteikarte` ↔ DB-Feld `dateiname`.  
+   Varianten wie `_erf.jpg`, `_erf` (ohne Endung) oder ohne Suffix werden automatisch
+   als gleich erkannt.
+4. Nach dem Import erscheint eine Zusammenfassung:
+   - **Aktualisiert** – Datensätze, bei denen ein Match gefunden wurde
+   - **Nicht gefunden** – Einträge ohne passenden DB-Datensatz
+   - **Fehler** – technische Verarbeitungsfehler
+
+### Nicht gefundene Einträge analysieren
+
+Falls Einträge nicht zugeordnet werden konnten, erscheint ein Dialog mit dem Angebot,
+die Liste der nicht gematchten Dateinamen zu öffnen. Sie wird zusätzlich gespeichert unter:
+
+```
+output/xlsx_not_found.txt
+```
+
+Typische Ursachen:
+- Bilddatei liegt im falschen Ordner oder wurde noch nicht registriert (→ Schritt 1 wiederholen)
+- Dateiname in der XLSX weicht deutlich ab (andere Nummerierung, anderes Trennzeichen)
+- Datei existiert physisch nicht auf dem Rechner
+
+### Was wird beim Import übernommen?
+
+Beim XLSX-Import werden alle Felder vollständig **überschrieben** (außer `notiz`/F-ID und `gramps`):
+
+| DB-Feld | Quelle |
+|---------|--------|
+| `kirchengemeinde` | Fest: `ev. Kb. Wetzlar` |
+| `ereignis_typ` | Fest: `Taufe` |
+| `vorname` | `Vorname Täufling` |
+| `nachname` | `Klarname` |
+| `partner` | `Vorname Vater` |
+| `mutter_vorname` | `Vorname Mutter` |
+| `stand` | `Sohn`/`Tochter` aus `Geschlecht Täufling` |
+| `todestag` | Taufdatum (YYYY.MM.DD) |
+| `datum_geburt` | Taufdatum, sonst Geburtsdatum |
+| `kirchenbuchtext` | `Kirchenbucheintrag` |
+| `erkannter_text` | `Karteikartentext` |
+
+---
+
+## �📞 Weitere Informationen
 
 - **Projekt-Dokumentation**: [README.md](README.md)
 - **Cloud Vision Setup**: [CLOUD_VISION_SETUP.md](CLOUD_VISION_SETUP.md)

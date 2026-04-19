@@ -280,7 +280,8 @@ class KarteikartenDB:
             result['ereignis_typ'] = 'Heirat'
         elif '⚰' in text or '†' in text or 'Begräbnis' in text or 'begraben' in text:
             result['ereignis_typ'] = 'Begräbnis'
-        elif '~' in text or 'Taufe' in text or 'getauft' in text:
+        elif re.search(r'ev\.?\s*Kb\.?\s*\w+\s*\*\s*\d{4}', text) or \
+                '~' in text or 'Taufe' in text or 'getauft' in text:
             result['ereignis_typ'] = 'Taufe'
         
         # Datum (YYYY.MM.DD oder YYYY-MM-DD)

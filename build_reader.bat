@@ -65,4 +65,13 @@ echo.
 echo Die EXE-Datei befindet sich in:
 echo    dist\WetzlarReader.exe
 echo.
+
+REM Begleitdateien in dist\ kopieren
+echo Kopiere Begleitdateien nach dist\ ...
+copy /Y config_reader.json   dist\
+copy /Y ocr_corrections.json dist\
+echo.
+echo Weitergabe-Paket ist fertig in dist\
+echo (config_reader.json bitte vor Weitergabe anpassen!)
+echo.
 pause
