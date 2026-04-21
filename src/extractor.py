@@ -1291,11 +1291,16 @@ def extract_burial_fields(text: str) -> dict:
     alter_jahre = None
     geb_jahr_gesch = None
 
-    alter_pattern = r'(?:aetat(?:is|isis)?|aet\.?|alters?)\s*(?:anno)?\s*(?:aetatis(?:is)?)?\s*[.:]*\s*(\d+)(?:[.,]?\s*(\d+)?)?\s*(?:jahr|ann(?:i)?|wochen|tag|monat|mens(?:is)?)?'
+    alter_pattern = r'(?:aetat(?:is|isis)?|aet\.?|alt(?:ers?)?)\b\s*(?:anno)?\s*(?:aetatis(?:is)?)?\s*[.:]*\s*(\d+)(?:[.,]?\s*(\d+)?)?\s*(jahr|ann(?:i)?|wochen?|tage?|monat(?:e)?|mens(?:is)?)?'
 
     alter_match = re.search(alter_pattern, text, re.IGNORECASE)
     if alter_match:
-        alter_jahre = int(alter_match.group(1))
+        einheit = (alter_match.group(3) or '').lower()
+        if re.match(r'wochen?|tage?|monat(?:e)?|mens(?:is)?', einheit, re.IGNORECASE):
+            # Unter 1 Jahr alt → im Todesjahr geboren
+            alter_jahre = 0
+        else:
+            alter_jahre = int(alter_match.group(1))
         if result.get('todestag') and alter_jahre is not None:
             try:
                 jahr_match = re.match(r'(\d{4})', result['todestag'])
@@ -1335,7 +1340,7 @@ _HUIUS_TOKENS = frozenset({'hs', 'h', 'huj', 'huius', 'hujus', 'ejusdem', 'ej', 
 
 
 def _parse_historical_date(day_str: str, month_str: str, year_str: Optional[str], base_year: Optional[int]) -> Optional[str]:
-    """Konvertiert historisches Datum (DD. MONAT [Ao YY]) → DD.MM.YYYY."""
+    """Konvertiert historisches Datum (DD. MONAT [Ao YY]) → YYYY.MM.DD."""
     try:
         day = int(day_str)
     except (ValueError, TypeError):
@@ -1362,8 +1367,8 @@ def _parse_historical_date(day_str: str, month_str: str, year_str: Optional[str]
         return None
 
     if month == 0:
-        return f"00.00.{year}" if year else None
-    return f"{day:02d}.{month:02d}.{year}"
+        return f"{year}.00.00" if year else None
+    return f"{year}.{month:02d}.{day:02d}"
 
 
 def extract_baptism_fields(text: str) -> dict:
@@ -1516,13 +1521,13 @@ def extract_baptism_fields(text: str) -> dict:
             # "huius"/"hs" = dieses Monats → Monat aus Geburtsdatum übernehmen
             geb_monat = None
             if result.get('datum_geburt'):
-                gm2 = re.match(r'(\d{2})\.(\d{2})\.(\d{4})', result['datum_geburt'])
+                gm2 = re.match(r'(\d{4})\.(\d{2})\.(\d{2})', result['datum_geburt'])
                 if gm2:
                     geb_monat = int(gm2.group(2))
             if geb_monat:
                 try:
                     tauf_tag = int(tm.group(1))
-                    result['todestag'] = f"{tauf_tag:02d}.{geb_monat:02d}.{jahr}"
+                    result['todestag'] = f"{jahr}.{geb_monat:02d}.{tauf_tag:02d}"
                 except (ValueError, TypeError):
                     pass
         else:

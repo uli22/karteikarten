@@ -295,7 +295,7 @@ class OnlineSyncService:
         with self._lock:
             result = self._run_cycle(db)
             self._last_result = result
-            self._last_sync_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+            self._last_sync_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
             return result
 
     def flush_once(self, db: KarteikartenDB) -> SyncResult:
@@ -316,7 +316,7 @@ class OnlineSyncService:
                     with self._lock:
                         result = self._run_cycle(thread_db)
                         self._last_result = result
-                        self._last_sync_ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M")
+                        self._last_sync_ts = datetime.now().strftime("%Y-%m-%d %H:%M")
                     if result.failed or result.errors:
                         logger.warning(
                             "Sync-Zyklus: %d gepusht, %d gepullt, %d Fehler",

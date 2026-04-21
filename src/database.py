@@ -158,6 +158,21 @@ class KarteikartenDB:
             if field not in columns:
                 cursor.execute(f"ALTER TABLE karteikarten ADD COLUMN {field} {ftype}")
 
+        # Migration: Datumfelder todestag und datum_geburt von DD.MM.YYYY → YYYY.MM.DD
+        # Erkennung: 10 Zeichen, Trennzeichen an Pos 3+6, letzter Teil 4-stellige Jahreszahl (>=1000)
+        _dd_mm_yyyy = (
+            "LENGTH({col}) = 10"
+            " AND SUBSTR({col}, 3, 1) = '.'"
+            " AND SUBSTR({col}, 6, 1) = '.'"
+            " AND CAST(SUBSTR({col}, 7, 4) AS INTEGER) >= 1000"
+        )
+        for col in ('todestag', 'datum_geburt'):
+            cursor.execute(
+                f"UPDATE karteikarten"
+                f" SET {col} = SUBSTR({col},7,4)||'.'||SUBSTR({col},4,2)||'.'||SUBSTR({col},1,2)"
+                f" WHERE {col} IS NOT NULL AND {_dd_mm_yyyy.format(col=col)}"
+            )
+
         # Backfill für bestehende Datensätze
         cursor.execute("SELECT id, global_id, version FROM karteikarten")
         for row in cursor.fetchall():
