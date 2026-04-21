@@ -625,7 +625,7 @@ class KarteikartenGUI:
             typ = "Begräbnis"
         elif "∞" in text:
             typ = "Heirat"
-        elif "Gb" in text or "gb" in text:
+        elif "*" in text or "~" in text or "Gb" in text or "gb" in text or "Taufe" in text or "taufe" in text:
             typ = "Taufe"
         
         # Extrahiere Jahr (4-stellige Zahl am Anfang der Datumsangabe)

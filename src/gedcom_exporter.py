@@ -258,8 +258,9 @@ class GedcomExporter:
         """
         note_id = self._get_note_id()
         escaped_text = self._escape_gedcom_text(text)
-        
-        # Formatiere für GEDCOM mit CONC-Zeilen
+        # Vorhandene führende/abschließende Anführungszeichen aus der DB entfernen,
+        # damit das später hinzugefügte Wrapper-Paar keine Dopplung erzeugt.
+        escaped_text = escaped_text.strip('"')
         formatted_text = f"|{title}| \"{escaped_text}\""
         self._notes[note_id] = formatted_text
         
@@ -495,11 +496,21 @@ class GedcomExporter:
         # p\.\s*\d+\s+Nr\.\s*\d+ = "p. X Nr. Y"
         # \s+ = mindestens ein Leerzeichen danach
         
-        match = re.search(r'^.*?\d{4}\.\d{1,2}\.\d{1,2}\.\s+p\.\s*\d+\s+Nr\.\s*\d+\s+(.*)$', erkannter_text, re.DOTALL)
+        match = re.search(
+            r'^.*?\d{4}\.\d{1,2}\.\d{1,2}\.?\s+p\.\s*\d+\s+Nr\.\s*[\d]+\.?\s+(.*)$',
+            erkannter_text, re.DOTALL
+        )
         if match:
-            return match.group(1).strip()
-        
-        return erkannter_text
+            # Whitespace und Zeilenumbrüche im verbleibenden Text bereinigen
+            cleaned = match.group(1).strip()
+            cleaned = re.sub(r'[\r\n]+', ' ', cleaned)
+            cleaned = re.sub(r'\s{2,}', ' ', cleaned)
+            return cleaned
+
+        # Kein Zitationsmuster gefunden: nur Whitespace bereinigen
+        result = re.sub(r'[\r\n]+', ' ', erkannter_text)
+        result = re.sub(r'\s{2,}', ' ', result)
+        return result.strip()
     
     def _get_kirchenbuch_image_path(self, source_name: str, seite: str) -> Optional[str]:
         """Sucht den Bildpfad für ein Kirchenbuch mit robusten Wildcard-Patterns (wie GUI)."""
@@ -712,14 +723,29 @@ class GedcomExporter:
         """Schreibt alle gesammelten NOTE und OBJE Einträge am Ende."""
         # NOTE-Records: nur für GRAMPS (TNG schreibt Notizen inline)
         if self._dialect == 'GRAMPS':
+            max_len = 80
+
+            def _word_wrap(text: str, width: int):
+                """Zerlegt Text in Segmente ≤ width Zeichen, bricht an Wortgrenzen um."""
+                segments = []
+                while len(text) > width:
+                    cut = text.rfind(' ', 0, width)
+                    if cut <= 0:
+                        cut = width  # kein Leerzeichen gefunden → hart schneiden
+                    segments.append(text[:cut])
+                    text = text[cut:].lstrip(' ')
+                if text:
+                    segments.append(text)
+                return segments
+
             for note_id in sorted(self._notes.keys()):
                 note_text = self._notes[note_id]
                 f.write(f"0 {note_id} NOTE")
-                if len(note_text) > 248:
-                    lines = [note_text[i:i+248] for i in range(0, len(note_text), 248)]
-                    f.write(f" {lines[0]}\n")
-                    for line in lines[1:]:
-                        f.write(f"1 CONC {line}\n")
+                if len(note_text) > max_len:
+                    segments = _word_wrap(note_text, max_len)
+                    f.write(f" {segments[0]}\n")
+                    for seg in segments[1:]:
+                        f.write(f"1 CONC {seg}\n")
                 else:
                     f.write(f" {note_text}\n")
     
@@ -1153,7 +1179,7 @@ class GedcomExporter:
         # Note hinzufügen
         note_id = None
         if erkannter_text:
-            note_id = self._add_note("Abschrift Karteikarte", erkannter_text)
+            note_id = self._add_note("Abschrift Karteikarte", self._clean_note_text(erkannter_text))
         
         # Prüfe auf Wittwer
         is_braeutigam_wittwer = self._is_wittwer(braeutigam_vater_vorname)
@@ -1514,8 +1540,8 @@ class GedcomExporter:
             nachname       → Familienname (Vater-Nachname)
             partner        → Vater-Vorname
             mutter_vorname → Mutter-Vorname
-            datum_geburt   → Geburtsdatum   (DD.MM.YYYY)
-            todestag       → Taufdatum      (DD.MM.YYYY)
+            datum_geburt   → Geburtsdatum   (YYYY.MM.DD)
+            todestag       → Taufdatum      (YYYY.MM.DD)
             ort            → Tauf- und Geburtsort
             stand          → Geschlecht des Täuflings ('M'/'F'), Fallback via Vorname
         """
