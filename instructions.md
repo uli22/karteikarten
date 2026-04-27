@@ -216,6 +216,15 @@ Für GitHub sollen diese Ordner ignoriert werden:
 - `output/`
 - `test/`
 
+### ⚠️ Git-Commits: Nur Dateien dieses Projekts
+
+**REGEL**: Beim Committen in GitHub dürfen **ausschließlich Dateien aus dem Ordner `d:\projects\Wetzlar-Erkennung\`** gestaged und committet werden.
+
+- Dateien aus anderen Projekten (z.B. `Beschluss`, `Lima`, etc.) **niemals** mit committen.
+- Andere Projekte werden nur committet, wenn deren **eigener Projektordner in VS Code geöffnet** ist.
+- Vor jedem Commit prüfen: `git status` – sind nur Wetzlar-Erkennung-Dateien aufgelistet?
+- Im Zweifel einzelne Dateien statt `git add .` verwenden.
+
 ### Ablage von Test- und Debug-Dateien
 
 Künftig sollen alle neuen Test-, Debug- und Check-Dateien im Ordner `test/` angelegt werden.

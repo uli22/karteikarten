@@ -1,13 +1,15 @@
 # Python-generated files
 __pycache__/
 *.py[oc]
+*.pyc
 build/
 dist/
 wheels/
 *.egg-info
+.mypy_cache/
 
 # Virtual environments
-.venv
+.venv/
 .venv-build/
 
 # Local/editor files
@@ -16,12 +18,56 @@ wheels/
 *.lnk
 *.bak
 
-# Runtime and local data
-output/
-test/
-credentials/
+# Databases
 *.db
+*.sqlite
+*.sqlite3
+
+# Configuration & Credentials (sensitive data)
+config.json
+config_reader.json
+credentials/
+client_secret*.json
+*.json
+
+# Data folders (input/output, personal data)
+input/
+output/
+backups/
+/test/
+
+# Image files (screenshots, temporary images)
+*.jpg
+*.jpeg
+*.png
+*.gif
+api.jpg
+online.jpg
+
+# Build/Distribution artifacts
+*.spec
+WetzlarErkennung.spec
+WetzlarReader.spec
+
+# Generated documentation/temp files
+*.txt
+!README.txt
+!readme.txt
+!Bedienung.md
+!instructions.md
 
 # OS files
 Thumbs.db
 Desktop.ini
+.DS_Store
+
+# PyInstaller
+build/
+dist/
+*.manifest
+*.spec
+
+# IDE
+.idea/
+*.swp
+*.swo

@@ -4,20 +4,24 @@ Zweite, eigenständige Anwendung - NUR LESEN, außer F-ID Bearbeitung per Kontex
 Keine Änderungen an src/gui.py oder anderen bestehenden Dateien.
 """
 
+import json
 import re
 import sys
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from PIL import Image as PILImage
 from PIL import ImageTk
 
-from .config import get_config
+from .config import bootstrap_config, get_config, resolve_config_path
 from .database import KarteikartenDB
 from .extraction_lists import get_sources_with_adjusted_paths
+from .extractor import extract_kirchenbuch_titel
 from .gedcom_exporter import GedcomExporter
+from .online_sync import OnlineSyncService
 
 
 class KarteikartenReader:
@@ -30,13 +34,38 @@ class KarteikartenReader:
         self.root.title("Wetzlar Karteikarten – Leser")
         self.root.geometry("1200x800")
 
-        # Config (dieselbe wie Hauptanwendung)
-        self.config = get_config()
+        # Eigene Reader-Konfiguration, initial aus config.json gebootstrapped.
+        reader_config_target = resolve_config_path("config_reader.json")
+        reader_config_exists = reader_config_target.exists()
+        self._reader_config_path = bootstrap_config(reader_config_target, "config.json")
+        self.config = get_config(self._reader_config_path)
+        
+        # Beim ersten Start: API-Mode mit deaktiviertem Sync, bis Benutzer API-Key eingibt
+        if not reader_config_exists:
+            reader_sync_config = {
+                "enabled": False,  # Deaktiviert bis Benutzer API-Key eingibt
+                "mode": "api",     # Reader nutzt nur API, nicht lokales MySQL
+                "source": "reader",
+                "endpoint_url": "",
+                "api_key": "",
+                "device_id": "",
+                "last_pull_cursor": "",
+                "last_pull_id": "",
+                "sync_interval_seconds": 20,
+                "batch_size": 100
+            }
+            self.config.set_online_sync(reader_sync_config)
 
         # Datenbank
         db_path = self._resolve_db_path()
         self.db = KarteikartenDB(str(db_path))
         self.active_db_path = str(Path(db_path).resolve())
+
+        # Online-Sync (startet nur, wenn enabled=True UND richtig konfiguriert)
+        self._sync_service = OnlineSyncService(config_obj=self.config)
+        if self.config.online_sync.get("enabled", False):
+            self._sync_service.start_background(self.db)
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
         # Sortierzustand
         self.sort_reverse: dict = {}
@@ -77,6 +106,13 @@ class KarteikartenReader:
     # ------------------------------------------------------------------
 
     def _create_widgets(self):
+        # Menüleiste
+        menubar = tk.Menu(self.root)
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Über…", command=self._show_about)
+        menubar.add_cascade(label="Hilfe", menu=help_menu)
+        self.root.config(menu=menubar)
+
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
 
@@ -88,6 +124,26 @@ class KarteikartenReader:
 
         self._create_db_tab(db_tab)
         self._create_settings_tab(settings_tab)
+
+    # ------------------------------------------------------------------
+    # Über-Dialog
+    # ------------------------------------------------------------------
+
+    def _show_about(self):
+        """Zeigt den 'Über'-Dialog mit Versionsnummer."""
+        win = tk.Toplevel(self.root)
+        win.title("Über Wetzlar Karteikarten – Leser")
+        win.resizable(False, False)
+        win.grab_set()
+        tk.Label(win, text="Wetzlar Karteikarten – Leser",
+                 font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
+        tk.Label(win, text="Version 0.4.2").pack(padx=30)
+        tk.Label(win, text="© 2026 – Wetzlar Projekt",
+                 foreground="gray").pack(padx=30, pady=(4, 16))
+        tk.Button(win, text="OK", width=10,
+                  command=win.destroy).pack(pady=(0, 20))
+        win.bind("<Return>", lambda _e: win.destroy())
+        win.bind("<Escape>", lambda _e: win.destroy())
 
     # ------------------------------------------------------------------
     # Datenbank-Tab
@@ -136,10 +192,30 @@ class KarteikartenReader:
         filter_row2 = ttk.Frame(filter_frame)
         filter_row2.pack(fill=tk.X, pady=(0, 5))
 
-        ttk.Label(filter_row2, text="Name/Text:").pack(side=tk.LEFT, padx=5)
-        self.name_search = ttk.Entry(filter_row2, width=30)
+        ttk.Label(filter_row2, text="Text:").pack(side=tk.LEFT, padx=5)
+        self.name_search = ttk.Entry(filter_row2, width=20)
         self.name_search.pack(side=tk.LEFT, padx=5)
         self.name_search.bind("<Return>", lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Partner Vorname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.partner_vorname_search = ttk.Entry(filter_row2, width=16)
+        self.partner_vorname_search.pack(side=tk.LEFT, padx=5)
+        self.partner_vorname_search.bind("<Return>", lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Nachname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.nachname_search = ttk.Entry(filter_row2, width=16)
+        self.nachname_search.pack(side=tk.LEFT, padx=5)
+        self.nachname_search.bind("<Return>", lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Braut Vorname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.braut_vorname_search = ttk.Entry(filter_row2, width=16)
+        self.braut_vorname_search.pack(side=tk.LEFT, padx=5)
+        self.braut_vorname_search.bind("<Return>", lambda e: self._refresh_db_list())
+
+        ttk.Label(filter_row2, text="Braut Nachname:").pack(side=tk.LEFT, padx=(10, 5))
+        self.braut_nachname_search = ttk.Entry(filter_row2, width=16)
+        self.braut_nachname_search.pack(side=tk.LEFT, padx=5)
+        self.braut_nachname_search.bind("<Return>", lambda e: self._refresh_db_list())
 
         self.regex_search_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(filter_row2, text="Regex", variable=self.regex_search_var).pack(side=tk.LEFT, padx=5)
@@ -159,6 +235,8 @@ class KarteikartenReader:
         ttk.Button(filter_row3, text="📑 Nach Seite/Nr.", command=self._sort_by_page_and_number).pack(side=tk.LEFT, padx=5)
         ttk.Button(filter_row3, text="📊 Statistik", command=self._show_statistics).pack(side=tk.LEFT, padx=5)
         ttk.Button(filter_row3, text="💾 Backup CSV", command=self._backup_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_row3, text="🔒 Full Backup", command=self._backup_full_csv).pack(side=tk.LEFT, padx=5)
+        ttk.Button(filter_row3, text="↩️ Restore", command=self._restore_full_backup).pack(side=tk.LEFT, padx=5)
 
         # === TREEVIEW ===
         tree_frame = ttk.Frame(parent)
@@ -173,7 +251,7 @@ class KarteikartenReader:
             "ID", "Jahr", "Datum", "ISO_datum", "Typ", "Seite", "Nr", "Gemeinde",
             "Vorname", "Nachname", "Partner", "Beruf", "Ort",
             "Bräutigam Vater", "Braut Vater", "Braut Nachname", "Braut Ort",
-            "Bräutigam Stand", "Braut Stand", "Todestag", "Geb.Jahr (gesch.)",
+            "Bräutigam Stand", "Braut Stand", "Mutter Vorname", "Datum Geburt", "Todestag", "Geb.Jahr (gesch.)",
             "Dateiname", "Notiz", "Gramps", "Text",
         )
         self.tree = ttk.Treeview(
@@ -199,6 +277,7 @@ class KarteikartenReader:
             "Vorname": 80, "Nachname": 80, "Partner": 100, "Beruf": 80, "Ort": 80,
             "Bräutigam Vater": 100, "Braut Vater": 100, "Braut Nachname": 100, "Braut Ort": 80,
             "Bräutigam Stand": 70, "Braut Stand": 70,
+            "Mutter Vorname": 100, "Datum Geburt": 80,
             "Todestag": 80, "Geb.Jahr (gesch.)": 60,
             "Dateiname": 80, "Notiz": 50, "Gramps": 50, "Text": 400,
         }
@@ -226,7 +305,8 @@ class KarteikartenReader:
         self.tree_menu.add_command(label="Karteikarte anzeigen", command=self._show_selected_card_image)
         self.tree_menu.add_command(label="Kirchenbuch anzeigen", command=self._show_selected_kirchenbuch)
         self.tree_menu.add_command(label="Text anzeigen", command=self._show_selected_text)
-        self.tree_menu.add_command(label="GEDCOM exportieren (Auswahl)", command=self._export_gedcom_selected_from_context)
+        self.tree_menu.add_command(label="GEDCOM (GRAMPS) exportieren (Auswahl)", command=self._export_gedcom_selected_from_context)
+        self.tree_menu.add_command(label="GEDCOM (TNG) exportieren (Auswahl)", command=self._export_gedcom_tng_selected_from_context)
         self.tree_menu.add_command(label="Auswahl kopieren", command=self._copy_selected_rows_to_clipboard)
         self.tree.bind("<Button-3>", self._show_tree_menu)
 
@@ -244,8 +324,32 @@ class KarteikartenReader:
     # ------------------------------------------------------------------
 
     def _create_settings_tab(self, parent):
-        main_frame = ttk.Frame(parent)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        outer = ttk.Frame(parent)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        main_frame = ttk.Frame(canvas)
+
+        def _on_frame_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        window_id = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+        main_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _bind_mousewheel(widget):
+            widget.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+
+        _bind_mousewheel(canvas)
+        _bind_mousewheel(main_frame)
 
         ttk.Label(main_frame, text="⚙️ Einstellungen", font=("Arial", 16, "bold")).pack(pady=(0, 20))
 
@@ -353,6 +457,126 @@ class KarteikartenReader:
             anchor=tk.W, pady=(10, 0)
         )
 
+        # === Online-Sync Einstellungen ===
+        sync_frame = ttk.LabelFrame(main_frame, text="🌐 Online-Synchronisation", padding=15)
+        sync_frame.pack(fill=tk.X, pady=(0, 20))
+
+        cfg = self.config.online_sync
+
+        self._sync_enabled_var = tk.BooleanVar(value=bool(cfg.get("enabled", False)))
+        ttk.Checkbutton(sync_frame, text="Online-Sync aktivieren", variable=self._sync_enabled_var).pack(anchor=tk.W, pady=(0, 8))
+
+        src_row = ttk.Frame(sync_frame)
+        src_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(src_row, text="Diese Instanz ist:", width=20).pack(side=tk.LEFT)
+        self._sync_source_var = tk.StringVar(value=cfg.get("source", "reader"))
+        ttk.Radiobutton(src_row, text="Erkennung", variable=self._sync_source_var, value="erkennung").pack(side=tk.LEFT, padx=4)
+        ttk.Radiobutton(src_row, text="Reader", variable=self._sync_source_var, value="reader").pack(side=tk.LEFT, padx=4)
+
+        mode_row = ttk.Frame(sync_frame)
+        mode_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(mode_row, text="Sync-Modus:", width=20).pack(side=tk.LEFT)
+        self._sync_mode_var = tk.StringVar(value=cfg.get("mode", "api"))
+        ttk.Combobox(mode_row, textvariable=self._sync_mode_var, values=["mysql", "api"], width=15, state="readonly").pack(side=tk.LEFT, padx=4)
+
+        sync_style = ttk.Style(self.root)
+        sync_style.configure("SyncInvalid.TEntry", foreground="#a00000", fieldbackground="#ffe6e6")
+
+        def _lbl_entry(frame_parent, label, var, show="", hint=""):
+            row = ttk.Frame(frame_parent)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, width=22).pack(side=tk.LEFT)
+            entry = ttk.Entry(row, textvariable=var, show=show)
+            entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            if hint:
+                ttk.Label(row, text=hint, foreground="gray", font=("Arial", 8, "italic")).pack(side=tk.LEFT, padx=(6, 0))
+            return entry
+
+        self._mysql_fields_frame = ttk.Frame(sync_frame)
+        self._mysql_fields_frame.pack(fill=tk.X)
+        ttk.Label(
+            self._mysql_fields_frame,
+            text="▸ Modus mysql: direkte Verbindung (nur VPS / lokales Netz)",
+            foreground="#666",
+            font=("Arial", 8, "italic"),
+        ).pack(anchor=tk.W, pady=(6, 2))
+
+        self._sync_host_var = tk.StringVar(value=cfg.get("db_host", ""))
+        self._sync_port_var = tk.StringVar(value=str(cfg.get("db_port", 3306)))
+        self._sync_user_var = tk.StringVar(value=cfg.get("db_user", ""))
+        self._sync_pw_var = tk.StringVar(value=cfg.get("db_password", ""))
+        self._sync_db_var = tk.StringVar(value=cfg.get("db_name", ""))
+
+        _lbl_entry(self._mysql_fields_frame, "DB-Host:", self._sync_host_var,
+                   hint="z.B. 192.168.1.10 (nur für mysql-Modus)")
+        _lbl_entry(self._mysql_fields_frame, "DB-Port:", self._sync_port_var, hint="Standard: 3306")
+        _lbl_entry(self._mysql_fields_frame, "DB-Benutzer:", self._sync_user_var)
+        _lbl_entry(self._mysql_fields_frame, "DB-Passwort:", self._sync_pw_var, show="*")
+        _lbl_entry(self._mysql_fields_frame, "DB-Name:", self._sync_db_var)
+
+        ttk.Label(
+            sync_frame,
+            text="▸ Modus api: PHP-Datei auf Webspace (z.B. Lima-City) → URL unten eintragen",
+            foreground="#0055aa",
+            font=("Arial", 8, "italic"),
+        ).pack(anchor=tk.W, pady=(10, 2))
+
+        self._sync_interval_var = tk.StringVar(value=str(cfg.get("sync_interval_seconds", 20)))
+        self._sync_endpoint_var = tk.StringVar(value=cfg.get("endpoint_url", ""))
+        self._sync_api_key_var = tk.StringVar(value=cfg.get("api_key", ""))
+
+        self._sync_endpoint_entry = _lbl_entry(
+            sync_frame,
+            "API-Endpoint:",
+            self._sync_endpoint_var,
+            hint="https://deine-domain.de/sync/lima_sync_endpoint.php",
+        )
+        self._sync_endpoint_hint_var = tk.StringVar(value="")
+        ttk.Label(sync_frame, textvariable=self._sync_endpoint_hint_var,
+                  foreground="#8a5a00", font=("Arial", 8, "italic")).pack(anchor=tk.W, padx=(160, 0), pady=(0, 2))
+        _lbl_entry(sync_frame, "API-Key:", self._sync_api_key_var, show="*", hint="wie in lima_sync_endpoint.php eingetragen")
+        _lbl_entry(sync_frame, "Intervall (Sek):", self._sync_interval_var)
+
+        def _validate_endpoint_field(*_):
+            raw_url = self._sync_endpoint_var.get().strip()
+            if not raw_url:
+                self._sync_endpoint_entry.configure(style="TEntry")
+                self._sync_endpoint_hint_var.set("")
+                return
+            normalized = self._normalize_endpoint_url(raw_url)
+            parts = urlsplit(normalized)
+            if parts.netloc:
+                self._sync_endpoint_entry.configure(style="TEntry")
+                self._sync_endpoint_hint_var.set(
+                    f"Wird als {normalized} gespeichert" if normalized != raw_url else ""
+                )
+            else:
+                self._sync_endpoint_entry.configure(style="SyncInvalid.TEntry")
+                self._sync_endpoint_hint_var.set("Ungültige URL. Beispiel: https://wze.de.cool/lima_sync_endpoint.php")
+
+        def _on_mode_change(*_):
+            if self._sync_mode_var.get() == "mysql":
+                self._mysql_fields_frame.pack(fill=tk.X, after=mode_row)
+            else:
+                self._mysql_fields_frame.pack_forget()
+
+        self._sync_mode_var.trace_add("write", _on_mode_change)
+        self._sync_endpoint_var.trace_add("write", _validate_endpoint_field)
+        _on_mode_change()
+        _validate_endpoint_field()
+
+        btn_row = ttk.Frame(sync_frame)
+        btn_row.pack(fill=tk.X, pady=(10, 0))
+        ttk.Button(btn_row, text="💾 Speichern", command=self._save_sync_settings).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🔄 Jetzt synchronisieren", command=self._sync_now_clicked).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="� Vollabgleich erzwingen", command=self._force_full_sync).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🗑️ DB löschen & neu laden", command=self._reset_and_reload_db).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🔌 Verbindung testen", command=self._test_sync_connection).pack(side=tk.LEFT)
+
+        self._sync_status_var = tk.StringVar(value="–")
+        ttk.Label(sync_frame, textvariable=self._sync_status_var, foreground="blue").pack(anchor=tk.W, pady=(6, 0))
+        self._update_sync_status()
+
     # ------------------------------------------------------------------
     # Daten laden & filtern
     # ------------------------------------------------------------------
@@ -369,12 +593,16 @@ class KarteikartenReader:
             filename_filter = self.filename_filter.get()
             kirchenbuch_filter = self.kirchenbuch_filter.get()
             name_search = self.name_search.get().strip()
+            nachname_search = self.nachname_search.get().strip()
+            partner_vorname_search = self.partner_vorname_search.get().strip()
+            braut_vorname_search = self.braut_vorname_search.get().strip()
+            braut_nachname_search = self.braut_nachname_search.get().strip()
 
             query = (
                 "SELECT id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, "
                 "vorname, nachname, partner, beruf, ort, "
                 "braeutigam_vater, braut_vater, braut_nachname, braut_ort, "
-                "braeutigam_stand, stand, todestag, geb_jahr_gesch, "
+                "braeutigam_stand, stand, mutter_vorname, datum_geburt, todestag, geb_jahr_gesch, "
                 "dateiname, notiz, erkannter_text, kirchenbuchtext, gramps "
                 "FROM karteikarten WHERE 1=1"
             )
@@ -403,6 +631,22 @@ class KarteikartenReader:
                 query += " AND LOWER(dateiname) LIKE ?"
                 params.append(f"%{filename_filter.lower()}%")
 
+            if nachname_search:
+                query += " AND nachname LIKE ?"
+                params.append(f"%{nachname_search}%")
+
+            if partner_vorname_search:
+                query += " AND vorname LIKE ?"
+                params.append(f"%{partner_vorname_search}%")
+
+            if braut_vorname_search:
+                query += " AND partner LIKE ?"
+                params.append(f"%{braut_vorname_search}%")
+
+            if braut_nachname_search:
+                query += " AND braut_nachname LIKE ?"
+                params.append(f"%{braut_nachname_search}%")
+
             regex_mode = getattr(self, "regex_search_var", None)
             if name_search:
                 if regex_mode and regex_mode.get():
@@ -425,12 +669,12 @@ class KarteikartenReader:
                     messagebox.showerror("Regex-Fehler", f"Ungültiger regulärer Ausdruck:\n{e}")
                     self.db_status_label.config(text="0 Datensätze gefunden (Regex-Fehler)")
                     return
-                rows = [row for row in rows if pattern.search(str(row[23]))]
+                rows = [row for row in rows if pattern.search(str(row[25]))]
 
             if kirchenbuch_filter and kirchenbuch_filter != "Alle":
                 rows = [
                     row for row in rows
-                    if self._extract_kirchenbuch_titel(row[21]) == kirchenbuch_filter
+                    if extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
                 ]
 
             for row in rows:
@@ -445,12 +689,13 @@ class KarteikartenReader:
                     safe(5), safe(6), safe(7), safe(8), safe(9),
                     safe(10), safe(11), safe(12), safe(13), safe(14),
                     safe(15), safe(16), safe(17), safe(18), safe(19),
-                    safe(20), safe(21), safe(22), safe(25), safe(23),
+                    safe(20), safe(21), safe(22), safe(23), safe(24),
+                    safe(27), safe(25),
                 )
 
-                notiz = safe(22)
-                kirchenbuchtext = safe(24)
-                gramps = safe(25)
+                notiz = safe(24)
+                kirchenbuchtext = safe(26)
+                gramps = safe(27)
                 jahr = safe(1)
                 datum = safe(2)
                 is_valid_date = self._is_valid_date(datum, jahr)
@@ -478,7 +723,7 @@ class KarteikartenReader:
             kb_values = sorted({
                 titel
                 for (dateiname,) in cursor.fetchall()
-                for titel in [self._extract_kirchenbuch_titel(dateiname)]
+                for titel in [extract_kirchenbuch_titel(dateiname)]
                 if titel
             })
             current_kb = self.kirchenbuch_filter.get()
@@ -492,40 +737,15 @@ class KarteikartenReader:
             messagebox.showerror("Fehler", f"Fehler beim Laden der Daten:\n{str(e)}")
 
     def _is_valid_date(self, datum: str, jahr) -> bool:
-        if not datum:
-            return True
-        if jahr is not None:
-            try:
-                if int(jahr) < 1500 or int(jahr) > 1754:
-                    return False
-            except (ValueError, TypeError):
-                pass
-        match = re.match(r"^(\d{2})\.(\d{2})\.(\d{4})$", str(datum))
-        if not match:
-            return False
-        tag_str, monat_str, jahr_str = match.groups()
+        from .extractor import is_valid_date
         try:
-            tag = int(tag_str)
-            monat = int(monat_str)
-            j = int(jahr_str)
-            if j < 1500 or j > 1754:
-                return False
-            if monat < 1 or monat > 12:
-                return False
-            if tag != 0 and (tag < 1 or tag > 31):
-                return False
-            return True
+            jahr_int = int(jahr) if jahr is not None else None
         except (ValueError, TypeError):
-            return False
+            jahr_int = None
+        return is_valid_date(datum, jahr_int)
 
     def _extract_kirchenbuch_titel(self, dateiname: str) -> str:
-        """Extrahiert 'Hb 1695-1718' aus Dateinamen wie '3282 Hb 1717 - 1695-1718 - F....jpg'."""
-        if not dateiname:
-            return ""
-        match = re.search(r"\b([A-Z][a-z])\s+\d{4}\s+-\s*(\d{4}-\d{4})", str(dateiname))
-        if not match:
-            return ""
-        return f"{match.group(1)} {match.group(2)}"
+        return extract_kirchenbuch_titel(dateiname)
 
     # ------------------------------------------------------------------
     # Filter-Aktionen
@@ -538,6 +758,10 @@ class KarteikartenReader:
         self.filename_filter.current(0)
         self.kirchenbuch_filter.current(0)
         self.name_search.delete(0, tk.END)
+        self.nachname_search.delete(0, tk.END)
+        self.partner_vorname_search.delete(0, tk.END)
+        self.braut_vorname_search.delete(0, tk.END)
+        self.braut_nachname_search.delete(0, tk.END)
         self._refresh_db_list()
 
     # ------------------------------------------------------------------
@@ -677,6 +901,73 @@ class KarteikartenReader:
         except Exception as e:
             messagebox.showerror("Fehler", f"Backup fehlgeschlagen:\n{e}")
 
+    def _backup_full_csv(self):
+        """Exportiert Karteikarten + Sync-Queue mit Datum im Dateinamen."""
+        from pathlib import Path
+
+        # Wähle Verzeichnis
+        output_dir = filedialog.askdirectory(title="Verzeichnis für Full Backup wählen")
+        if not output_dir:
+            return
+
+        try:
+            karteikarten_path, queue_path = self.db.export_full_backup(output_dir)
+            
+            # Zähle Einträge
+            import csv
+            with open(karteikarten_path, 'r', encoding='utf-8') as f:
+                rows_count = sum(1 for _ in csv.reader(f)) - 1
+            
+            with open(queue_path, 'r', encoding='utf-8') as f:
+                queue_count = sum(1 for _ in csv.reader(f)) - 1
+            
+            msg = (
+                f"Full Backup erstellt:\n\n"
+                f"Karteikarten: {rows_count} Datensätze\n"
+                f"  → {Path(karteikarten_path).name}\n\n"
+                f"Sync-Queue: {queue_count} Einträge\n"
+                f"  → {Path(queue_path).name}\n\n"
+                f"Speicherort: {output_dir}"
+            )
+            messagebox.showinfo("Full Backup erstellt", msg)
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Full Backup fehlgeschlagen:\n{e}")
+
+    def _restore_full_backup(self):
+        """Importiert Karteikarten + Sync-Queue aus Backup-CSVs."""
+        import csv
+        import os
+
+        # Ask for directory with backup files
+        backup_dir = filedialog.askdirectory(title="Backup-Verzeichnis mit CSV-Dateien wählen")
+        if not backup_dir:
+            return
+
+        # Find backup files
+        karteikarten_file = None
+        queue_file = None
+        
+        for file in os.listdir(backup_dir):
+            if '_backup_karteikarten_' in file and file.endswith('.csv'):
+                karteikarten_file = os.path.join(backup_dir, file)
+            elif '_backup_sync_queue_' in file and file.endswith('.csv'):
+                queue_file = os.path.join(backup_dir, file)
+        
+        if not karteikarten_file:
+            messagebox.showwarning("Nicht gefunden", "Zur Wiederherstellung wird _backup_karteikarten_*.csv benötigt")
+            return
+
+        # Warnung anzeigen
+        if not messagebox.askyesno("Bestätigung", 
+            "Aktuelle Daten werden mit dem Backup überschrieben!\n\nFortfahren?"):
+            return
+
+        try:
+            self.db.restore_full_backup(karteikarten_file, queue_file)
+            messagebox.showinfo("Erfolg", "Daten erfolgreich wiederhergestellt!\n\nBitte die Anwendung neu starten.")
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Wiederherstellung fehlgeschlagen:\n{e}")
+
     # ------------------------------------------------------------------
     # Statistik
     # ------------------------------------------------------------------
@@ -799,8 +1090,13 @@ class KarteikartenReader:
         def save_fid():
             new_fid = entry_var.get().strip()
             c = self.db.conn.cursor()
-            c.execute("UPDATE karteikarten SET notiz = ? WHERE id = ?", (new_fid, record_id))
+            c.execute(
+                "UPDATE karteikarten SET notiz = ?, "
+                "version = COALESCE(version, 1) + 1, sync_status = 'pending', updated_by = 'reader', "
+                "aktualisiert_am = CURRENT_TIMESTAMP WHERE id = ?",
+                (new_fid, record_id))
             self.db.conn.commit()
+            self.db.mark_record_for_sync(record_id, source='reader')
             values = list(self.tree.item(item)["values"])
             values[22] = new_fid  # Notiz-Spalte (Index 22)
             self.tree.item(item, values=values)
@@ -875,7 +1171,7 @@ class KarteikartenReader:
             typ_kuerzel = "Gb"
 
         # Passende Quelle aus den aktuell konfigurierten Quellen suchen
-        sources = get_sources_with_adjusted_paths()
+        sources = get_sources_with_adjusted_paths(self.config)
         passende_quellen = []
         for source in sources:
             if source.get("media_type") != "kirchenbuchseiten":
@@ -1063,7 +1359,7 @@ class KarteikartenReader:
         txt_kb.config(state=tk.DISABLED)
 
     def _export_gedcom_selected_from_context(self):
-        """Exportiert die ausgewählten Datensätze aus dem Kontextmenü als GEDCOM."""
+        """Exportiert die ausgewählten Datensätze aus dem Kontextmenü als GEDCOM (GRAMPS)."""
         selection = self.tree.selection()
         if not selection:
             messagebox.showwarning("Keine Auswahl", "Bitte wählen Sie mindestens einen Datensatz aus.")
@@ -1071,7 +1367,7 @@ class KarteikartenReader:
 
         filepath = filedialog.asksaveasfilename(
             defaultextension=".ged",
-            initialfile="karteikarten_export_auswahl.ged",
+            initialfile="karteikarten_export_auswahl_gra.ged",
             filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")],
         )
         if not filepath:
@@ -1097,6 +1393,38 @@ class KarteikartenReader:
             messagebox.showwarning("Keine Daten", str(e))
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export:\n{str(e)}")
+
+    def _export_gedcom_tng_selected_from_context(self):
+        """Exportiert die ausgewählten Datensätze aus dem Kontextmenü als GEDCOM (TNG)."""
+        selection = self.tree.selection()
+        if not selection:
+            messagebox.showwarning("Keine Auswahl", "Bitte wählen Sie mindestens einen Datensatz aus.")
+            return
+
+        filepath = filedialog.asksaveasfilename(
+            defaultextension=".ged",
+            initialfile="karteikarten_export_auswahl_tng.ged",
+            filetypes=[("GEDCOM-Dateien", "*.ged"), ("Alle Dateien", "*.*")],
+        )
+        if not filepath:
+            return
+
+        try:
+            exporter = GedcomExporter(self.db.conn, dialect='TNG')
+            id_list = [self.tree.item(item)["values"][0] for item in selection]
+            exported_count = exporter.export_to_gedcom(filepath, {"id_list": id_list})
+
+            messagebox.showinfo(
+                "Erfolg",
+                f"GEDCOM-Export erfolgreich!\n\n"
+                f"Datei: {Path(filepath).name}\n"
+                f"Exportierte Datensätze (Auswahl): {exported_count}\n"
+                f"Format: TNG-Dialekt",
+            )
+        except ValueError as e:
+            messagebox.showwarning("Keine Daten", str(e))
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Fehler beim GEDCOM-Export (TNG):\n{str(e)}")
 
     def _copy_selected_rows_to_clipboard(self):
         selection = self.tree.selection()
@@ -1265,7 +1593,11 @@ class KarteikartenReader:
                 return
         try:
             new_db = KarteikartenDB(str(new_path))
+            cur = new_db.conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM karteikarten")
+            new_db_rows = int(cur.fetchone()[0] or 0)
             old_conn = getattr(self.db, "conn", None)
+            self._sync_service.stop_background()
             if old_conn:
                 try:
                     old_conn.close()
@@ -1274,6 +1606,14 @@ class KarteikartenReader:
             self.db = new_db
             self.active_db_path = str(new_path.resolve())
             self.config.db_path = self.active_db_path
+            if new_db_rows == 0:
+                self.config.set_online_sync({
+                    "last_pull_cursor": "1970-01-01 00:00:00",
+                    "last_pull_id": "",
+                })
+            self._sync_service = OnlineSyncService(config_obj=self.config)
+            if self.config.online_sync.get("enabled", False):
+                self._sync_service.start_background(self.db)
             self.settings_db_path_var.set(self.active_db_path)
             if hasattr(self, "db_path_info_label"):
                 self.db_path_info_label.config(text=f"Aktive DB: {self.active_db_path}")
@@ -1282,9 +1622,382 @@ class KarteikartenReader:
         except Exception as e:
             messagebox.showerror("DB-Fehler", f"Datenbank konnte nicht geladen werden:\n{e}")
 
+    # ------------------------------------------------------------------
+    # Online-Sync Hilfsmethoden
+    # ------------------------------------------------------------------
+
+    def _normalize_endpoint_url(self, raw_url: str) -> str:
+        url = (raw_url or "").strip()
+        if not url:
+            return ""
+        if "://" not in url:
+            url = "https://" + url
+        url = url.replace("https://https://", "https://")
+        url = url.replace("http://http://", "http://")
+        url = url.replace("https://https:/", "https://")
+        url = url.replace("http://http:/", "http://")
+        if url.startswith("https:/") and not url.startswith("https://"):
+            url = "https://" + url[len("https:/"):]
+        if url.startswith("http:/") and not url.startswith("http://"):
+            url = "http://" + url[len("http:/"):]
+        parts = urlsplit(url)
+        if not parts.netloc and parts.path:
+            path = parts.path.lstrip("/")
+            if "/" in path:
+                host, rest = path.split("/", 1)
+                if "." in host:
+                    parts = parts._replace(netloc=host, path="/" + rest)
+            elif "." in path:
+                parts = parts._replace(netloc=path, path="")
+        scheme = parts.scheme or "https"
+        return urlunsplit((scheme, parts.netloc, parts.path, parts.query, parts.fragment))
+
+    def _save_sync_settings(self):
+        try:
+            port = int(self._sync_port_var.get().strip() or "3306")
+            interval = int(self._sync_interval_var.get().strip() or "20")
+        except ValueError:
+            messagebox.showwarning("Eingabefehler", "Port und Intervall müssen ganze Zahlen sein.")
+            return
+
+        endpoint_url = self._normalize_endpoint_url(self._sync_endpoint_var.get())
+        self._sync_endpoint_var.set(endpoint_url)
+        # Cursor-Werte aus der aktuell gespeicherten Datei lesen, damit ein
+        # manuell zurückgesetzter Cursor (z.B. last_pull_cursor="") nicht
+        # durch den In-Memory-Merge überschrieben wird.
+        try:
+            import json as _json
+            _file_cfg = _json.loads(Path(self._reader_config_path).read_text(encoding="utf-8"))
+            _file_sync = _file_cfg.get("online_sync", {})
+            file_last_pull_cursor = _file_sync.get("last_pull_cursor", self.config.online_sync.get("last_pull_cursor", ""))
+            file_last_pull_id = _file_sync.get("last_pull_id", self.config.online_sync.get("last_pull_id", ""))
+        except Exception:
+            file_last_pull_cursor = self.config.online_sync.get("last_pull_cursor", "")
+            file_last_pull_id = self.config.online_sync.get("last_pull_id", "")
+
+        new_cfg = {
+            "enabled": self._sync_enabled_var.get(),
+            "mode": self._sync_mode_var.get().strip() or "mysql",
+            "db_host": self._sync_host_var.get().strip(),
+            "db_port": port,
+            "db_user": self._sync_user_var.get().strip(),
+            "db_password": self._sync_pw_var.get(),
+            "db_name": self._sync_db_var.get().strip(),
+            "endpoint_url": endpoint_url,
+            "api_key": self._sync_api_key_var.get(),
+            "source": self._sync_source_var.get(),
+            "sync_interval_seconds": interval,
+            "batch_size": self.config.online_sync.get("batch_size", 100),
+            "last_pull_cursor": file_last_pull_cursor,
+            "last_pull_id": file_last_pull_id,
+        }
+        self.config.set_online_sync(new_cfg)
+        self._sync_service.stop_background()
+        self._sync_service = OnlineSyncService(config_obj=self.config)
+        if new_cfg.get("enabled", False):
+            self._sync_service.start_background(self.db)
+        self._update_sync_status()
+        messagebox.showinfo("Gespeichert", "Online-Sync-Einstellungen wurden gespeichert.")
+
+    def _update_sync_status(self):
+        if not hasattr(self, "_sync_status_var"):
+            return
+        if getattr(self, "_full_sync_running", False):
+            self.root.after(5000, self._update_sync_status)
+            return
+        try:
+            stats = self._sync_service.get_status()
+            enabled = self.config.online_sync.get("enabled", False)
+            if not enabled:
+                self._sync_status_var.set("Status: Deaktiviert")
+            else:
+                mode = stats.get("mode", self.config.online_sync.get("mode", "mysql"))
+                pending = stats.get("pending", 0)
+                last = stats.get("last_sync", "–")
+                local_records = int(stats.get("local_records", 0) or 0)
+                remote_total = stats.get("remote_total")
+                last_pulled = int(stats.get("last_pulled", 0) or 0)
+                last_pushed = int(stats.get("last_pushed", 0) or 0)
+                if isinstance(remote_total, int) and remote_total > 0:
+                    progress = min(100, int((local_records / remote_total) * 100))
+                    summary = (
+                        f"Status: Aktiv ({mode}) | Lokal/Online: {local_records}/{remote_total} ({progress}%)"
+                    )
+                else:
+                    summary = f"Status: Aktiv ({mode}) | Lokal: {local_records}"
+                summary += (
+                    f" | Letzter Download: +{last_pulled} | Letzter Upload: +{last_pushed}"
+                    f" | Warteschlange: {pending} | Letzter Sync: {last}"
+                )
+                self._sync_status_var.set(summary)
+        except Exception as exc:
+            self._sync_status_var.set(f"Status: Fehler – {exc}")
+        self.root.after(5000, self._update_sync_status)
+
+    def _sync_now_clicked(self):
+        try:
+            result = self._sync_service.sync_now(self.db)
+            total_pushed = result.pushed
+            total_pulled = result.pulled
+            total_failed = result.failed
+
+            # Bei API-Pagination kann der erste Lauf nur den Cursor vorziehen,
+            # ohne lokale Änderungen (0/0). Dann einmal automatisch nachziehen.
+            if total_failed == 0 and total_pushed == 0 and total_pulled == 0:
+                stats = self._sync_service.get_status(self.db)
+                local_records = int(stats.get("local_records", 0) or 0)
+                remote_total = stats.get("remote_total")
+                if isinstance(remote_total, int) and local_records < remote_total:
+                    second = self._sync_service.sync_now(self.db)
+                    total_pushed += second.pushed
+                    total_pulled += second.pulled
+                    total_failed += second.failed
+                    result.errors.extend(second.errors)
+
+            self._update_sync_status()
+            if total_failed or result.errors:
+                details = "\n".join(result.errors[:5]) if result.errors else "Unbekannter Fehler"
+                if len(result.errors) > 5:
+                    details += "\n..."
+                messagebox.showerror(
+                    "Sync-Fehler",
+                    f"Synchronisation fehlgeschlagen.\n"
+                    f"Gepusht: {total_pushed}, Gepullt: {total_pulled}, Fehler: {total_failed}\n\n"
+                    f"Details:\n{details}"
+                )
+                return
+            if total_pushed == 0 and total_pulled == 0:
+                messagebox.showwarning("Kein Transfer", "Synchronisation ohne Übertragung abgeschlossen.\nEs wurden keine Datensätze übertragen.")
+                return
+            messagebox.showinfo("Sync", f"Synchronisation abgeschlossen.\nGepusht: {total_pushed}, Gepullt: {total_pulled}, Fehler: {total_failed}")
+        except Exception as exc:
+            messagebox.showerror("Sync-Fehler", str(exc))
+
+    def _reset_and_reload_db(self):
+        """Leert die lokale Reader-DB und lädt alle Datensätze neu vom Server."""
+        import threading as _threading
+        db_path = self.db.db_path
+        if not messagebox.askyesno(
+            "DB leeren & neu laden",
+            f"Alle lokalen Datensätze werden gelöscht:\n{db_path}\n\n"
+            "Anschließend werden alle Datensätze neu vom Online-Server geladen.\n\n"
+            "Fortfahren?",
+            icon="warning",
+        ):
+            return
+
+        # Hintergrundthread stoppen
+        self._sync_service.stop_background()
+
+        # Tabellen direkt leeren (kein Datei-Locking-Problem auf Windows)
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute("DELETE FROM karteikarten")
+            cur.execute("DELETE FROM sync_queue")
+            self.db.conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Fehler", f"DB konnte nicht geleert werden:\n{exc}")
+            self._sync_service.start_background(self.db)
+            return
+
+        # Cursor zurücksetzen
+        self._sync_service._last_pull_cursor = "1970-01-01 00:00:00"
+        self._sync_service._last_pull_id = ""
+        self._sync_service._warned_missing_last_pull_id = False
+        self.config.set_online_sync({"last_pull_cursor": "", "last_pull_id": ""})
+
+        self._sync_status_var.set("DB geleert – lade alle Datensätze vom Server…")
+        self._full_sync_running = True
+
+        def _run():
+            import time as _time
+            thread_db = None
+            try:
+                thread_db = KarteikartenDB(db_path)
+                MAX_CYCLES = 200
+                total_new = 0
+                for i in range(MAX_CYCLES):
+                    # Lokalen Zähler VOR dem Batch ermitteln
+                    cur_before = thread_db.conn.cursor()
+                    cur_before.execute("SELECT COUNT(*) FROM karteikarten")
+                    count_before = int(cur_before.fetchone()[0] or 0)
+
+                    try:
+                        result = self._sync_service.sync_now(thread_db)
+                    except Exception as exc:
+                        self.root.after(0, lambda e=str(exc): self._sync_status_var.set(f"Fehler: {e}"))
+                        return
+
+                    cur_after = thread_db.conn.cursor()
+                    cur_after.execute("SELECT COUNT(*) FROM karteikarten")
+                    local = int(cur_after.fetchone()[0] or 0)
+                    total_new += (local - count_before)
+
+                    remote = self._sync_service._remote_total
+                    pct = f" ({int(local/remote*100)}%)" if isinstance(remote, int) and remote > 0 else ""
+                    msg = f"Neu laden… {local}/{remote or '?'}{pct} | Batch {i+1} | +{total_new} neu"
+                    self.root.after(0, lambda m=msg: self._sync_status_var.set(m))
+
+                    if result.failed:
+                        only_reset = all("Vollabgleich zurückgesetzt" in str(e) for e in result.errors)
+                        if not only_reset:
+                            self.root.after(0, lambda e=result.errors: messagebox.showerror(
+                                "Fehler", "\n".join(str(x) for x in e[:5])))
+                            return
+                    if isinstance(remote, int) and local >= remote:
+                        self.root.after(0, lambda l=local: messagebox.showinfo(
+                            "Fertig", f"Alle {l} Datensätze geladen."))
+                        self.root.after(0, self._refresh_db_list)
+                        return
+                    if result.pulled == 0 and not isinstance(remote, int):
+                        break
+                    _time.sleep(0.2)
+            finally:
+                self._full_sync_running = False
+                if thread_db is not None:
+                    try:
+                        thread_db.conn.close()
+                    except Exception:
+                        pass
+                self._sync_service.start_background(self.db)
+                self.root.after(0, self._update_sync_status)
+
+        _threading.Thread(target=_run, daemon=True, name="ResetReload").start()
+
+    def _force_full_sync(self):
+        """Setzt den Pull-Cursor forciert auf den Anfang und startet Vollabgleich in Schleife."""
+        if not messagebox.askyesno(
+            "Vollabgleich erzwingen",
+            "Den Sync-Cursor zurücksetzen und alle Datensätze vom Server neu laden?\n\n"
+            "Bestehende lokale Daten werden nicht gelöscht, nur ergänzt/aktualisiert.\n"
+            "Der Abgleich läuft im Hintergrund – der Fortschritt wird in der Statuszeile angezeigt.",
+        ):
+            return
+        # Cursor direkt im laufenden Service-Objekt zurücksetzen
+        self._sync_service._last_pull_cursor = "1970-01-01 00:00:00"
+        self._sync_service._last_pull_id = ""
+        self._sync_service._warned_missing_last_pull_id = False
+        # Auch in Config-Datei persistieren
+        self.config.set_online_sync({"last_pull_cursor": "", "last_pull_id": ""})
+
+        import threading as _threading
+
+        self._full_sync_running = True
+
+        def _run():
+            import time as _time
+            thread_db = None
+            try:
+                # Hintergrund-Thread stoppen, damit kein Lock-Konflikt entsteht
+                # und der Cursor nicht zwischendurch durch den Background-Loop überschrieben wird.
+                self._sync_service.stop_background()
+                thread_db = KarteikartenDB(self.db.db_path)
+                MAX_CYCLES = 200
+                total_pulled = 0
+                for i in range(MAX_CYCLES):
+                    try:
+                        result = self._sync_service.sync_now(thread_db)
+                    except Exception as exc:
+                        self.root.after(0, lambda e=str(exc): self._sync_status_var.set(f"Vollabgleich Fehler: {e}"))
+                        return
+                    total_pulled += result.pulled
+                    stats = self._sync_service.get_status(thread_db)
+                    local = int(stats.get("local_records", 0) or 0)
+                    remote = stats.get("remote_total")
+                    pct = f" ({int(local/remote*100)}%" + ")" if isinstance(remote, int) and remote > 0 else ""
+                    msg = f"Vollabgleich läuft… Lokal/Online: {local}/{remote or '?'}{pct} | Batch {i+1} | +{total_pulled} geladen"
+                    self.root.after(0, lambda m=msg: self._sync_status_var.set(m))
+                    if result.failed:
+                        # Wenn nur ein Cursor-Reset stattgefunden hat → weitermachen statt abbrechen
+                        only_cursor_reset = all("Vollabgleich zurückgesetzt" in str(e) for e in result.errors)
+                        if only_cursor_reset:
+                            result.failed = 0
+                            result.errors.clear()
+                        else:
+                            self.root.after(0, lambda e=result.errors: messagebox.showerror(
+                                "Vollabgleich Fehler", "\n".join(str(x) for x in e[:5])))
+                            return
+                    if isinstance(remote, int) and local >= remote:
+                        self.root.after(0, lambda p=total_pulled, l=local: messagebox.showinfo(
+                            "Vollabgleich abgeschlossen",
+                            f"Alle Datensätze synchronisiert.\nNeu geladen: {p} | Lokal gesamt: {l}"))
+                        self.root.after(0, self._refresh_db_list)
+                        return
+                    # Wenn kein Cursor-Fortschritt mehr möglich (Null records und kein remote_total)
+                    if result.pulled == 0 and not isinstance(remote, int):
+                        break
+                    _time.sleep(0.2)  # kurze Pause damit UI-Updates sichtbar werden
+            finally:
+                self._full_sync_running = False
+                if thread_db is not None:
+                    try:
+                        thread_db.conn.close()
+                    except Exception:
+                        pass
+                # Hintergrund-Thread wieder starten
+                self._sync_service.start_background(self.db)
+                self.root.after(0, self._update_sync_status)
+
+        _threading.Thread(target=_run, daemon=True, name="FullSync").start()
+
+    def _test_sync_connection(self):
+        mode = (self._sync_mode_var.get() or "mysql").strip().lower()
+        if mode == "api":
+            url = self._normalize_endpoint_url(self._sync_endpoint_var.get())
+            self._sync_endpoint_var.set(url)
+            if not url:
+                messagebox.showwarning("Kein Endpoint", "Bitte zuerst die API-Endpoint-URL eintragen.\n\nBeispiel: https://deine-domain.de/sync/lima_sync_endpoint.php")
+                return
+            if not urlsplit(url).netloc:
+                messagebox.showwarning("Ungültige URL", "Der API-Endpoint ist ungültig.\nBitte vollständige URL angeben, z.B.\nhttps://wze.de.cool/lima_sync_endpoint.php")
+                return
+            try:
+                from urllib import error, request
+                from urllib.parse import urlencode
+                json_str = json.dumps({"action": "ping", "api_key": self._sync_api_key_var.get()}, ensure_ascii=False)
+                payload = urlencode({"payload": json_str}).encode("utf-8")
+                req = request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
+                with request.urlopen(req, timeout=10) as resp:
+                    raw = resp.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+                if not isinstance(data, dict) or data.get("ok") is False:
+                    raise RuntimeError(str(data.get("error") if isinstance(data, dict) else "Ungültige API-Antwort"))
+                messagebox.showinfo("Verbindung OK", f"API-Endpunkt ist erreichbar.\nServer-Zeit: {data.get('server_time', '?')}")
+            except error.URLError as exc:
+                messagebox.showerror("Verbindungsfehler", f"API nicht erreichbar: {exc}")
+            except Exception as exc:
+                messagebox.showerror("Verbindungsfehler", str(exc))
+            return
+
+        try:
+            import pymysql  # type: ignore
+            port = int(self._sync_port_var.get().strip() or "3306")
+            conn = pymysql.connect(
+                host=self._sync_host_var.get().strip(),
+                port=port,
+                user=self._sync_user_var.get().strip(),
+                password=self._sync_pw_var.get(),
+                database=self._sync_db_var.get().strip(),
+                connect_timeout=5,
+            )
+            conn.close()
+            messagebox.showinfo("Verbindung OK", "MySQL-Verbindung erfolgreich hergestellt.")
+        except ImportError:
+            messagebox.showerror("Fehlendes Paket", "pymysql ist nicht installiert.\nBitte ausführen:\n  pip install pymysql")
+        except Exception as exc:
+            messagebox.showerror("Verbindungsfehler", str(exc))
+
+    def _on_close(self):
+        try:
+            self._sync_service.stop_background()
+        except Exception:
+            pass
+        self.root.destroy()
+
 
 def run_reader():
     """Startet die Leseanwendung."""
     root = tk.Tk()
     KarteikartenReader(root)
     root.mainloop()
+

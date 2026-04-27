@@ -38,12 +38,12 @@ echo.
 echo Starte Build-Prozess...
 echo.
 
-REM Fuehre PyInstaller mit onefile-Konfiguration aus (sichtbares Terminal)
+REM Fuehre PyInstaller mit onefile-Konfiguration aus (kein Konsolenfenster)
 .venv-build\Scripts\python.exe -m PyInstaller ^
     --noconfirm ^
     --clean ^
     --onefile ^
-    --console ^
+    --windowed ^
     --name WetzlarErkennung ^
     %ICON_PARAM% ^
     main.py
@@ -64,5 +64,18 @@ echo =====================================
 echo.
 echo Die EXE-Datei befindet sich in:
 echo    dist\WetzlarErkennung.exe
+echo.
+
+REM Begleitdateien in dist\ kopieren
+echo Kopiere Begleitdateien nach dist\ ...
+copy /Y config.json             dist\
+copy /Y ocr_corrections.json    dist\
+copy /Y vornamen_maennlich.json dist\
+copy /Y vornamen_weiblich.json  dist\
+copy /Y berufe.json             dist\
+copy /Y stand_mapping.json      dist\
+echo.
+echo Weitergabe-Paket ist fertig in dist\
+echo (config.json bitte vor Weitergabe anpassen!)
 echo.
 pause
