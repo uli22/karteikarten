@@ -322,6 +322,8 @@ class OnlineSyncService:
                             "Sync-Zyklus: %d gepusht, %d gepullt, %d Fehler",
                             result.pushed, result.pulled, result.failed,
                         )
+                        for err_msg in result.errors:
+                            logger.warning("Sync-Fehlerdetail: %s", err_msg)
                     else:
                         logger.debug(
                             "Sync-Zyklus OK: %d gepusht, %d gepullt",

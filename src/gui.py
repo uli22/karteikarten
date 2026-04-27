@@ -20,6 +20,7 @@ from .extractor import (extract_baptism_fields, extract_burial_fields,
                         is_valid_date)
 from .gedcom_exporter import GedcomExporter
 from .ocr_engine import OCREngine
+from .ocr_spell_checker import OCRCorrectionTooltip, OCRWordLists
 from .online_sync import OnlineSyncService
 from .text_postprocessor import (fix_header_prefix, fix_infinity_year,
                                  fix_p_number, fix_wetzlar_infinity,
@@ -875,7 +876,7 @@ class KarteikartenGUI:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikartenerkennung",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.4.1").pack(padx=30)
+        tk.Label(win, text="Version 0.4.2").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
@@ -909,7 +910,7 @@ class KarteikartenGUI:
         left_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 10))
         
         # Label für Bildanzeige – Höhe fest begrenzen, damit Buttons nicht herausgedrückt werden
-        image_frame = ttk.Frame(left_frame, height=420)
+        image_frame = ttk.Frame(left_frame, height=620)
         image_frame.pack(fill=tk.X, expand=False)
         image_frame.pack_propagate(False)
 
@@ -1041,6 +1042,10 @@ class KarteikartenGUI:
                                    yscrollcommand=scrollbar.set)
         self.text_display.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.config(command=self.text_display.yview)
+
+        # Hover-Korrektur-Tool aktivieren
+        _ocr_word_lists = OCRWordLists()
+        self._ocr_correction_tooltip = OCRCorrectionTooltip(self.text_display, _ocr_word_lists)
         
         # Hilfsfunktion: ∞-Symbol einfügen
         def insert_infinity():
@@ -1884,6 +1889,7 @@ class KarteikartenGUI:
         btn_row.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(btn_row, text="💾 Speichern", command=self._save_sync_settings).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="🔄 Jetzt synchronisieren", command=self._sync_now_clicked).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🧹 Queue bereinigen", command=self._cleanup_sync_queue).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="🔌 Verbindung testen", command=self._test_sync_connection).pack(side=tk.LEFT)
 
         self._sync_status_var = tk.StringVar(value="–")
@@ -2105,6 +2111,26 @@ class KarteikartenGUI:
             )
         except Exception as exc:
             messagebox.showerror("Sync-Fehler", str(exc))
+
+    def _cleanup_sync_queue(self):
+        """Löscht alle bereits erfolgreich gesendeten Einträge aus der Sync-Queue."""
+        stats = self.db.get_sync_queue_stats()
+        sent = stats.get("sent", 0)
+        if sent == 0:
+            messagebox.showinfo("Queue bereinigen", "Keine gesendeten Einträge zum Bereinigen vorhanden.")
+            return
+        if not messagebox.askyesno(
+            "Queue bereinigen",
+            f"{sent} bereits gesendete Einträge werden aus der Sync-Queue gelöscht.\n\n"
+            "Ausstehende (noch nicht gesendete) Einträge bleiben erhalten.\n\nFortfahren?",
+        ):
+            return
+        try:
+            deleted = self.db.cleanup_sent_sync_queue()
+            self._update_sync_status()
+            messagebox.showinfo("Queue bereinigen", f"{deleted} gesendete Einträge gelöscht.")
+        except Exception as exc:
+            messagebox.showerror("Fehler", f"Bereinigung fehlgeschlagen:\n{exc}")
 
     def _test_sync_connection(self):
         """Testet die Verbindung im aktuell gewählten Sync-Modus."""
