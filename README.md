@@ -67,15 +67,56 @@ start_file = "0008 Hb"  # Startdatei-Pattern
 3. **Text bearbeiten**: Der erkannte Text kann im rechten Bereich bearbeitet werden
 4. **Speichern**: Mit "💾 Text speichern" den Text exportieren
 
+## Weitergabe (Verteilung als EXE)
+
+### Wetzlar Erkennung
+
+| Datei | Pflicht | Bemerkung |
+|---|---|---|
+| `WetzlarErkennung.exe` | ✅ | Kompiliert via `build.bat` |
+| `config.json` | ✅ | Pfade, Online-Sync-Einstellungen |
+| `vornamen_maennlich.json` | ✅ | Männliche Vornamen-Liste (Erweiterung der eingebauten Liste) |
+| `vornamen_weiblich.json` | ✅ | Weibliche Vornamen-Liste (Erweiterung der eingebauten Liste) |
+| `berufe.json` | ✅ | Berufsbezeichnungen-Liste (Erweiterung der eingebauten Liste) |
+| `stand_mapping.json` | ✅ | Mapping für Standesbezeichnungen |
+| `ocr_corrections.json` | ✅ | OCR-Korrekturregeln (Buchstaben-/Wortfehler) |
+| `Wetzlar_Starten.bat` | optional | Starter-Verknüpfung |
+| `karteikarten.db` | bei Erstinstallation | SQLite-Datenbank (wird neu angelegt, falls nicht vorhanden) |
+
+### Wetzlar Reader
+
+| Datei | Pflicht | Bemerkung |
+|---|---|---|
+| `WetzlarReader.exe` | ✅ | Kompiliert via `build_reader.bat` |
+| `config_reader.json` | ✅ | Pfade, Online-Sync-Einstellungen (`"source": "reader"`) |
+| `ocr_corrections.json` | ✅ | OCR-Korrekturregeln (wird auch vom Reader verwendet) |
+| `Reader_Starten.bat` | optional | Starter-Verknüpfung |
+
+> **Hinweis:** `config.json` und `config_reader.json` enthalten lokale Pfade (`media_drive`, `image_base_path`, `db_path`) und müssen auf dem Zielrechner angepasst werden. API-Schlüssel und Zugangsdaten für Online-Sync sind ebenfalls dort hinterlegt.
+
+> Die EXE-Dateien sind **Standalone** (alle Python-Abhängigkeiten eingebettet) – keine separate Python-Installation nötig.
+
+---
+
 ## Projektstruktur
 
 ```
 wetzlar-karteikartenerkennung/
 ├── src/
 │   ├── __init__.py          # Package Initialisierung
-│   ├── gui.py               # Grafische Benutzeroberfläche
-│   └── ocr_engine.py        # OCR-Engine (EasyOCR/Tesseract)
-├── main.py                  # Haupteinstiegspunkt
+│   ├── gui.py               # Grafische Benutzeroberfläche (Erkennung)
+│   ├── reader_gui.py        # Grafische Benutzeroberfläche (Reader)
+│   ├── extractor.py         # Extraktions-Logik (Heirat, Begräbnis)
+│   ├── text_postprocessor.py# Textkorrektur-Funktionen
+│   ├── ocr_engine.py        # OCR-Engine (EasyOCR/Tesseract)
+│   ├── database.py          # SQLite-Datenbankzugriff
+│   └── config.py            # Konfigurationsverwaltung
+├── main.py                  # Einstiegspunkt Erkennung
+├── reader_main.py           # Einstiegspunkt Reader
+├── config.json              # Konfiguration Erkennung
+├── config_reader.json       # Konfiguration Reader
+├── build.bat                # EXE-Build Erkennung
+├── build_reader.bat         # EXE-Build Reader
 ├── pyproject.toml           # Projekt-Konfiguration
 └── README.md                # Diese Datei
 ```
