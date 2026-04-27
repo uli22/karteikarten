@@ -519,6 +519,15 @@ class KarteikartenDB:
         )
         self.conn.commit()
 
+    def cleanup_sent_sync_queue(self) -> int:
+        """Löscht alle bereits erfolgreich gesendeten Queue-Einträge (sent_at IS NOT NULL).
+        Gibt die Anzahl der gelöschten Zeilen zurück."""
+        cursor = self.conn.cursor()
+        cursor.execute("DELETE FROM sync_queue WHERE sent_at IS NOT NULL")
+        deleted = cursor.rowcount
+        self.conn.commit()
+        return deleted
+
     def mark_record_for_sync(self, record_id: int, source: str = 'erkennung') -> None:
         """Liest global_id und aktuelle version eines vorhandenen Datensatzes und erzeugt
         einen Sync-Queue-Eintrag. Muss NACH einem direkten UPDATE-Commit aufgerufen werden."""

@@ -137,7 +137,7 @@ class KarteikartenReader:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikarten – Leser",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.4.1").pack(padx=30)
+        tk.Label(win, text="Version 0.4.2").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
