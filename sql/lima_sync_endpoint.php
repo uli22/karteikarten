@@ -149,6 +149,14 @@ try {
             continue;
         }
 
+        // _cropped-Datensätze werden grundlegend abgelehnt
+        $fn = isset($record['dateiname']) ? (string)$record['dateiname'] : '';
+        $fp = isset($record['dateipfad']) ? (string)$record['dateipfad'] : '';
+        if (strpos($fn, '_cropped') !== false || strpos($fp, '_cropped') !== false) {
+            $errors[] = ['id' => $queueId, 'error' => '_cropped-Datensatz wird nicht gespeichert'];
+            continue;
+        }
+
         $cols = ['global_id'];
         $vals = [$globalId];
         foreach ($allFields as $f) {

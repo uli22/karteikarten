@@ -79,6 +79,7 @@ class KarteikartenGUI:
         self._sync_service = OnlineSyncService()
         self._sync_service.start_background(self.db)
         self._sync_status_var: tk.StringVar  # wird in _create_settings_content gesetzt
+        self._full_sync_running: bool = False
 
         # Aktueller DB-Record (None = nicht gespeichert, ID = bereits in DB)
         self.current_db_record_id = None
@@ -876,7 +877,7 @@ class KarteikartenGUI:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikartenerkennung",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.4.2").pack(padx=30)
+        tk.Label(win, text="Version 0.4.3").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
@@ -1889,6 +1890,8 @@ class KarteikartenGUI:
         btn_row.pack(fill=tk.X, pady=(10, 0))
         ttk.Button(btn_row, text="💾 Speichern", command=self._save_sync_settings).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="🔄 Jetzt synchronisieren", command=self._sync_now_clicked).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🔁 Vollabgleich erzwingen", command=self._force_full_sync).pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row, text="🗑️ DB löschen & neu laden", command=self._reset_and_reload_db).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="🧹 Queue bereinigen", command=self._cleanup_sync_queue).pack(side=tk.LEFT, padx=(0, 8))
         ttk.Button(btn_row, text="🔌 Verbindung testen", command=self._test_sync_connection).pack(side=tk.LEFT)
 
@@ -2131,6 +2134,172 @@ class KarteikartenGUI:
             messagebox.showinfo("Queue bereinigen", f"{deleted} gesendete Einträge gelöscht.")
         except Exception as exc:
             messagebox.showerror("Fehler", f"Bereinigung fehlgeschlagen:\n{exc}")
+
+    def _force_full_sync(self):
+        """Setzt den Pull-Cursor auf den Anfang und lädt alle Datensätze vom Server neu."""
+        if not messagebox.askyesno(
+            "Vollabgleich erzwingen",
+            "Den Sync-Cursor zurücksetzen und alle Datensätze vom Server neu laden?\n\n"
+            "Bestehende lokale Daten werden nicht gelöscht, nur ergänzt/aktualisiert.\n"
+            "Der Abgleich läuft im Hintergrund – der Fortschritt wird in der Statuszeile angezeigt.",
+        ):
+            return
+
+        self._sync_service._last_pull_cursor = "1970-01-01 00:00:00"
+        self._sync_service._last_pull_id = ""
+        self._sync_service._warned_missing_last_pull_id = False
+        self.config.set_online_sync({"last_pull_cursor": "", "last_pull_id": ""})
+
+        import threading as _threading
+        self._full_sync_running = True
+
+        def _run():
+            import time as _time
+            thread_db = None
+            try:
+                self._sync_service.stop_background()
+                thread_db = KarteikartenDB(self.db.db_path)
+                MAX_CYCLES = 200
+                total_pulled = 0
+                for i in range(MAX_CYCLES):
+                    try:
+                        result = self._sync_service.sync_now(thread_db)
+                    except Exception as exc:
+                        self.root.after(0, lambda e=str(exc): self._sync_status_var.set(f"Vollabgleich Fehler: {e}"))
+                        return
+                    total_pulled += result.pulled
+                    stats = self._sync_service.get_status(thread_db)
+                    local = int(stats.get("local_records", 0) or 0)
+                    remote = stats.get("remote_total")
+                    pct = f" ({int(local/remote*100)}%)" if isinstance(remote, int) and remote > 0 else ""
+                    msg = f"Vollabgleich läuft… Lokal/Online: {local}/{remote or '?'}{pct} | Batch {i+1} | +{total_pulled} geladen"
+                    self.root.after(0, lambda m=msg: self._sync_status_var.set(m))
+                    if result.failed:
+                        only_cursor_reset = all("Vollabgleich zurückgesetzt" in str(e) for e in result.errors)
+                        if only_cursor_reset:
+                            # Server hat keine neuen DS mehr – restliche Lücke durch gefilterte Datensätze
+                            self.root.after(0, lambda p=total_pulled, l=local, r=remote: messagebox.showinfo(
+                                "Vollabgleich beendet",
+                                f"Abgleich abgeschlossen.\nNeu geladen: {p} | Lokal: {l} | Online: {r or '?'}"))
+                            self.root.after(0, self._refresh_db_list)
+                            return
+                        else:
+                            self.root.after(0, lambda e=result.errors: messagebox.showerror(
+                                "Vollabgleich Fehler", "\n".join(str(x) for x in e[:5])))
+                            return
+                    if isinstance(remote, int) and local >= remote:
+                        self.root.after(0, lambda p=total_pulled, l=local: messagebox.showinfo(
+                            "Vollabgleich abgeschlossen",
+                            f"Alle Datensätze synchronisiert.\nNeu geladen: {p} | Lokal gesamt: {l}"))
+                        self.root.after(0, self._refresh_db_list)
+                        return
+                    if result.pulled == 0 and not isinstance(remote, int):
+                        break
+                    _time.sleep(0.2)
+            finally:
+                self._full_sync_running = False
+                if thread_db is not None:
+                    try:
+                        thread_db.conn.close()
+                    except Exception:
+                        pass
+                self._sync_service.start_background(self.db)
+                self.root.after(0, self._update_sync_status)
+
+        _threading.Thread(target=_run, daemon=True, name="FullSync").start()
+
+    def _reset_and_reload_db(self):
+        """Leert die lokale Erkenner-DB und lädt alle Datensätze neu vom Server."""
+        import threading as _threading
+        db_path = self.db.db_path
+        if not messagebox.askyesno(
+            "DB leeren & neu laden",
+            f"Alle lokalen Datensätze werden gelöscht:\n{db_path}\n\n"
+            "Anschließend werden alle Datensätze neu vom Online-Server geladen.\n\n"
+            "Fortfahren?",
+            icon="warning",
+        ):
+            return
+
+        self._sync_service.stop_background()
+
+        try:
+            cur = self.db.conn.cursor()
+            cur.execute("DELETE FROM karteikarten")
+            cur.execute("DELETE FROM sync_queue")
+            self.db.conn.commit()
+        except Exception as exc:
+            messagebox.showerror("Fehler", f"DB konnte nicht geleert werden:\n{exc}")
+            self._sync_service.start_background(self.db)
+            return
+
+        self._sync_service._last_pull_cursor = "1970-01-01 00:00:00"
+        self._sync_service._last_pull_id = ""
+        self._sync_service._warned_missing_last_pull_id = False
+        self.config.set_online_sync({"last_pull_cursor": "", "last_pull_id": ""})
+
+        self._sync_status_var.set("DB geleert – lade alle Datensätze vom Server…")
+        self._full_sync_running = True
+
+        def _run():
+            import time as _time
+            thread_db = None
+            try:
+                thread_db = KarteikartenDB(db_path)
+                MAX_CYCLES = 200
+                total_new = 0
+                for i in range(MAX_CYCLES):
+                    cur_before = thread_db.conn.cursor()
+                    cur_before.execute("SELECT COUNT(*) FROM karteikarten")
+                    count_before = int(cur_before.fetchone()[0] or 0)
+
+                    try:
+                        result = self._sync_service.sync_now(thread_db)
+                    except Exception as exc:
+                        self.root.after(0, lambda e=str(exc): self._sync_status_var.set(f"Fehler: {e}"))
+                        return
+
+                    cur_after = thread_db.conn.cursor()
+                    cur_after.execute("SELECT COUNT(*) FROM karteikarten")
+                    local = int(cur_after.fetchone()[0] or 0)
+                    total_new += (local - count_before)
+
+                    remote = self._sync_service._remote_total
+                    pct = f" ({int(local/remote*100)}%)" if isinstance(remote, int) and remote > 0 else ""
+                    msg = f"Neu laden… {local}/{remote or '?'}{pct} | Batch {i+1} | +{total_new} neu"
+                    self.root.after(0, lambda m=msg: self._sync_status_var.set(m))
+
+                    if result.failed:
+                        only_reset = all("Vollabgleich zurückgesetzt" in str(e) for e in result.errors)
+                        if only_reset:
+                            self.root.after(0, lambda l=local, r=remote: messagebox.showinfo(
+                                "Laden beendet",
+                                f"Laden abgeschlossen.\nLokal: {l} | Online: {r or '?'}"))
+                            self.root.after(0, self._refresh_db_list)
+                            return
+                        else:
+                            self.root.after(0, lambda e=result.errors: messagebox.showerror(
+                                "Fehler", "\n".join(str(x) for x in e[:5])))
+                            return
+                    if isinstance(remote, int) and local >= remote:
+                        self.root.after(0, lambda l=local: messagebox.showinfo(
+                            "Fertig", f"Alle {l} Datensätze geladen."))
+                        self.root.after(0, self._refresh_db_list)
+                        return
+                    if result.pulled == 0 and not isinstance(remote, int):
+                        break
+                    _time.sleep(0.2)
+            finally:
+                self._full_sync_running = False
+                if thread_db is not None:
+                    try:
+                        thread_db.conn.close()
+                    except Exception:
+                        pass
+                self._sync_service.start_background(self.db)
+                self.root.after(0, self._update_sync_status)
+
+        _threading.Thread(target=_run, daemon=True, name="ResetReload").start()
 
     def _test_sync_connection(self):
         """Testet die Verbindung im aktuell gewählten Sync-Modus."""

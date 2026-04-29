@@ -76,6 +76,14 @@ _SYNC_FIELDS = [
 ]
 
 
+def _is_cropped_row(row: Dict[str, Any]) -> bool:
+    """Gibt True zurück wenn dateiname oder dateipfad _cropped enthält."""
+    return (
+        "_cropped" in (row.get("dateiname") or "")
+        or "_cropped" in (row.get("dateipfad") or "")
+    )
+
+
 @dataclass
 class SyncResult:
     pushed: int = 0
@@ -666,6 +674,9 @@ class OnlineSyncService:
 
     def _apply_pull(self, db: KarteikartenDB, server_row: Dict, result: SyncResult) -> bool:
         """Wendet einen Server-Datensatz lokal an. Gibt True zurück wenn ein Update erfolgte."""
+        server_row = dict(server_row)
+        if _is_cropped_row(server_row):
+            return False  # _cropped-Datensatz wird ignoriert
         global_id = server_row.get("global_id")
         if not global_id:
             return False
@@ -727,6 +738,9 @@ class OnlineSyncService:
 
     def _insert_from_server(self, db: KarteikartenDB, server_row: Dict) -> None:
         import uuid as _uuid
+        server_row = dict(server_row)
+        if _is_cropped_row(server_row):
+            return  # _cropped-Datensatz wird ignoriert
         global_id = server_row.get("global_id") or str(_uuid.uuid4())
         fields = ["global_id"] + [f for f in _SYNC_FIELDS if f in server_row]
         values = [global_id] + [server_row.get(f) for f in fields[1:]]

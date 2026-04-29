@@ -352,6 +352,9 @@ class KarteikartenDB:
         Returns:
             ID des eingefügten/aktualisierten Datensatzes, oder None wenn übersprungen
         """
+        # _cropped-Datensätze werden grundlegend abgelehnt
+        if (dateiname and '_cropped' in dateiname) or (dateipfad and '_cropped' in dateipfad):
+            return None
         # Parse den Header
         parsed = self.parse_header(erkannter_text)
         cursor = self.conn.cursor()
