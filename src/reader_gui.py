@@ -137,7 +137,7 @@ class KarteikartenReader:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikarten – Leser",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.4.2").pack(padx=30)
+        tk.Label(win, text="Version 0.4.3").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
@@ -1840,7 +1840,13 @@ class KarteikartenReader:
 
                     if result.failed:
                         only_reset = all("Vollabgleich zurückgesetzt" in str(e) for e in result.errors)
-                        if not only_reset:
+                        if only_reset:
+                            self.root.after(0, lambda l=local, r=remote: messagebox.showinfo(
+                                "Laden beendet",
+                                f"Laden abgeschlossen.\nLokal: {l} | Online: {r or '?'}"))
+                            self.root.after(0, self._refresh_db_list)
+                            return
+                        else:
                             self.root.after(0, lambda e=result.errors: messagebox.showerror(
                                 "Fehler", "\n".join(str(x) for x in e[:5])))
                             return
@@ -1908,11 +1914,14 @@ class KarteikartenReader:
                     msg = f"Vollabgleich läuft… Lokal/Online: {local}/{remote or '?'}{pct} | Batch {i+1} | +{total_pulled} geladen"
                     self.root.after(0, lambda m=msg: self._sync_status_var.set(m))
                     if result.failed:
-                        # Wenn nur ein Cursor-Reset stattgefunden hat → weitermachen statt abbrechen
                         only_cursor_reset = all("Vollabgleich zurückgesetzt" in str(e) for e in result.errors)
                         if only_cursor_reset:
-                            result.failed = 0
-                            result.errors.clear()
+                            # Server hat keine neuen DS mehr – restliche Lücke durch gefilterte Datensätze
+                            self.root.after(0, lambda p=total_pulled, l=local, r=remote: messagebox.showinfo(
+                                "Vollabgleich beendet",
+                                f"Abgleich abgeschlossen.\nNeu geladen: {p} | Lokal: {l} | Online: {r or '?'}"))
+                            self.root.after(0, self._refresh_db_list)
+                            return
                         else:
                             self.root.after(0, lambda e=result.errors: messagebox.showerror(
                                 "Vollabgleich Fehler", "\n".join(str(x) for x in e[:5])))
@@ -1923,7 +1932,6 @@ class KarteikartenReader:
                             f"Alle Datensätze synchronisiert.\nNeu geladen: {p} | Lokal gesamt: {l}"))
                         self.root.after(0, self._refresh_db_list)
                         return
-                    # Wenn kein Cursor-Fortschritt mehr möglich (Null records und kein remote_total)
                     if result.pulled == 0 and not isinstance(remote, int):
                         break
                     _time.sleep(0.2)  # kurze Pause damit UI-Updates sichtbar werden
