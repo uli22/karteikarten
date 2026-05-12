@@ -106,10 +106,28 @@ Das Programm öffnet sich mit 1400x700 Pixel Fenstergröße und zeigt zwei Tabs:
 |--------|----------|
 | **Jahr** | Filtert nach Jahreszahl (z.B. 1564) |
 | **Typ** | Filtert nach Ereignistyp (Heirat, Taufe, Begräbnis) |
-| **Name** | Volltextsuche im erkannten Text |
+| **Text** | Volltextsuche im erkannten Text |
+| **Partner Vorname** | Suche im Feld Vorname (Bräutigam / Täufling / Verstorbener) |
+| **Nachname** | Suche im Nachnamen-Feld |
+| **Braut Vorname** | Suche im Feld Braut-/Muttervorname |
+| **Braut Nachname** | Suche im Braut-Nachname-Feld |
+| **☑ Regex** | Aktiviert reguläre Ausdrücke für alle Suchfelder (Text, Partner Vorname, Nachname, Braut Vorname, Braut Nachname) |
 | **🔍 Suchen** | Wendet Filter an |
 | **✕ Filter löschen** | Setzt alle Filter zurück |
 | **🔄 Aktualisieren** | Lädt Liste neu |
+
+#### Regex-Suche
+
+Wenn **☑ Regex** aktiviert ist, werden alle fünf Suchfelder als reguläre Ausdrücke interpretiert (Groß-/Kleinschreibung wird ignoriert). Beispiele:
+
+| Ausdruck | Trifft auf |
+|----------|------------|
+| `^Jacob` | Namen, die mit „Jacob" beginnen |
+| `Mebe(ss\|s)` | „Mebess" oder „Mebes" |
+| `\d{4}` | Vierstellige Jahreszahlen im Text |
+| `Schm(idt\|ied)` | „Schmidt" oder „Schmied" |
+
+Bei ungültigem Ausdruck erscheint eine Fehlermeldung – die Suche wird nicht ausgeführt.
 
 ### Tabelle
 

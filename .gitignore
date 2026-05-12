@@ -56,6 +56,13 @@ WetzlarReader.spec
 !Bedienung.md
 !instructions.md
 
+# Lokale Analyse- und Test-Skripte (nicht committen)
+Tests/
+
+# Vertrauliche Dokumente (nie committen)
+Beschluss*
+*Beschluss*
+
 # OS files
 Thumbs.db
 Desktop.ini
