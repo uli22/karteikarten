@@ -490,23 +490,23 @@ class KarteikartenGUI:
         
         try:
             fields = self._last_recognized_fields if hasattr(self, '_last_recognized_fields') else {}
-            vorname = self._get_ocr_field_value('vorname') or fields.get('vorname')
-            nachname = self._get_ocr_field_value('nachname') or fields.get('nachname')
-            partner = self._get_ocr_field_value('partner') or fields.get('partner')
-            beruf = self._get_ocr_field_value('beruf') or fields.get('beruf')
-            ort = self._get_ocr_field_value('ort') or fields.get('ort')
-            seite_value = self._get_ocr_field_value('seite') or fields.get('seite')
+            vorname = self._get_field_with_fallback('vorname', fields)
+            nachname = self._get_field_with_fallback('nachname', fields)
+            partner = self._get_field_with_fallback('partner', fields)
+            beruf = self._get_field_with_fallback('beruf', fields)
+            ort = self._get_field_with_fallback('ort', fields)
+            seite_value = self._get_field_with_fallback('seite', fields)
             seite = int(seite_value) if seite_value else None
-            nummer_value = self._get_ocr_field_value('nummer') or fields.get('nummer')
+            nummer_value = self._get_field_with_fallback('nummer', fields)
             nummer = int(nummer_value) if nummer_value else None
-            todestag = self._get_ocr_field_value('todestag') or fields.get('todestag')
-            stand = self._get_ocr_field_value('stand') or fields.get('stand')
-            braut_stand = self._get_ocr_field_value('braut stand') or fields.get('stand')
-            braeutigam_stand = self._get_ocr_field_value('bräutigam stand') or fields.get('braeutigam_stand')
-            braeutigam_vater = self._get_ocr_field_value('bräutigam vater') or fields.get('braeutigam_vater')
-            braut_vater = self._get_ocr_field_value('braut vater') or fields.get('braut_vater')
-            braut_nachname = self._get_ocr_field_value('braut nachname') or fields.get('braut_nachname')
-            braut_ort = self._get_ocr_field_value('braut ort') or fields.get('braut_ort')
+            todestag = self._get_field_with_fallback('todestag', fields)
+            stand = self._get_field_with_fallback('stand', fields)
+            braut_stand = self._get_field_with_fallback('braut stand', fields, 'stand')
+            braeutigam_stand = self._get_field_with_fallback('bräutigam stand', fields, 'braeutigam_stand')
+            braeutigam_vater = self._get_field_with_fallback('bräutigam vater', fields, 'braeutigam_vater')
+            braut_vater = self._get_field_with_fallback('braut vater', fields, 'braut_vater')
+            braut_nachname = self._get_field_with_fallback('braut nachname', fields, 'braut_nachname')
+            braut_ort = self._get_field_with_fallback('braut ort', fields, 'braut_ort')
             mutter_vorname = self._get_ocr_field_value('mutter vorname')
             datum_geburt = self._get_ocr_field_value('datum geburt')
             kirchenbuchtext = self.kirchenbuch_text_display.get("1.0", tk.END).strip()
@@ -515,14 +515,14 @@ class KarteikartenGUI:
             fid = fid if fid else None
             gramps = self.gramps_entry.get().strip()
             gramps = gramps if gramps else None
-            geb_jahr_value = self._get_ocr_field_value('geb.jahr (gesch.)')
+            geb_jahr_value = self._get_field_with_fallback('geb.jahr (gesch.)', fields, 'geb_jahr_gesch')
             if geb_jahr_value:
                 try:
                     geb_jahr_gesch = int(geb_jahr_value)
                 except ValueError:
                     geb_jahr_gesch = None
             else:
-                geb_jahr_gesch = fields.get('geb_jahr_gesch')
+                geb_jahr_gesch = None
 
             cursor = self.db.conn.cursor()
             cursor.execute("SELECT ereignis_typ FROM karteikarten WHERE id = ?", (self.current_db_record_id,))
@@ -1448,6 +1448,10 @@ class KarteikartenGUI:
         # Statistik-Button wie im Reader direkt im oberen Aktionsbereich
         statistics_btn = ttk.Button(filter_row3, text="📊 Statistik", command=self._show_statistics)
         statistics_btn.pack(side=tk.LEFT, padx=5)
+
+        # Button: Fehlende Dateien (nicht in DB)
+        missing_files_btn = ttk.Button(filter_row3, text="📂 Fehlende Dateien", command=self._show_missing_files)
+        missing_files_btn.pack(side=tk.LEFT, padx=5)
         
         # Treeview mit Scrollbar
         tree_frame = ttk.Frame(parent)
@@ -3184,28 +3188,40 @@ class KarteikartenGUI:
                 query += " AND LOWER(dateiname) LIKE ?"
                 params.append(f'%{filename_filter.lower()}%')
 
+            regex_mode = getattr(self, 'regex_search_var', None)
+            use_regex = bool(regex_mode and regex_mode.get())
+
             if partner_vorname_search:
-                query += " AND vorname LIKE ?"
-                params.append(f'%{partner_vorname_search}%')
+                if use_regex:
+                    pass  # Filter erfolgt später per Regex
+                else:
+                    query += " AND vorname LIKE ?"
+                    params.append(f'%{partner_vorname_search}%')
 
             if nachname_search:
-                query += " AND nachname LIKE ?"
-                params.append(f'%{nachname_search}%')
+                if use_regex:
+                    pass
+                else:
+                    query += " AND nachname LIKE ?"
+                    params.append(f'%{nachname_search}%')
 
             if braut_vorname_search:
-                query += " AND partner LIKE ?"
-                params.append(f'%{braut_vorname_search}%')
+                if use_regex:
+                    pass
+                else:
+                    query += " AND partner LIKE ?"
+                    params.append(f'%{braut_vorname_search}%')
 
             if braut_nachname_search:
-                query += " AND braut_nachname LIKE ?"
-                params.append(f'%{braut_nachname_search}%')
-
-
-            regex_mode = getattr(self, 'regex_search_var', None)
-            if name_search:
-                if regex_mode and regex_mode.get():
-                    # Hole alle Datensätze, Filter erfolgt später per Regex
+                if use_regex:
                     pass
+                else:
+                    query += " AND braut_nachname LIKE ?"
+                    params.append(f'%{braut_nachname_search}%')
+
+            if name_search:
+                if use_regex:
+                    pass  # Filter erfolgt später per Regex
                 else:
                     query += " AND erkannter_text LIKE ?"
                     params.append(f'%{name_search}%')
@@ -3217,15 +3233,23 @@ class KarteikartenGUI:
             rows = cursor.fetchall()
 
             # Regex-Filter anwenden, falls aktiviert
-            if name_search and regex_mode and regex_mode.get():
-                try:
-                    pattern = re.compile(name_search)
-                except re.error as e:
-                    messagebox.showerror("Regex-Fehler", f"Ungültiger regulärer Ausdruck:\n{e}")
-                    self.db_status_label.config(text="0 Datensätze gefunden (Regex-Fehler)")
-                    return
-                # Filtere rows, bei denen erkannter_text auf das Pattern matcht
-                rows = [row for row in rows if pattern.search(str(row[25]))]  # Index 25 = erkannter_text
+            if use_regex:
+                regex_fields = [
+                    (name_search, 25),            # erkannter_text
+                    (partner_vorname_search, 8),   # vorname
+                    (nachname_search, 9),          # nachname
+                    (braut_vorname_search, 10),    # partner
+                    (braut_nachname_search, 15),   # braut_nachname
+                ]
+                for search_val, col_idx in regex_fields:
+                    if search_val:
+                        try:
+                            pattern = re.compile(search_val, re.IGNORECASE)
+                        except re.error as e:
+                            messagebox.showerror("Regex-Fehler", f"Ungültiger regulärer Ausdruck:\n{e}")
+                            self.db_status_label.config(text="0 Datensätze gefunden (Regex-Fehler)")
+                            return
+                        rows = [row for row in rows if pattern.search(str(row[col_idx] or ''))]
 
             if kirchenbuch_filter and kirchenbuch_filter != 'Alle':
                 rows = [
@@ -3639,6 +3663,17 @@ class KarteikartenGUI:
             return None
         value = var.get().strip()
         return value if value else None
+
+    def _get_field_with_fallback(self, field_key: str, fallback: dict, fallback_key: Optional[str] = None) -> Optional[str]:
+        """Liest den Feldwert aus dem UI.
+        Wenn das Feld ein UI-Widget hat, wird immer der UI-Wert verwendet (auch wenn leer),
+        damit manuelle Löschungen nicht vom ursprünglichen OCR-Wert überschrieben werden.
+        Nur wenn kein Widget vorhanden ist, wird der Fallback-Dict verwendet."""
+        fk = fallback_key or field_key
+        if hasattr(self, 'ocr_field_vars') and field_key in self.ocr_field_vars:
+            value = self.ocr_field_vars[field_key].get().strip()
+            return value if value else None
+        return (fallback or {}).get(fk) or None
 
     def _load_ocr_fields_from_db(self, record_id: int):
         cursor = self.db.conn.cursor()
@@ -4156,7 +4191,133 @@ class KarteikartenGUI:
             txt.config(state=tk.DISABLED)
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim Abrufen der Statistik:\n{str(e)}")
-    
+
+    def _show_missing_files(self):
+        """Zeigt Dateien in image_base_path, die nicht in der Datenbank sind – nach Zeitraum und Buchtyp."""
+        import re as _re
+
+        IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp", ".gif", ".webp"}
+        base_path = Path(self.config.image_base_path) if self.config.image_base_path else self.base_path
+
+        win = tk.Toplevel(self.root)
+        win.title("Fehlende Dateien (nicht in DB)")
+        win.geometry("900x600")
+
+        txt = tk.Text(win, font=("Courier", 10), wrap=tk.NONE)
+        vsb = ttk.Scrollbar(win, orient="vertical", command=txt.yview)
+        hsb = ttk.Scrollbar(win, orient="horizontal", command=txt.xview)
+        txt.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        txt.pack(fill=tk.BOTH, expand=True)
+
+        txt.insert(tk.END, "Wird berechnet …\n")
+        txt.config(state=tk.DISABLED)
+        win.update()
+
+        try:
+            # DB-Pfade laden
+            cursor = self.db.conn.cursor()
+            cursor.execute("SELECT dateipfad FROM karteikarten WHERE dateipfad IS NOT NULL")
+            db_paths = {r[0].lower() for r in cursor.fetchall()}
+
+            # Bilddateien einsammeln (dedupliziert)
+            _seen: set = set()
+            all_files: list = []
+            for f in base_path.rglob("*"):
+                if f.is_file() and f.suffix.lower() in IMAGE_EXTENSIONS:
+                    key = str(f).lower()
+                    if key not in _seen:
+                        _seen.add(key)
+                        all_files.append(f)
+
+            missing = [f for f in all_files if str(f).lower() not in db_paths]
+
+            def _top(f: Path) -> str:
+                try:
+                    parts = f.relative_to(base_path).parts
+                    return parts[0] if len(parts) > 1 else "(Wurzel)"
+                except ValueError:
+                    return "(außerhalb)"
+
+            def _buchtyp(f: Path) -> str:
+                m = _re.search(r'[\\/\s](Gb|Hb|Sb)[\s\\/]', str(f))
+                if m:
+                    return m.group(1)
+                m2 = _re.search(r'\b(Gb|Hb|Sb)\b', f.name)
+                return m2.group(1) if m2 else "?"
+
+            total_detail: dict = {}
+            missing_detail: dict = {}
+            for f in all_files:
+                k = (_top(f), _buchtyp(f))
+                total_detail[k] = total_detail.get(k, 0) + 1
+            for f in missing:
+                k = (_top(f), _buchtyp(f))
+                missing_detail[k] = missing_detail.get(k, 0) + 1
+
+            zeitraeume = sorted({k[0] for k in total_detail})
+            buchtypen  = sorted({k[1] for k in total_detail})
+
+            col_z = 56
+            col_n = 6
+
+            sub_hdr = f"{'':>{col_z}}"
+            for _ in buchtypen + ['GESAMT']:
+                sub_hdr += f"  {'GES':>{col_n}}  {'VH':>{col_n}}  {'FE':>{col_n}}"
+
+            lines = [
+                f"Basis-Ordner : {base_path}",
+                f"Dateien ges. : {len(all_files):,}  |  In DB: {len(db_paths):,}  |  Fehlend: {len(missing):,}",
+                "",
+            ]
+
+            # Kopfzeile
+            hdr = f"{'ZEITRAUM':<{col_z}}"
+            for bt in buchtypen:
+                hdr += f"  {bt:^{col_n*3+4}}"
+            hdr += f"  {'GESAMT':^{col_n*3+4}}"
+            lines.append("=" * len(sub_hdr))
+            lines.append(hdr)
+            lines.append(sub_hdr)
+            lines.append("=" * len(sub_hdr))
+
+            grand_g = grand_v = grand_m = 0
+            bt_grand: dict = {bt: [0, 0, 0] for bt in buchtypen}
+
+            for zr in zeitraeume:
+                row = f"{zr:<{col_z}}"
+                zr_g = zr_v = zr_m = 0
+                for bt in buchtypen:
+                    g = total_detail.get((zr, bt), 0)
+                    m = missing_detail.get((zr, bt), 0)
+                    v = g - m
+                    row += f"  {g:>{col_n}}  {v:>{col_n}}  {m:>{col_n}}"
+                    zr_g += g; zr_v += v; zr_m += m
+                    bt_grand[bt][0] += g; bt_grand[bt][1] += v; bt_grand[bt][2] += m
+                row += f"  {zr_g:>{col_n}}  {zr_v:>{col_n}}  {zr_m:>{col_n}}"
+                grand_g += zr_g; grand_v += zr_v; grand_m += zr_m
+                lines.append(row)
+
+            lines.append("-" * len(sub_hdr))
+            foot = f"{'GESAMT':<{col_z}}"
+            for bt in buchtypen:
+                g, v, m = bt_grand[bt]
+                foot += f"  {g:>{col_n}}  {v:>{col_n}}  {m:>{col_n}}"
+            foot += f"  {grand_g:>{col_n}}  {grand_v:>{col_n}}  {grand_m:>{col_n}}"
+            lines.append(foot)
+            lines.append("=" * len(sub_hdr))
+
+            txt.config(state=tk.NORMAL)
+            txt.delete("1.0", tk.END)
+            txt.insert(tk.END, "\n".join(lines))
+            txt.config(state=tk.DISABLED)
+        except Exception as e:
+            txt.config(state=tk.NORMAL)
+            txt.delete("1.0", tk.END)
+            txt.insert(tk.END, f"Fehler: {e}")
+            txt.config(state=tk.DISABLED)
+
     def _export_csv(self):
         """Exportiert die Datenbank als CSV."""
         filepath = filedialog.asksaveasfilename(

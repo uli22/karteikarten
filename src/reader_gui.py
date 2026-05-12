@@ -631,25 +631,39 @@ class KarteikartenReader:
                 query += " AND LOWER(dateiname) LIKE ?"
                 params.append(f"%{filename_filter.lower()}%")
 
+            regex_mode = getattr(self, "regex_search_var", None)
+            use_regex = bool(regex_mode and regex_mode.get())
+
             if nachname_search:
-                query += " AND nachname LIKE ?"
-                params.append(f"%{nachname_search}%")
+                if use_regex:
+                    pass
+                else:
+                    query += " AND nachname LIKE ?"
+                    params.append(f"%{nachname_search}%")
 
             if partner_vorname_search:
-                query += " AND vorname LIKE ?"
-                params.append(f"%{partner_vorname_search}%")
+                if use_regex:
+                    pass
+                else:
+                    query += " AND vorname LIKE ?"
+                    params.append(f"%{partner_vorname_search}%")
 
             if braut_vorname_search:
-                query += " AND partner LIKE ?"
-                params.append(f"%{braut_vorname_search}%")
+                if use_regex:
+                    pass
+                else:
+                    query += " AND partner LIKE ?"
+                    params.append(f"%{braut_vorname_search}%")
 
             if braut_nachname_search:
-                query += " AND braut_nachname LIKE ?"
-                params.append(f"%{braut_nachname_search}%")
+                if use_regex:
+                    pass
+                else:
+                    query += " AND braut_nachname LIKE ?"
+                    params.append(f"%{braut_nachname_search}%")
 
-            regex_mode = getattr(self, "regex_search_var", None)
             if name_search:
-                if regex_mode and regex_mode.get():
+                if use_regex:
                     pass  # Regex-Filter später
                 else:
                     query += " AND erkannter_text LIKE ?"
@@ -661,15 +675,23 @@ class KarteikartenReader:
             cursor.execute(query, params)
             rows = cursor.fetchall()
 
-            if name_search and regex_mode and regex_mode.get():
-                import re
-                try:
-                    pattern = re.compile(name_search)
-                except re.error as e:
-                    messagebox.showerror("Regex-Fehler", f"Ungültiger regulärer Ausdruck:\n{e}")
-                    self.db_status_label.config(text="0 Datensätze gefunden (Regex-Fehler)")
-                    return
-                rows = [row for row in rows if pattern.search(str(row[25]))]
+            if use_regex:
+                regex_fields = [
+                    (name_search, 25),            # erkannter_text
+                    (partner_vorname_search, 8),   # vorname
+                    (nachname_search, 9),          # nachname
+                    (braut_vorname_search, 10),    # partner
+                    (braut_nachname_search, 15),   # braut_nachname
+                ]
+                for search_val, col_idx in regex_fields:
+                    if search_val:
+                        try:
+                            pattern = re.compile(search_val, re.IGNORECASE)
+                        except re.error as e:
+                            messagebox.showerror("Regex-Fehler", f"Ungültiger regulärer Ausdruck:\n{e}")
+                            self.db_status_label.config(text="0 Datensätze gefunden (Regex-Fehler)")
+                            return
+                        rows = [row for row in rows if pattern.search(str(row[col_idx] or ''))]
 
             if kirchenbuch_filter and kirchenbuch_filter != "Alle":
                 rows = [
