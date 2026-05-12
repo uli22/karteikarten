@@ -227,8 +227,12 @@ Für GitHub sollen diese Ordner ignoriert werden:
 
 ### Ablage von Test- und Debug-Dateien
 
-Künftig sollen alle neuen Test-, Debug- und Check-Dateien im Ordner `test/` angelegt werden.
-Dateien mit Mustern wie `test_*.*`, `debug_*.*` und `check_*.*` gehören nicht in den Projektstamm.
+**REGEL**: Alle neuen Test-, Debug-, Analyse-, Diagnose- und Check-Skripte gehören **ausschließlich** in den Unterordner `Tests/` im Projektstamm – niemals direkt in den Projektstamm.
+
+- Dateimuster die in `Tests/` gehören: `_analyse_*.py`, `_check_*.py`, `_diagnose_*.py`, `_find_*.py`, `_sync_*.py`, `_repair_*.py`, `compare_*.py`, `reset_*.py` und ähnliche Einmal- oder Hilfsskripte
+- Der Ordner `Tests/` ist in `.gitignore` eingetragen und wird **nie committet**
+- Beim Erstellen neuer Skripte direkt den Pfad `Tests/mein_skript.py` verwenden
+- Vorhandene Skripte im Projektstamm ggf. nachträglich in `Tests/` verschieben
 
 ---
 
