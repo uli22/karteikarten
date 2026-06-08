@@ -188,6 +188,14 @@ class KarteikartenReader:
         self.kirchenbuch_filter.pack(side=tk.LEFT, padx=5)
         self.kirchenbuch_filter.bind("<<ComboboxSelected>>", lambda e: self._refresh_db_list())
 
+        self.filter_inf_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_row1,
+            text="inf ausblenden",
+            variable=self.filter_inf_var,
+            command=self._refresh_db_list,
+        ).pack(side=tk.LEFT, padx=(10, 5))
+
         # Zeile 2: Textsuche
         filter_row2 = ttk.Frame(filter_frame)
         filter_row2.pack(fill=tk.X, pady=(0, 5))
@@ -699,6 +707,16 @@ class KarteikartenReader:
                     if extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
                 ]
 
+            # Filter: inf-Texte ausblenden
+            if getattr(self, 'filter_inf_var', None) and self.filter_inf_var.get():
+                rows = [
+                    row for row in rows
+                    if not str(row[25] or '').lstrip().startswith('inf')
+                ]
+
+            # Sammle notiz-Werte für F-ID-Statistik
+            notiz_werte = []
+
             for row in rows:
                 def safe(idx):
                     try:
@@ -716,6 +734,7 @@ class KarteikartenReader:
                 )
 
                 notiz = safe(24)
+                notiz_werte.append(notiz)
                 kirchenbuchtext = safe(26)
                 gramps = safe(27)
                 jahr = safe(1)
@@ -734,7 +753,15 @@ class KarteikartenReader:
 
                 self.tree.insert("", tk.END, values=values, tags=tuple(tags))
 
-            self.db_status_label.config(text=f"{len(rows)} Datensätze gefunden")
+            # F-ID Statistiken aus den aktuell gefilterten Zeilen
+            if notiz_werte:
+                f_start = sum(1 for n in notiz_werte if str(n).startswith('F'))
+                i_start = sum(1 for n in notiz_werte if str(n).startswith('I'))
+                f_id_summe = f_start + i_start
+                f_id_info = f" | F-ID: F={f_start} I={i_start} ∑={f_id_summe}"
+            else:
+                f_id_info = ""
+            self.db_status_label.config(text=f"{len(rows)} Datensätze gefunden{f_id_info}")
 
             years = self.db.get_all_years()
             self.year_filter["values"] = ["Alle"] + [str(y) for y in years]
@@ -779,6 +806,8 @@ class KarteikartenReader:
         self.type_filter.current(0)
         self.filename_filter.current(0)
         self.kirchenbuch_filter.current(0)
+        if hasattr(self, "filter_inf_var"):
+            self.filter_inf_var.set(False)
         self.name_search.delete(0, tk.END)
         self.nachname_search.delete(0, tk.END)
         self.partner_vorname_search.delete(0, tk.END)
