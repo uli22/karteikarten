@@ -68,7 +68,7 @@ echo.
 
 REM Begleitdateien in dist\ kopieren
 echo Kopiere Begleitdateien nach dist\ ...
-copy /Y config_reader.json   dist\
+copy /Y config_reader.template.json   dist\config_reader.json
 copy /Y ocr_corrections.json dist\
 echo.
 echo Weitergabe-Paket ist fertig in dist\
