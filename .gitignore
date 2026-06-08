@@ -28,7 +28,11 @@ config.json
 config_reader.json
 credentials/
 client_secret*.json
+api.txt
+
+# Track template-but ignore all other JSON files (credentials, exports etc.)
 *.json
+!config_reader.template.json
 
 # Data folders (input/output, personal data)
 input/
