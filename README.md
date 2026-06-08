@@ -93,6 +93,8 @@ start_file = "0008 Hb"  # Startdatei-Pattern
 | `Reader_Starten.bat` | optional | Starter-Verknüpfung |
 
 > **Hinweis:** `config.json` und `config_reader.json` enthalten lokale Pfade (`media_drive`, `image_base_path`, `db_path`) und müssen auf dem Zielrechner angepasst werden. API-Schlüssel und Zugangsdaten für Online-Sync sind ebenfalls dort hinterlegt.
+>
+> **Sicherheit:** Im Release-Build (`dist/`) wird seit v0.4.4 die **`config_reader.template.json`** statt der echten `config_reader.json` ausgeliefert – ohne Zugangsdaten. Der Nutzer überträgt seine eigenen Einstellungen in die `config_reader.json` neben der EXE. `api.txt` und `config_reader.json` sind in `.gitignore` aufgenommen und landen nicht im Repository.
 
 > Die EXE-Dateien sind **Standalone** (alle Python-Abhängigkeiten eingebettet) – keine separate Python-Installation nötig.
 
@@ -114,7 +116,8 @@ wetzlar-karteikartenerkennung/
 ├── main.py                  # Einstiegspunkt Erkennung
 ├── reader_main.py           # Einstiegspunkt Reader
 ├── config.json              # Konfiguration Erkennung
-├── config_reader.json       # Konfiguration Reader
+├── config_reader.json       # Konfiguration Reader (lokal, in .gitignore)
+├── config_reader.template.json # Template für Build (ohne Zugangsdaten)
 ├── build.bat                # EXE-Build Erkennung
 ├── build_reader.bat         # EXE-Build Reader
 ├── pyproject.toml           # Projekt-Konfiguration
