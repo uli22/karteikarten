@@ -153,6 +153,8 @@ class KarteikartenDB:
             ('version', 'INTEGER DEFAULT 1'),
             ('updated_by', 'TEXT'),
             ('sync_status', "TEXT DEFAULT 'pending'"),
+            ('kommentar', 'TEXT'),
+            ('erledigt', 'INTEGER DEFAULT 0'),
         ]
         for field, ftype in new_fields:
             if field not in columns:
@@ -456,6 +458,37 @@ class KarteikartenDB:
             """,
             (global_id, op, source, base_version)
         )
+
+    def update_kommentar_erledigt(self, record_id: int, kommentar: Optional[str], erledigt: bool, updated_by: str = 'reader') -> None:
+        """Aktualisiert Kommentar und Erledigt-Status eines Datensatzes."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT global_id, version FROM karteikarten WHERE id = ?", (record_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+        global_id = row['global_id']
+        cursor.execute("""
+            UPDATE karteikarten SET
+                kommentar = ?,
+                erledigt = ?,
+                version = COALESCE(version, 1) + 1,
+                updated_by = ?,
+                sync_status = 'pending',
+                aktualisiert_am = CURRENT_TIMESTAMP
+            WHERE id = ?
+        """, (kommentar, 1 if erledigt else 0, updated_by, record_id))
+        self._enqueue_sync(cursor, global_id=global_id, op='upsert', source=updated_by,
+                           base_version=int(row['version'] or 1))
+        self.conn.commit()
+
+    def get_kommentar_erledigt(self, record_id: int) -> Tuple[Optional[str], bool]:
+        """Liest Kommentar und Erledigt-Status eines Datensatzes."""
+        cursor = self.conn.cursor()
+        cursor.execute("SELECT kommentar, erledigt FROM karteikarten WHERE id = ?", (record_id,))
+        row = cursor.fetchone()
+        if row:
+            return (row['kommentar'], bool(row['erledigt']))
+        return (None, False)
 
     def get_sync_queue_stats(self) -> Dict[str, int]:
         """Liefert eine einfache Übersicht über die lokale Sync-Queue."""

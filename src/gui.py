@@ -605,41 +605,82 @@ class KarteikartenGUI:
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim Speichern in DB:\n{e}")
 
+    def _save_kommentar_erledigt(self):
+        """Speichert Kommentar und Erledigt-Status aus dem OCR-Tab in die DB."""
+        if not self.current_db_record_id:
+            messagebox.showwarning("Kein DB-Eintrag", "Bitte zuerst einen Datensatz aus der Datenbank laden.")
+            return
+        kommentar = self.kommentar_entry.get().strip()
+        kommentar = kommentar if kommentar else None
+        erledigt = self.erledigt_var.get()
+        self.db.update_kommentar_erledigt(
+            self.current_db_record_id, kommentar, erledigt, updated_by='erkennung'
+        )
+        self._refresh_db_list()
+        messagebox.showinfo("Gespeichert", "Kommentar und Status gespeichert.")
+
     def _show_current_kirchenbuch(self):
         """Zeigt das Kirchenbuchbild für die aktuell im OCR-Tab angezeigte Karteikarte an."""
-        # Extrahiere Typ, Jahr und Seite NUR aus dem erkannten Text
-        text = self.text_display.get("1.0", tk.END).strip()
-        
-        if not text:
-            messagebox.showwarning("Kein Text", "Bitte zuerst eine Karteikarte laden und Text erkennen.")
-            return
-        
         from pathlib import Path
 
-        # Versuche Typ, Jahr und Seite aus dem erkannten Text zu extrahieren
-        # Format: "ev. Kb. Wetzlar ⚰ 1687.05.13. p. 99 Nr. 1"
+        # 1. Versuche Werte aus der DB zu holen (wenn ein Datensatz geladen ist)
         typ = None
         jahr = None
         seite = None
-        
-        # Erkenne Typ aus Symbol im Text
-        if "⚰" in text:
-            typ = "Begräbnis"
-        elif "∞" in text:
-            typ = "Heirat"
-        elif "*" in text or "~" in text or "Gb" in text or "gb" in text or "Taufe" in text or "taufe" in text:
-            typ = "Taufe"
-        
-        # Extrahiere Jahr (4-stellige Zahl am Anfang der Datumsangabe)
-        jahr_match = re.search(r"(\d{4})\.\d{2}\.\d{2}", text)
-        if jahr_match:
-            jahr = int(jahr_match.group(1))
-        
-        # Extrahiere Seite (p. XX)
-        seite_match = re.search(r"p\.?\s*(\d+)", text, re.IGNORECASE)
-        if seite_match:
-            seite = int(seite_match.group(1))
-        
+
+        if self.current_db_record_id is not None:
+            try:
+                cursor = self.db.conn.cursor()
+                cursor.execute(
+                    "SELECT ereignis_typ, jahr, seite FROM karteikarten WHERE id = ?",
+                    (self.current_db_record_id,)
+                )
+                row = cursor.fetchone()
+                if row:
+                    if row[0]:
+                        typ = row[0]
+                    if row[1]:
+                        try:
+                            jahr = int(row[1])
+                        except (ValueError, TypeError):
+                            pass
+                    if row[2]:
+                        try:
+                            seite = int(row[2])
+                        except (ValueError, TypeError):
+                            pass
+            except Exception:
+                pass  # Fallback auf Textextraktion
+
+        # 2. Fallback: Werte aus dem OCR-Text extrahieren
+        text = self.text_display.get("1.0", tk.END).strip()
+
+        if not text and typ is None and jahr is None and seite is None:
+            messagebox.showwarning("Kein Text", "Bitte zuerst eine Karteikarte laden und Text erkennen.")
+            return
+
+        if text:
+            # Erkenne Typ aus Symbol im Text (nur wenn nicht bereits aus DB)
+            if typ is None:
+                if "⚰" in text:
+                    typ = "Begräbnis"
+                elif "∞" in text:
+                    typ = "Heirat"
+                elif "*" in text or "~" in text or "Gb" in text or "gb" in text or "Taufe" in text or "taufe" in text:
+                    typ = "Taufe"
+
+            # Extrahiere Jahr aus Text (nur wenn nicht bereits aus DB)
+            if jahr is None:
+                jahr_match = re.search(r"(\d{4})\.\d{2}\.\d{2}", text)
+                if jahr_match:
+                    jahr = int(jahr_match.group(1))
+
+            # Extrahiere Seite aus Text (nur wenn nicht bereits aus DB)
+            if seite is None:
+                seite_match = re.search(r"p\.?\s*(\d+)", text, re.IGNORECASE)
+                if seite_match:
+                    seite = int(seite_match.group(1))
+
         if not all([typ, jahr, seite]):
             messagebox.showerror(
                 "Fehlende Informationen",
@@ -1181,6 +1222,23 @@ class KarteikartenGUI:
         ttk.Label(action_buttons_frame2, text="Gramps:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(15, 5))
         self.gramps_entry = ttk.Entry(action_buttons_frame2, width=15, font=("Arial", 10))
         self.gramps_entry.pack(side=tk.LEFT, padx=5)
+
+        # Vierte Reihe für Kommentar und Erledigt
+        action_buttons_frame3 = ttk.Frame(buttons_frame)
+        action_buttons_frame3.pack(side=tk.TOP, anchor=tk.W, pady=(5, 0))
+        
+        # Kommentar-Feld
+        ttk.Label(action_buttons_frame3, text="Kommentar:", font=("Arial", 9, "bold")).pack(side=tk.LEFT, padx=(5, 5))
+        self.kommentar_entry = ttk.Entry(action_buttons_frame3, width=60, font=("Arial", 10))
+        self.kommentar_entry.pack(side=tk.LEFT, padx=5)
+        
+        # Erledigt Checkbox
+        self.erledigt_var = tk.BooleanVar(value=False)
+        self.erledigt_cb = ttk.Checkbutton(action_buttons_frame3, text="Erledigt", variable=self.erledigt_var)
+        self.erledigt_cb.pack(side=tk.LEFT, padx=(15, 5))
+        
+        # Button zum Speichern von Kommentar + Erledigt
+        ttk.Button(action_buttons_frame3, text="💾 Speichern", command=self._save_kommentar_erledigt).pack(side=tk.LEFT, padx=5)
         
         # Frame für erkannte Felder MIT SCROLLBAR
         fields_frame = ttk.LabelFrame(right_frame, text="Erkannte Felder", padding=0)
@@ -1301,6 +1359,15 @@ class KarteikartenGUI:
         self.kirchenbuch_filter.current(0)
         self.kirchenbuch_filter.pack(side=tk.LEFT, padx=5)
         self.kirchenbuch_filter.bind('<<ComboboxSelected>>', lambda e: self._refresh_db_list())
+
+        # Filter: inf-Texte ausblenden (erkannter_text beginnt mit "inf")
+        self.filter_inf_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            filter_row1,
+            text="inf ausblenden",
+            variable=self.filter_inf_var,
+            command=self._refresh_db_list
+        ).pack(side=tk.LEFT, padx=(10, 5))
 
         # === ZEILE 2: SUCHE & ERSETZEN ===
         filter_row2 = ttk.Frame(filter_frame)
@@ -1433,6 +1500,12 @@ class KarteikartenGUI:
         # Trennlinie
         ttk.Separator(filter_row3, orient='vertical').pack(side=tk.LEFT, fill=tk.Y, padx=10)
 
+        # Dateiname-Suche
+        ttk.Label(filter_row3, text="Dateiname:").pack(side=tk.LEFT, padx=(0, 5))
+        self.dateiname_search = ttk.Entry(filter_row3, width=25)
+        self.dateiname_search.pack(side=tk.LEFT, padx=5)
+        self.dateiname_search.bind('<Return>', lambda e: self._refresh_db_list())
+
         # Button: Leere in sortierter Spalte auswählen
         select_empty_btn = ttk.Button(filter_row3, text="⛶ Leere auswählen", command=self._select_empty_in_sorted_column)
         select_empty_btn.pack(side=tk.LEFT, padx=5)
@@ -1470,7 +1543,8 @@ class KarteikartenGUI:
             'Vorname', 'Nachname', 'Partner', 'Beruf', 'Ort',
             'Bräutigam Vater', 'Braut Vater', 'Braut Nachname', 'Braut Ort',
             'Bräutigam Stand', 'Braut Stand', 'Mutter Vorname', 'Datum Geburt', 'Todestag', 'Geb.Jahr (gesch.)',
-            'Dateiname', 'Notiz', 'Gramps', 'Text')
+            'Dateiname', 'Notiz', 'Gramps', 'Text',
+            'Kommentar', 'Erledigt')
         self.tree = ttk.Treeview(
             tree_frame,
             columns=columns,
@@ -1510,6 +1584,8 @@ class KarteikartenGUI:
         self.tree.heading('Notiz', text='F-ID', command=lambda: self._sort_column('Notiz'))
         self.tree.heading('Gramps', text='Gramps', command=lambda: self._sort_column('Gramps'))
         self.tree.heading('Text', text='Erkannter Text', command=lambda: self._sort_column('Text'))
+        self.tree.heading('Kommentar', text='Kommentar', command=lambda: self._sort_column('Kommentar'))
+        self.tree.heading('Erledigt', text='Erledigt', command=lambda: self._sort_column('Erledigt'))
 
         self.tree.column('ID', width=20, anchor='center')
         self.tree.column('Jahr', width=40, anchor='center')
@@ -1538,6 +1614,8 @@ class KarteikartenGUI:
         self.tree.column('Notiz', width=8, anchor='center')
         self.tree.column('Gramps', width=10, anchor='center')
         self.tree.column('Text', width=400, anchor='w')
+        self.tree.column('Kommentar', width=200, anchor='w')
+        self.tree.column('Erledigt', width=20, anchor='center')
         
         # Spaltenbreiten aus Config laden
         self._apply_column_widths()
@@ -1560,6 +1638,9 @@ class KarteikartenGUI:
         
         # NEU: Tag für ungültige Datumswerte (roter Text)
         self.tree.tag_configure('invalid_date', foreground='#dc3545', font=('Arial', 9, 'bold'))
+        
+        # Tag für erledigte Datensätze (rot, überschreibt andere)
+        self.tree.tag_configure('erledigt', background='#f8d7da')
         
         self.tree.pack(fill=tk.BOTH, expand=True)
         
@@ -3152,13 +3233,15 @@ class KarteikartenGUI:
             nachname_search = self.nachname_search.get().strip()
             braut_vorname_search = self.braut_vorname_search.get().strip()
             braut_nachname_search = self.braut_nachname_search.get().strip()
+            dateiname_search = self.dateiname_search.get().strip()
 
             query = (
                 "SELECT id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, "
                 "vorname, nachname, partner, beruf, ort, "
                 "braeutigam_vater, braut_vater, braut_nachname, braut_ort, "
                 "braeutigam_stand, stand, mutter_vorname, datum_geburt, todestag, geb_jahr_gesch, "
-                "dateiname, notiz, erkannter_text, kirchenbuchtext, gramps "
+                "dateiname, notiz, erkannter_text, kirchenbuchtext, gramps, "
+                "kommentar, erledigt "
                 "FROM karteikarten WHERE 1=1"
             )
             params = []
@@ -3219,6 +3302,13 @@ class KarteikartenGUI:
                     query += " AND braut_nachname LIKE ?"
                     params.append(f'%{braut_nachname_search}%')
 
+            if dateiname_search:
+                if use_regex:
+                    pass  # Filter erfolgt später per Regex
+                else:
+                    query += " AND dateiname LIKE ?"
+                    params.append(f'%{dateiname_search}%')
+
             if name_search:
                 if use_regex:
                     pass  # Filter erfolgt später per Regex
@@ -3240,6 +3330,7 @@ class KarteikartenGUI:
                     (nachname_search, 9),          # nachname
                     (braut_vorname_search, 10),    # partner
                     (braut_nachname_search, 15),   # braut_nachname
+                    (dateiname_search, 23),        # dateiname
                 ]
                 for search_val, col_idx in regex_fields:
                     if search_val:
@@ -3257,12 +3348,23 @@ class KarteikartenGUI:
                     if extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
                 ]
 
+            # Filter: inf-Texte ausblenden
+            if getattr(self, 'filter_inf_var', None) and self.filter_inf_var.get():
+                rows = [
+                    row for row in rows
+                    if not str(row[25] or '').lstrip().startswith('inf')
+                ]
+
+            # Sammle notiz-Werte für F-ID-Statistik
+            notiz_werte = []
+            
             for row in rows:
                 # row: id, jahr, datum, iso_datum, ereignis_typ, seite, nummer, kirchengemeinde, 
                 # vorname, nachname, partner, beruf, ort,
                 # braeutigam_vater, braut_vater, braut_nachname, braut_ort,
                 # braeutigam_stand, stand, mutter_vorname, datum_geburt, todestag, geb_jahr_gesch,
-                # dateiname, notiz, erkannter_text, kirchenbuchtext, gramps
+                # dateiname, notiz, erkannter_text, kirchenbuchtext, gramps,
+                # kommentar, erledigt
                 def safe(idx):
                     try:
                         return row[idx] if row[idx] is not None else ''
@@ -3297,15 +3399,24 @@ class KarteikartenGUI:
                     safe(24), # Notiz
                     safe(27), # Gramps
                     safe(25), # Erkannter Text
+                    safe(28), # Kommentar
+                    safe(29), # Erledigt
                 )
 
                 # NEU: Prüfe ob Datum gültig ist
-                jahr = safe(1)
+                jahr_raw = safe(1)
                 datum = safe(2)
                 notiz = safe(24)
+                notiz_werte.append(notiz)
                 kirchenbuchtext = safe(26)  # Index 26 = kirchenbuchtext
                 gramps = safe(27)  # Index 27 = gramps
-                date_valid = is_valid_date(datum, jahr)
+                erledigt_val = safe(29)  # Index 29 = erledigt
+                try:
+                    jahr_str = str(jahr_raw).strip() if jahr_raw is not None else ''
+                    jahr_int = int(jahr_str) if jahr_str else None
+                except (ValueError, TypeError):
+                    jahr_int = None
+                date_valid = is_valid_date(datum, jahr_int)
 
                 # Tags setzen
                 tags = []
@@ -3317,10 +3428,20 @@ class KarteikartenGUI:
                     tags.append('has_gramps')
                 if not date_valid and datum:
                     tags.append('invalid_date')
+                if erledigt_val != '1':
+                    tags.append('erledigt')
 
                 self.tree.insert('', tk.END, values=values, tags=tuple(tags))
             
-            self.db_status_label.config(text=f"{len(rows)} Datensätze gefunden")
+            # F-ID Statistiken aus den aktuell gefilterten Zeilen (notiz-Werte wurden bereits in der Schleife gesammelt)
+            if notiz_werte:
+                f_start = sum(1 for n in notiz_werte if str(n).startswith('F'))
+                i_start = sum(1 for n in notiz_werte if str(n).startswith('I'))
+                f_id_summe = f_start + i_start
+                f_id_info = f" | F-ID: F={f_start} I={i_start} ∑={f_id_summe}"
+            else:
+                f_id_info = ""
+            self.db_status_label.config(text=f"{len(rows)} Datensätze gefunden{f_id_info}")
             
             years = self.db.get_all_years()
             self.year_filter['values'] = ['Alle'] + [str(y) for y in years]
@@ -3518,6 +3639,7 @@ class KarteikartenGUI:
         self.filename_filter.current(0)
         self.kirchenbuch_filter.current(0)
         self.name_search.delete(0, tk.END)
+        self.dateiname_search.delete(0, tk.END)
         self.nachname_search.delete(0, tk.END)
         self.braut_nachname_search.delete(0, tk.END)
         self._refresh_db_list()
@@ -3754,7 +3876,7 @@ class KarteikartenGUI:
                 self._display_current_card()
                 
                 self.text_display.delete("1.0", tk.END)
-                self.text_display.insert("1.0", erkannter_text)
+                self.text_display.insert("1.0", str(erkannter_text or ""))
 
                 # OCR-Felder aus DB laden (editierbar)
                 self._load_ocr_fields_from_db(record_id)
@@ -3764,17 +3886,21 @@ class KarteikartenGUI:
                 if kirchenbuchtext:
                     self.kirchenbuch_text_display.insert("1.0", kirchenbuchtext)
                 
-                # F-ID und Gramps laden
+                # F-ID, Gramps, Kommentar und Erledigt laden
                 cursor = self.db.conn.cursor()
-                cursor.execute("SELECT notiz, gramps FROM karteikarten WHERE id = ?", (record_id,))
+                cursor.execute("SELECT notiz, gramps, kommentar, erledigt FROM karteikarten WHERE id = ?", (record_id,))
                 row_data = cursor.fetchone()
                 self.fid_entry.delete(0, tk.END)
                 self.gramps_entry.delete(0, tk.END)
+                self.kommentar_entry.delete(0, tk.END)
                 if row_data:
                     if row_data[0]:  # notiz
                         self.fid_entry.insert(0, row_data[0])
                     if row_data[1]:  # gramps
                         self.gramps_entry.insert(0, row_data[1])
+                    if row_data[2]:  # kommentar
+                        self.kommentar_entry.insert(0, row_data[2])
+                    self.erledigt_var.set(bool(row_data[3]))  # erledigt
                 
                 self.notebook.select(0)
             except ValueError:
@@ -4696,6 +4822,7 @@ class KarteikartenGUI:
                 with open(out_path, "w", encoding="utf-8") as f:
                     f.write(f"# XLSX-Import: nicht gematchte Einträge ({len(not_found_names)})\n")
                     f.write(f"# Importdatei: {Path(filepath).name}\n")
+                    f.write(f"# XLSX-Pfad: {filepath}\n")
                     f.write(f"# Zeitpunkt: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
                     for name in not_found_names:
                         f.write(f"{name}\n")

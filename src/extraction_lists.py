@@ -241,7 +241,7 @@ WEIBLICHE_VORNAMEN = [
     "Johanna", "Juliana", "Justina",
     "Katharina",
     "Jul", "Leisa", 
-    "Magdalena", "Marg", "Margaretha", "Margret", "Margreth", "Maria", 
+    "Magdalena", "Marg", "Margaretha", "Margarethe", "Margret", "Margreth", "Maria", 
     "Rachell", "Reg", "Regina", 
     "Sara", "Sabina", "Sophia", "Sus", "Susanna", "Susan",
     "Ursula", "Ursell",
@@ -257,6 +257,7 @@ MAENNLICHE_VORNAMEN = [
     "Eberhard", "Eberhart", "Ebert", "Eckardt", "Eckhardt", "Elias", "Emrich", "Enders", "Enderß", "Ernst", 
     "Franz", "Frantz", "Frid", "Friedrich", "Friderich", "Friderich",
     "Gaebhart", "Geo", "Gebert", "Georg", "George", "Gebert", "Görg", "Gerhardt",
+    "Gottfried", "Gottfriedt",
     "Hans", "Hanss", "Hanß", "Heinr", "Heinrich", "Henrich", "Hieronymus", "Herman",
     "Isaak",
     "Jacob", "Jean", "Joan", "Joachim", "Jochim", "Joh", "Joh.", "Johan", "Johann", "Johannes", "Joannes", "Jonas", "Joes", "Jost",  "Just", "Jurge", "Jörg", "jörg", "Jorg",
@@ -323,14 +324,22 @@ STAND_MAPPING = {
     "verlassener tochter": "verlassene Tochter",
     "verlassene tochter": "verlassene Tochter",
     "hinterlassene tochter": "hinterlassene Tochter",
+    "hinterlassene tochterlein": "hinterlassene Tochter",
+    "hinterlassene töchterlein": "hinterlassene Tochter",
+    "hinterlassene döchterlein": "hinterlassene Tochter",
     "relicta filia": "hinterlassene Tochter",  # lat.: hinterlassene Tochter
     "filia": "Tochter",                         # lat.: Tochter
+    "filiola": "Tochter",                        # lat. Dim.: Töchterlein
+    "filiolus": "Sohn",                       # lat. Dim.: Töchterlein (historische Verwendung)
     
     # Sohn
     "sohn": "Sohn",
     "sohnlein": "Sohn",
     "söhnlein": "Sohn",
     "son": "Sohn",
+    "hinterlassener sohn": "hinterlassener Sohn",
+    "hinterlassener söhnlein": "hinterlassener Sohn",
+    "hinterlassener sohnlein": "hinterlassener Sohn",
     
     # Eidam (Schwiegersohn)
     "eidam": "Eidam",

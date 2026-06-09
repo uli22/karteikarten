@@ -4,6 +4,7 @@ Diese Funktionen sind GUI-unabhängig und können direkt aufgerufen werden.
 """
 
 import re
+from datetime import datetime, timedelta
 from typing import Optional
 
 from .extraction_lists import (ANREDEN, ARTIKEL, BERUFE, BERUFS_EINLEITUNG,
@@ -101,13 +102,13 @@ def extract_kirchenbuch_titel(dateiname: str) -> str:
     return f"{match.group(1)} {match.group(2)}"
 
 
-def is_valid_date(datum: str, jahr: Optional[int]) -> bool:
+def is_valid_date(datum: str, jahr: object = None) -> bool:
     """
     Prüft ob ein Datum gültig ist (Jahr zwischen 1500 und 1754).
 
     Args:
         datum: Datumsstring (z.B. "20.11.1564" oder "00.03.1616")
-        jahr: Extrahiertes Jahr aus der Datenbank
+        jahr: Extrahiertes Jahr aus der Datenbank (int oder str)
 
     Returns:
         True wenn gültig, False wenn ungültig
@@ -117,7 +118,11 @@ def is_valid_date(datum: str, jahr: Optional[int]) -> bool:
 
     # Prüfe ob Jahr im gültigen Bereich (1500-1754)
     if jahr is not None:
-        if jahr < 1500 or jahr > 1754:
+        try:
+            jahr_int = int(jahr)
+        except (ValueError, TypeError):
+            jahr_int = None
+        if jahr_int is not None and (jahr_int < 1500 or jahr_int > 1754):
             return False
 
     match = re.match(r'^(\d{2})\.(\d{2})\.(\d{4})$', datum)
@@ -721,6 +726,8 @@ def extract_burial_fields(text: str) -> dict:
             return wort[:-1]
         elif wort.endswith('i') and len(wort) > 2:
             return wort[:-1]
+        elif wort.endswith('ens') and len(wort) > 4:
+            return wort[:-3]
         elif wort.endswith('en') and len(wort) > 3:
             return wort[:-2]
         elif wort.endswith('s') and len(wort) > 2:
@@ -737,7 +744,38 @@ def extract_burial_fields(text: str) -> dict:
     stand = None
     ort = None
 
-    while idx < len(words):
+    # === Vorverarbeitung: W. / WW. (Witwe/Witwer Abkürzung) ===
+    # Muster A: "[Partner-Vorname] [Nachname in Genitiv], W. [weiblicher Vorname]"
+    #           → W = Wittwe, weiblicher Vorname = Verstorbene, männlicher Vorname = Partner
+    # Muster B: "[Vorname] [Nachname] W." (kein weiblicher Vorname danach)
+    #           → W = Wittwer, normales Name-Parsing läuft durch
+    _w_resolved = False
+    _nachname_genitiv_stripped = False
+    _w_pos = next((i for i, w in enumerate(words) if w == "W" and i > 0), None)
+    if _w_pos is not None:
+        _next_after_w = _w_pos + 1
+        while _next_after_w < len(words) and words[_next_after_w].lower() in ignoriere_woerter:
+            _next_after_w += 1
+        if _next_after_w < len(words) and words[_next_after_w] in weibliche_vornamen:
+            # Muster A: W = Wittwe, alles vor W = Partner-Info
+            _pre_words = [w for w in words[:_w_pos]
+                          if w.lower() not in ignoriere_woerter
+                          and w.lower() not in anreden]
+            if len(_pre_words) >= 1:
+                partner = _pre_words[0]
+            if len(_pre_words) >= 2:
+                nachname = entferne_genitiv(_pre_words[1])
+                _nachname_genitiv_stripped = True
+            vorname = words[_next_after_w]
+            ist_weiblich = True
+            vorname_start_idx = _next_after_w
+            _j_v = _next_after_w + 1
+            while _j_v < len(words) and words[_j_v] in weibliche_vornamen:
+                vorname += " " + words[_j_v]
+                _j_v += 1
+            _w_resolved = True
+
+    while idx < len(words) and not _w_resolved:
         w = words[idx]
         if w in weibliche_vornamen or w in maennliche_vornamen:
             vorname_start_idx = idx
@@ -752,7 +790,7 @@ def extract_burial_fields(text: str) -> dict:
     if not vorname:
         idx = 0
 
-    if vorname and vorname_start_idx > 0:
+    if vorname and vorname_start_idx > 0 and not _w_resolved:
         if words[0].lower() not in ignoriere_woerter and words[0].lower() not in anreden:
             nachname = words[0]
 
@@ -778,11 +816,71 @@ def extract_burial_fields(text: str) -> dict:
             ):
                 vorname = first_word
                 nachname = entferne_genitiv(second_word)
+                _nachname_genitiv_stripped = True
                 vorname_start_idx = 0
 
     if vorname:
         if idx < len(words):
             next_word = words[idx]
+
+            def _ist_doppelvorname(w1_ist_weiblich, kandidat, kandidat_idx):
+                """
+                Prüft ob 'kandidat' ein zweiter Vorname (Doppelvorname) des gleichen
+                Geschlechts ist, statt ein Partner-Name.
+
+                Kriterium: nach dem Kandidaten (und ggf. weiteren gleich-geschlechtigen
+                Vornamen) folgt ein Wort, das kein Vorname und kein Stand ist
+                (= Nachname) – oder der Kandidat und das Folgewort haben BEIDE
+                dasselbe Geschlecht wie der erste Vorname (also gleicher Typ).
+                """
+                # Sammle alle aufeinanderfolgenden Vornamen gleichen Typs
+                vornamen_kandidaten = [kandidat]
+                j = kandidat_idx + 1
+                vornamen_pool = weibliche_vornamen if w1_ist_weiblich else maennliche_vornamen
+                while j < len(words) and words[j] in vornamen_pool:
+                    vornamen_kandidaten.append(words[j])
+                    j += 1
+                # Überspringe ignorierte Wörter (aber keine STAND_PRAEFIXE)
+                while (j < len(words) and
+                       words[j].lower() in ignoriere_woerter and
+                       words[j].lower() not in STAND_PRAEFIXE):
+                    j += 1
+                if j >= len(words):
+                    # Kein Folgewort → Doppelvorname wenn kandidat gleichen Geschlechts
+                    return w1_ist_weiblich == (kandidat in weibliche_vornamen)
+                nachfolger = words[j]
+                # Folgewort ist ein Stand → Kandidat ist Partner, kein Doppelvorname
+                if nachfolger.lower() in stand_synonyme:
+                    return False
+                if nachfolger.lower() in STAND_PRAEFIXE:
+                    return False
+                # Folgewort ist wieder ein Vorname desselben Typs → weiter sammeln,
+                # aber dann folgt garantiert ein Nachname → Doppelvorname
+                # Folgewort ist kein Vorname (= Nachname) → prüfe ob danach ein
+                # Sohn/Tochter/Kind-Stand folgt; dann sind die Vornamen der Vater (Partner)
+                nachfolger_ist_vorname = (nachfolger in weibliche_vornamen or
+                                          nachfolger in maennliche_vornamen)
+                if not nachfolger_ist_vorname:
+                    _kind_stände = {"sohn", "son", "sohnlein", "söhnlein",
+                                    "tochter", "dochter", "tochterlein",
+                                    "töchterlein", "döchterlein",
+                                    "filia", "filius", "filiola", "filiolus",
+                                    "kind", "wochenkind"}
+                    k = j + 1
+                    while (k < len(words) and
+                           words[k].lower() in ignoriere_woerter and
+                           words[k].lower() not in STAND_PRAEFIXE):
+                        k += 1
+                    # Auch "hinterl. Sohn/Tochter" abfangen
+                    if k < len(words) and words[k].lower() in STAND_PRAEFIXE:
+                        k += 1
+                        while (k < len(words) and
+                               words[k].lower() in STAND_PRAEFIXE):
+                            k += 1
+                    if k < len(words) and words[k].lower() in _kind_stände:
+                        return False  # [Vater Vornamen] [Nachname Gen.] Sohn/Tochter
+                    return True
+                return False
 
             if ist_weiblich and next_word in maennliche_vornamen:
                 partner = next_word
@@ -794,13 +892,27 @@ def extract_burial_fields(text: str) -> dict:
                     idx += 1
 
             elif ist_weiblich and next_word in weibliche_vornamen:
-                partner = next_word
-                idx += 1
-                while idx < len(words) and words[idx] in weibliche_vornamen:
-                    partner += " " + words[idx]
+                if _ist_doppelvorname(True, next_word, idx):
+                    # Doppelvorname: zum Vornamen hinzufügen
+                    vorname += " " + next_word
                     idx += 1
-                while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                    while idx < len(words) and words[idx] in weibliche_vornamen:
+                        vorname += " " + words[idx]
+                        idx += 1
+                    while (idx < len(words) and
+                           words[idx].lower() in ignoriere_woerter and
+                           words[idx].lower() not in STAND_PRAEFIXE):
+                        idx += 1
+                else:
+                    # Kein Doppelvorname: erster + zweiter Vorname sind beide Partner
+                    partner = vorname + " " + next_word
+                    vorname = None
                     idx += 1
+                    while idx < len(words) and words[idx] in weibliche_vornamen:
+                        partner += " " + words[idx]
+                        idx += 1
+                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                        idx += 1
 
             elif not ist_weiblich and next_word in weibliche_vornamen:
                 partner = next_word
@@ -812,13 +924,26 @@ def extract_burial_fields(text: str) -> dict:
                     idx += 1
 
             elif not ist_weiblich and next_word in maennliche_vornamen:
-                partner = next_word
-                idx += 1
-                while idx < len(words) and words[idx] in maennliche_vornamen:
-                    partner += " " + words[idx]
+                if _ist_doppelvorname(False, next_word, idx):
+                    vorname += " " + next_word
                     idx += 1
-                while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                    while idx < len(words) and words[idx] in maennliche_vornamen:
+                        vorname += " " + words[idx]
+                        idx += 1
+                    while (idx < len(words) and
+                           words[idx].lower() in ignoriere_woerter and
+                           words[idx].lower() not in STAND_PRAEFIXE):
+                        idx += 1
+                else:
+                    # Kein Doppelvorname: erster + zweiter Vorname sind beide Partner
+                    partner = vorname + " " + next_word
+                    vorname = None
                     idx += 1
+                    while idx < len(words) and words[idx] in maennliche_vornamen:
+                        partner += " " + words[idx]
+                        idx += 1
+                    while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                        idx += 1
 
         if not nachname and idx < len(words):
             w = words[idx]
@@ -832,8 +957,11 @@ def extract_burial_fields(text: str) -> dict:
                 not w.isdigit() and
                 w.lower() not in ARTIKEL):
                 nachname = entferne_genitiv(w)
+                _nachname_genitiv_stripped = True
                 idx += 1
-                while idx < len(words) and words[idx].lower() in ignoriere_woerter:
+                while (idx < len(words) and
+                       words[idx].lower() in ignoriere_woerter and
+                       words[idx].lower() not in STAND_PRAEFIXE):
                     idx += 1
 
     if not vorname and not partner and idx < len(words):
@@ -871,12 +999,14 @@ def extract_burial_fields(text: str) -> dict:
                                 potential_nachname not in maennliche_vornamen and
                                 potential_nachname not in weibliche_vornamen):
                                 nachname = entferne_genitiv(potential_nachname)
+                                _nachname_genitiv_stripped = True
                 break
             else:
                 temp_idx += 1
 
     if nachname:
-        nachname = entferne_genitiv(nachname)
+        if not _nachname_genitiv_stripped:
+            nachname = entferne_genitiv(nachname)
         if nachname:
             nachname = nachname[0].upper() + nachname[1:] if len(nachname) > 1 else nachname.upper()
 
@@ -979,6 +1109,17 @@ def extract_burial_fields(text: str) -> dict:
         elif words[i].lower() == "ein" and i + 1 < len(words) and words[i + 1].lower() in stand_synonyme:
             stand_prefix = ""
             j = i + 1
+        elif words[i] == "W":
+            # W. Abkürzung: Wittwe wenn weiblicher Vorname folgt, sonst Wittwer
+            _wi_next = i + 1
+            while _wi_next < len(words) and words[_wi_next].lower() in ignoriere_woerter:
+                _wi_next += 1
+            if _wi_next < len(words) and words[_wi_next] in weibliche_vornamen:
+                stand = "Wittwe"
+            else:
+                stand = "Wittwer"
+            idx = i + 1
+            break
         else:
             j = i
 
@@ -986,7 +1127,22 @@ def extract_burial_fields(text: str) -> dict:
             word_lower = words[j].lower()
             stand = STAND_MAPPING.get(word_lower, words[j].capitalize())
             if stand_prefix:
-                stand = stand_prefix + stand
+                _hinterl_kuerzel = {"hinterl.", "hinterl", "hinterlassen", "hinterlassene", "hinterlassener"}
+                if stand_prefix.strip().lower() in _hinterl_kuerzel:
+                    _feminine_stands = {
+                        "tochter", "dochter", "tochterlein", "töchterlein", "döchterlein",
+                        "witwe", "wittib", "wittwe", "witbe", "widwe", "vidua",
+                        "hausfrau", "haußfrau", "filia"
+                    }
+                    _masculine_stands = {"sohn", "söhnlein", "sohnlein", "son", "filius"}
+                    if word_lower in _masculine_stands:
+                        stand = "hinterlassener " + stand
+                    elif word_lower in _feminine_stands:
+                        stand = "hinterlassene " + stand
+                    else:
+                        stand = stand_prefix + stand
+                else:
+                    stand = stand_prefix + stand
             idx = j + 1
             break
 
@@ -997,12 +1153,27 @@ def extract_burial_fields(text: str) -> dict:
                 stand = stand_value
                 break
 
+    # === Witwe/Wittwer: hinterlassene-Präfix entfernen ===
+    # Bei Tochter/Sohn ist das Präfix inhaltlich bedeutsam; bei Witwe/Wittwer ist
+    # das Präfix redundant (Wittwe impliziert bereits den hinterlassenen Status).
+    _stand_gender_locked = False  # verhindert Gender-Flip nach bewusstem Witwe/Wittwer-Lookup
+    if stand:
+        _witwe_bases = {"wittwe", "witwe", "wittib", "witbe", "widwe", "vidua",
+                        "wittwer", "witwer"}
+        _sl = stand.lower()
+        if _sl.startswith(("hinterlassene ", "hinterlassener ")):
+            _base = _sl.split()[-1]
+            if _base in _witwe_bases:
+                stand = STAND_MAPPING.get(_base, stand.split()[-1].capitalize())
+                _stand_gender_locked = True  # Witwe/Wittwer wurde explizit so bestimmt
+
     # === Gender-Validierung des Stand ===
-    if stand and vorname:
+    # Nur für Witwe/Witwer: ein männlicher Witwer darf nicht als "Witwe" stehen und umgekehrt.
+    # Tochter/Sohn werden NICHT geflippt: ein männlicher Vorname vor "Töchterlein" bedeutet,
+    # dass der Mann der Vater (Partner) ist – die Partner-Logik darunter regelt das korrekt.
+    if stand and vorname and not _stand_gender_locked:
         stand_lower = stand.lower()
         stand_gender_pairs = {
-            "tochter": "sohn", "dochter": "sohn", "tochterlein": "sohnlein",
-            "töchterlein": "söhnlein", "döchterlein": "söhnlein",
             "witwe": "witwer", "wittib": "wittwer", "wittwe": "wittwer",
             "witbe": "witwer", "widwe": "witwer", "vidua": "witwer",
         }
@@ -1010,12 +1181,15 @@ def extract_burial_fields(text: str) -> dict:
         stand_base = stand_lower.split()[-1] if ' ' in stand_lower else stand_lower
         vorname_is_female = ist_weiblich
         stand_is_female = stand_base in [
-            "tochter", "dochter", "tochterlein", "töchterlein", "döchterlein",
             "witwe", "wittib", "wittwe", "witbe", "widwe", "vidua", "hausfrau", "haußfrau"
         ]
 
         if vorname_is_female != stand_is_female:
-            if stand_base in stand_gender_pairs:
+            # Kein Flip wenn Stand bereits explizit mit hinterlassene(r)-Präfix gesetzt wurde
+            _hat_hinterl_prefix = stand_lower.startswith(("hinterlassene ", "hinterlassener "))
+            if _hat_hinterl_prefix:
+                pass  # Präfix wurde bewusst gesetzt – nicht überschreiben
+            elif stand_base in stand_gender_pairs:
                 if not vorname_is_female:
                     correct_stand = stand_gender_pairs[stand_base]
                     stand = STAND_MAPPING.get(correct_stand, correct_stand.capitalize())
@@ -1126,7 +1300,8 @@ def extract_burial_fields(text: str) -> dict:
     # === Hausfrau-Sonderfall ===
     weibliche_stände = ["hausfrau", "haußfrau", "wittwe", "wittib", "wittwe", "witbe", "widwe"]
 
-    if stand and stand.lower() in weibliche_stände and vorname and ist_weiblich:
+    # Nicht ausführen wenn Namen durch W.-Vorverarbeitung bereits korrekt gesetzt wurden
+    if stand and stand.lower() in weibliche_stände and vorname and ist_weiblich and not _w_resolved:
         search_start = vorname_start_idx + 1
         while search_start < len(words) and words[search_start] in weibliche_vornamen:
             search_start += 1
@@ -1338,6 +1513,81 @@ _MONAT_MAP: dict[str, int] = {
 # "huius" (= dieses Monats) – Taufdatum übernimmt Geburtsmonat
 _HUIUS_TOKENS = frozenset({'hs', 'h', 'huj', 'huius', 'hujus', 'ejusdem', 'ej', 'eodem', 'eod'})
 
+# Sonntagsnamen (Kirchenjahr) → Offset in Tagen zu Ostersonntag
+_SONNTAG_NAMEN: dict[str, int] = {
+    'invocavit': -42,       # 1. Fastensonntag  (6 Wochen vor Ostern)
+    'reminiscere': -35,     # 2. Fastensonntag  (5 Wochen vor Ostern)
+    'oculi': -28,           # 3. Fastensonntag  (4 Wochen vor Ostern)
+    'laetare': -21,         # 4. Fastensonntag  (3 Wochen vor Ostern)
+    'judica': -14,          # 5. Fastensonntag  (2 Wochen vor Ostern, Passionssonntag)
+    'palmarum': -7,         # Palmsonntag        (1 Woche vor Ostern)
+    'ostern': 0,            # Ostersonntag
+    'quasimodogeniti': 7,   # 1. Sonntag nach Ostern
+    'misericordias': 14,    # 2. Sonntag nach Ostern
+    'jubilate': 21,         # 3. Sonntag nach Ostern
+    'cantate': 28,          # 4. Sonntag nach Ostern
+    'rogate': 35,           # 5. Sonntag nach Ostern (Sonntag vor Himmelfahrt)
+    'exaudi': 42,           # 6. Sonntag nach Ostern (Sonntag vor Pfingsten)
+    'pfingsten': 49,        # Pfingstsonntag (7 Wochen nach Ostern)
+    'trinitatis': 56,       # Trinitatis (1. Sonntag nach Pfingsten)
+}
+
+# Präfixe, die vor Sonntagsnamen stehen können (werden ignoriert)
+_SONNTAG_PRAEFIXE = frozenset({'dom', 'dominica', 'domonica', 'sonntag', 'sontag', 'so'})
+
+# Monatsnamen, die fälschlich wie Sonntagsnamen aussehen könnten – zur Sicherheit
+_SONNTAG_MONATS_AUSSCHLUSS = frozenset({'mart', 'martii', 'martij', 'mai', 'maii', 'maij'})
+
+
+def _calculate_easter(year: int) -> tuple[int, int, int]:
+    """Berechnet das Datum des Ostersonntags (Gregorianischer Kalender, Gaußsche Osterformel).
+    Returns (year, month, day) als Tuple."""
+    a = year % 19
+    b = year // 100
+    c = year % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19 * a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2 * e + 2 * i - h - k) % 7
+    m = (a + 11 * h + 22 * l) // 451
+    month = (h + l - 7 * m + 114) // 31
+    day = ((h + l - 7 * m + 114) % 31) + 1
+    return (year, month, day)
+
+
+def _calculate_easter_julian(year: int) -> tuple[int, int, int]:
+    """Berechnet das Datum des Ostersonntags nach dem julianischen Kalender.
+    Für historische Kirchenbucheinträge (vor 1700) zu verwenden.
+    Returns (year, month, day) als Tuple."""
+    a = year % 4
+    b = year % 7
+    c = year % 19
+    d = (19 * c + 15) % 30
+    e = (2 * a + 4 * b - d + 34) % 7
+    f = d + e + 114
+    month = f // 31
+    day = f % 31 + 1
+    return (year, month, day)
+
+
+def _sonntag_zu_datum(sonntag_name: str, jahr: int, julianisch: bool = True) -> Optional[str]:
+    """Wandelt einen Sonntagsnamen (z.B. 'Invocavit') in ein Datum YYYY.MM.DD um.
+    julianisch=True (Default) für historische Einträge vor Gregorianischer Kalenderreform.
+    Gibt None zurück, wenn der Name nicht bekannt ist."""
+    key = re.sub(r'[^a-z]', '', sonntag_name.lower())
+    offset = _SONNTAG_NAMEN.get(key)
+    if offset is None:
+        return None
+    from datetime import datetime, timedelta
+    easter = _calculate_easter_julian(jahr) if julianisch else _calculate_easter(jahr)
+    easter_date = datetime(easter[0], easter[1], easter[2])
+    target = easter_date + timedelta(days=offset)
+    return target.strftime('%Y.%m.%d')
+
 
 def _parse_historical_date(day_str: str, month_str: str, year_str: Optional[str], base_year: Optional[int]) -> Optional[str]:
     """Konvertiert historisches Datum (DD. MONAT [Ao YY]) → YYYY.MM.DD."""
@@ -1408,8 +1658,12 @@ def extract_baptism_fields(text: str) -> dict:
     m = re.match(zitation_pattern, text, re.IGNORECASE)
     if m:
         jahr = int(m.group(1))
+        monat, tag = int(m.group(2)), int(m.group(3))
         result['seite'] = int(m.group(4))
         result['nummer'] = int(m.group(5))
+        # Zitationsdatum als primäres Taufdatum (z.B. 1662.11.26)
+        if 1 <= monat <= 12 and 1 <= tag <= 31:
+            result['todestag'] = f"{jahr}.{monat:02d}.{tag:02d}"
         after_zitation = text[m.end():].strip()
     else:
         after_zitation = text.strip()
@@ -1420,7 +1674,7 @@ def extract_baptism_fields(text: str) -> dict:
     after_zitation = re.sub(r'\[[^\]]*\]', '', after_zitation).strip()
 
     # --- 2. Vater-Block und Mutter-Vorname ---
-    # Unterstützte Trennwörter: "mit", "und ... eheleuten" und "und seiner Ehel. hausfrawen"
+    # Unterstützte Trennwörter: "mit", "und ... eheleuten", "und seiner Ehel. hausfrawen" und "u." (und-Abkürzung)
     trenn_m = re.search(r'\bmit\b', after_zitation, re.IGNORECASE)
     # Variante "und [Mutter-VN(s)] eheleuten/eheleute"
     und_ehe_m = re.search(
@@ -1432,8 +1686,12 @@ def extract_baptism_fields(text: str) -> dict:
         r'\bund\s+sein(?:er?)?\s+[Ee]hel[a-z\.]*\s+[Hh]ausfr[a-zäöü\.]*\s+(\S+)',
         after_zitation, re.IGNORECASE
     )
+    # Variante "u." als Abkürzung für "und" (z.B. "Gottfriedt Walpracht u. Margarethe")
+    # Nur im Teil vor "~" suchen, um Fehlmatches im Gevatter-Teil zu vermeiden
+    text_vor_taufe = after_zitation.split('~')[0] if '~' in after_zitation else after_zitation
+    trenn_u = re.search(r'\bu\.', text_vor_taufe)
 
-    if trenn_m or und_ehe_m or und_hausfr_m:
+    if trenn_m or und_ehe_m or und_hausfr_m or trenn_u:
         if trenn_m:
             vater_block = after_zitation[:trenn_m.start()].strip()
             after_trenn = after_zitation[trenn_m.end():].strip()
@@ -1441,10 +1699,14 @@ def extract_baptism_fields(text: str) -> dict:
             # "und [Name] eheleuten"-Format: Vater steht vor dem "und"
             vater_block = after_zitation[:und_ehe_m.start()].strip()
             after_trenn = after_zitation[und_ehe_m.end():].strip()
-        else:
+        elif und_hausfr_m:
             # "und seiner Ehel. hausfrawen"-Format: Vater steht vor dem "und"
             vater_block = after_zitation[:und_hausfr_m.start()].strip()
             after_trenn = after_zitation[und_hausfr_m.end():].strip()
+        else:
+            # "u."-Format: Vater steht vor "u.", Mutter danach
+            vater_block = after_zitation[:trenn_u.start()].strip()
+            after_trenn = after_zitation[trenn_u.end():].strip()
 
         # Vater: Anreden überspringen → VN + NN
         vater_tokens = [t for t in re.split(r'[\s,;.]+', vater_block) if t]
@@ -1509,31 +1771,51 @@ def extract_baptism_fields(text: str) -> dict:
             result['datum_geburt'] = d
             break
 
-    # --- 5. Taufdatum: ~ DD. MONAT [Ao YY] ---
-    tauf_re = re.compile(
-        r'~\s*(\d{1,2})\.?\s*([A-Za-zä]+)\.?\s*(?:Ao?\.?\s*(\d{2,4}))?',
-        re.IGNORECASE
-    )
-    tm = tauf_re.search(after_zitation)
-    if tm:
-        monat_token = re.sub(r'[^a-z]', '', tm.group(2).lower())
-        if monat_token in _HUIUS_TOKENS:
-            # "huius"/"hs" = dieses Monats → Monat aus Geburtsdatum übernehmen
-            geb_monat = None
-            if result.get('datum_geburt'):
-                gm2 = re.match(r'(\d{4})\.(\d{2})\.(\d{2})', result['datum_geburt'])
-                if gm2:
-                    geb_monat = int(gm2.group(2))
-            if geb_monat:
-                try:
-                    tauf_tag = int(tm.group(1))
-                    result['todestag'] = f"{jahr}.{geb_monat:02d}.{tauf_tag:02d}"
-                except (ValueError, TypeError):
-                    pass
+    # --- 5. Taufdatum: nur Fallback, wenn kein Zitations-Datum vorhanden ---
+    if result['todestag'] is None:
+        tauf_re = re.compile(
+            r'~\s*(\d{1,2})\.?\s*([A-Za-zä]+)\.?\s*(?:Ao?\.?\s*(\d{2,4}))?',
+            re.IGNORECASE
+        )
+        tm = tauf_re.search(after_zitation)
+        if tm:
+            monat_token = re.sub(r'[^a-z]', '', tm.group(2).lower())
+            if monat_token in _HUIUS_TOKENS:
+                # "huius"/"hs" = dieses Monats → Monat aus Geburtsdatum übernehmen
+                geb_monat = None
+                if result.get('datum_geburt'):
+                    gm2 = re.match(r'(\d{4})\.(\d{2})\.(\d{2})', result['datum_geburt'])
+                    if gm2:
+                        geb_monat = int(gm2.group(2))
+                if geb_monat:
+                    try:
+                        tauf_tag = int(tm.group(1))
+                        result['todestag'] = f"{jahr}.{geb_monat:02d}.{tauf_tag:02d}"
+                    except (ValueError, TypeError):
+                        pass
+            else:
+                d = _parse_historical_date(tm.group(1), tm.group(2), tm.group(3), jahr)
+                if d:
+                    result['todestag'] = d
         else:
-            d = _parse_historical_date(tm.group(1), tm.group(2), tm.group(3), jahr)
-            if d:
-                result['todestag'] = d
+            # Fallback: Sonntagsname nach ~ (z.B. "~ Dom. Invocavit", "~ Invocavit")
+            sonntag_re = re.compile(
+                r'~\s*(?:(?:Dom(?:inic)?(?:a)?)\.?\s*)?'  # optionales "Dom." / "Dominica"
+                r'([A-ZÄÖÜ][a-zäöüß]+)',  # Sonntagsname (z.B. Invocavit)
+                re.IGNORECASE
+            )
+            sm = sonntag_re.search(after_zitation)
+            if sm and jahr:
+                sonntag_key = re.sub(r'[^a-z]', '', sm.group(1).lower())
+                # Ausschluss: echte Monatsnamen nicht als Sonntag interpretieren
+                if sonntag_key not in _SONNTAG_MONATS_AUSSCHLUSS:
+                    d = _sonntag_zu_datum(sonntag_key, jahr)
+                    if d:
+                        result['todestag'] = d
+            if sonntag_key not in _SONNTAG_MONATS_AUSSCHLUSS:
+                d = _sonntag_zu_datum(sonntag_key, jahr)
+                if d:
+                    result['todestag'] = d
 
     # --- 6. Täufling-Vorname: letzte bekannte Vornamen am Textende ---
     body_clean = re.sub(r'[,;]+', ' ', after_zitation)

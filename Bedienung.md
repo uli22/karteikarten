@@ -142,6 +142,17 @@ Bei ungültigem Ausdruck erscheint eine Fehlermeldung – die Suche wird nicht a
 - **Dateiname** - Name der Bilddatei
 - **Erkannter Text** - Vollständiger OCR-Text
 
+**Farbmarkierungen in der Tabellen-Ansicht:**
+
+| Farbe | Bedeutung |
+|-------|-----------|
+| ![#d4edda](https://placehold.co/12x12/d4edda/d4edda) `#d4edda` grün | **F-ID (Notiz)** ist gesetzt |
+| ![#c3f0ca](https://placehold.co/12x12/c3f0ca/c3f0ca) `#c3f0ca` hellgrün | **Kirchenbuchtext** ist vorhanden |
+| ![#cfe2ff](https://placehold.co/12x12/cfe2ff/cfe2ff) `#cfe2ff` blau | **Gramps-ID** ist gesetzt |
+| ![#dc3545](https://placehold.co/12x12/dc3545/dc3545) `#dc3545` rot | **Datum** ist ungültig (weder TT.MM.JJJJ noch JJJJ.MM.TT) |
+
+Die Markierungen gelten sowohl für den **Erkenner** als auch für den **Reader**.
+
 **Sortierung:**
 - Klick auf Spaltenüberschrift zum Sortieren
 - Standard: Jahr absteigend, dann Datum, dann Nummer

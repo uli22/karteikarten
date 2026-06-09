@@ -23,6 +23,8 @@ from .extractor import extract_kirchenbuch_titel
 from .gedcom_exporter import GedcomExporter
 from .online_sync import OnlineSyncService
 
+VERSION = "0.4.5"
+
 
 class KarteikartenReader:
     """Leseanwendung: Zeigt die Datenbank an, erlaubt Suche/Filter.
@@ -122,8 +124,12 @@ class KarteikartenReader:
         settings_tab = ttk.Frame(self.notebook)
         self.notebook.add(settings_tab, text="⚙️ Einstellungen")
 
+        about_tab = ttk.Frame(self.notebook)
+        self.notebook.add(about_tab, text="ℹ️ Über")
+
         self._create_db_tab(db_tab)
         self._create_settings_tab(settings_tab)
+        self._create_about_tab(about_tab)
 
     # ------------------------------------------------------------------
     # Über-Dialog
@@ -137,13 +143,91 @@ class KarteikartenReader:
         win.grab_set()
         tk.Label(win, text="Wetzlar Karteikarten – Leser",
                  font=("TkDefaultFont", 13, "bold")).pack(padx=30, pady=(20, 4))
-        tk.Label(win, text="Version 0.4.3").pack(padx=30)
+        tk.Label(win, text=f"Version {VERSION}").pack(padx=30)
         tk.Label(win, text="© 2026 – Wetzlar Projekt",
                  foreground="gray").pack(padx=30, pady=(4, 16))
         tk.Button(win, text="OK", width=10,
                   command=win.destroy).pack(pady=(0, 20))
         win.bind("<Return>", lambda _e: win.destroy())
         win.bind("<Escape>", lambda _e: win.destroy())
+
+    # ------------------------------------------------------------------
+    # Über-Tab
+    # ------------------------------------------------------------------
+
+    def _create_about_tab(self, parent):
+        """Erstellt den 'ℹ️ Über'-Tab mit Versionsinfo."""
+        outer = ttk.Frame(parent)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        main_frame = ttk.Frame(canvas)
+
+        def _on_frame_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(window_id, width=event.width)
+
+        window_id = canvas.create_window((0, 0), window=main_frame, anchor="nw")
+        main_frame.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def _bind_mousewheel(widget):
+            widget.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
+
+        _bind_mousewheel(canvas)
+        _bind_mousewheel(main_frame)
+
+        # === App-Name ===
+        ttk.Label(main_frame, text="Wetzlar Karteikarten – Leser",
+                  font=("Arial", 18, "bold")).pack(pady=(40, 8))
+
+        ttk.Label(main_frame, text=f"Version {VERSION}",
+                  font=("Arial", 14)).pack(pady=(0, 20))
+
+        ttk.Label(main_frame, text="© 2026 – Wetzlar Projekt",
+                  foreground="gray", font=("Arial", 10)).pack(pady=(0, 30))
+
+        # === Trennlinie ===
+        ttk.Separator(main_frame, orient="horizontal").pack(fill=tk.X, padx=40, pady=(0, 20))
+
+        # === Beschreibung ===
+        desc = (
+            "Eigenständige Leseanwendung für die Wetzlarer Karteikarten-Datenbank.\n\n"
+            "Diese Anwendung dient ausschließlich zum Anzeigen, Durchsuchen und\n"
+            "Exportieren der Daten. Schreibzugriff erfolgt nur auf das F-ID-Notizfeld."
+        )
+        ttk.Label(main_frame, text=desc, justify=tk.CENTER,
+                  font=("Arial", 10)).pack(padx=40, pady=(0, 20))
+
+        ttk.Separator(main_frame, orient="horizontal").pack(fill=tk.X, padx=40, pady=(0, 20))
+
+        # === Technik ===
+        tech_frame = ttk.LabelFrame(main_frame, text="Technik", padding=15)
+        tech_frame.pack(fill=tk.X, padx=40, pady=(0, 20))
+
+        tech_lines = [
+            ("Sprache:", "Python 3.13+"),
+            ("GUI:", "Tkinter (ttk)"),
+            ("Datenbank:", "SQLite (karteikarten.db)"),
+            ("Build:", "PyInstaller"),
+        ]
+        for label, value in tech_lines:
+            row = ttk.Frame(tech_frame)
+            row.pack(fill=tk.X, pady=2)
+            ttk.Label(row, text=label, width=16, anchor=tk.E,
+                      font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=(0, 10))
+            ttk.Label(row, text=value, font=("Arial", 10)).pack(side=tk.LEFT)
+
+        # === Hinweis ===
+        ttk.Label(main_frame, text="Dies ist ein Open-Source-Projekt.",
+                  foreground="gray", font=("Arial", 9, "italic")).pack(pady=(0, 30))
 
     # ------------------------------------------------------------------
     # Datenbank-Tab
@@ -261,6 +345,7 @@ class KarteikartenReader:
             "Bräutigam Vater", "Braut Vater", "Braut Nachname", "Braut Ort",
             "Bräutigam Stand", "Braut Stand", "Mutter Vorname", "Datum Geburt", "Todestag", "Geb.Jahr (gesch.)",
             "Dateiname", "Notiz", "Gramps", "Text",
+            "Kommentar", "Erledigt",
         )
         self.tree = ttk.Treeview(
             tree_frame,
@@ -288,6 +373,7 @@ class KarteikartenReader:
             "Mutter Vorname": 100, "Datum Geburt": 80,
             "Todestag": 80, "Geb.Jahr (gesch.)": 60,
             "Dateiname": 80, "Notiz": 50, "Gramps": 50, "Text": 400,
+            "Kommentar": 200, "Erledigt": 20,
         }
         for col, w in col_widths.items():
             self.tree.column(col, width=w, anchor="w" if col not in ("ID", "Jahr", "Seite", "Nr", "Notiz", "ISO_datum", "Datum") else "center")
@@ -300,6 +386,7 @@ class KarteikartenReader:
         self.tree.tag_configure("has_kirchenbuchtext", background="#c3f0ca")
         self.tree.tag_configure("has_gramps", background="#cfe2ff")
         self.tree.tag_configure("invalid_date", foreground="#dc3545", font=("Arial", 9, "bold"))
+        self.tree.tag_configure("erledigt", background="#f8d7da")  # rot für erledigt
 
         self.tree.pack(fill=tk.BOTH, expand=True)
 
@@ -309,6 +396,7 @@ class KarteikartenReader:
         # Kontextmenü
         self.tree_menu = tk.Menu(self.tree, tearoff=0)
         self.tree_menu.add_command(label="F-ID bearbeiten", command=self._edit_fid)
+        self.tree_menu.add_command(label="Kommentar bearbeiten", command=self._edit_comment)
         self.tree_menu.add_separator()
         self.tree_menu.add_command(label="Karteikarte anzeigen", command=self._show_selected_card_image)
         self.tree_menu.add_command(label="Kirchenbuch anzeigen", command=self._show_selected_kirchenbuch)
@@ -611,7 +699,8 @@ class KarteikartenReader:
                 "vorname, nachname, partner, beruf, ort, "
                 "braeutigam_vater, braut_vater, braut_nachname, braut_ort, "
                 "braeutigam_stand, stand, mutter_vorname, datum_geburt, todestag, geb_jahr_gesch, "
-                "dateiname, notiz, erkannter_text, kirchenbuchtext, gramps "
+                "dateiname, notiz, erkannter_text, kirchenbuchtext, gramps, "
+                "kommentar, erledigt "
                 "FROM karteikarten WHERE 1=1"
             )
             params = []
@@ -731,12 +820,14 @@ class KarteikartenReader:
                     safe(15), safe(16), safe(17), safe(18), safe(19),
                     safe(20), safe(21), safe(22), safe(23), safe(24),
                     safe(27), safe(25),
+                    safe(28), safe(29),
                 )
 
                 notiz = safe(24)
                 notiz_werte.append(notiz)
                 kirchenbuchtext = safe(26)
                 gramps = safe(27)
+                erledigt_val = safe(29)
                 jahr = safe(1)
                 datum = safe(2)
                 is_valid_date = self._is_valid_date(datum, jahr)
@@ -750,6 +841,8 @@ class KarteikartenReader:
                     tags.append("has_gramps")
                 if not is_valid_date and datum:
                     tags.append("invalid_date")
+                if erledigt_val != "1":
+                    tags.append("erledigt")
 
                 self.tree.insert("", tk.END, values=values, tags=tuple(tags))
 
@@ -1096,6 +1189,70 @@ class KarteikartenReader:
     # ------------------------------------------------------------------
     # Kontextmenü-Aktionen
     # ------------------------------------------------------------------
+
+    def _edit_comment(self):
+        """Öffnet Dialog zum Bearbeiten von Kommentar und Erledigt-Status."""
+        selection = self.tree.selection()
+        if not selection:
+            return
+
+        item = selection[0]
+        record_id = self.tree.item(item)["values"][0]
+
+        cursor = self.db.conn.cursor()
+        cursor.execute("SELECT kommentar, erledigt, dateiname FROM karteikarten WHERE id = ?", (record_id,))
+        row = cursor.fetchone()
+        if not row:
+            return
+
+        current_kommentar = row[0] if row[0] else ""
+        current_erledigt = bool(row[1])
+        dateiname = row[2]
+
+        dialog = tk.Toplevel(self.root)
+        dialog.title(f"Kommentar: {dateiname}")
+        dialog.geometry("500x280")
+        dialog.transient(self.root)
+        dialog.grab_set()
+
+        ttk.Label(dialog, text="Kommentar:", font=("Arial", 10, "bold")).pack(anchor=tk.W, padx=20, pady=(20, 5))
+        text_widget = tk.Text(dialog, font=("Arial", 10), height=5, width=50, wrap=tk.WORD)
+        text_widget.pack(padx=20, pady=5, fill=tk.BOTH, expand=True)
+        text_widget.insert("1.0", current_kommentar)
+        text_widget.focus()
+
+        erledigt_var = tk.BooleanVar(value=current_erledigt)
+        cb = ttk.Checkbutton(dialog, text="Erledigt", variable=erledigt_var)
+        cb.pack(anchor=tk.W, padx=20, pady=(5, 0))
+
+        btn_frame = ttk.Frame(dialog)
+        btn_frame.pack(fill=tk.X, padx=20, pady=10)
+
+        def save_comment():
+            new_kommentar = text_widget.get("1.0", tk.END).strip()
+            new_kommentar = new_kommentar if new_kommentar else None
+            new_erledigt = erledigt_var.get()
+            self.db.update_kommentar_erledigt(record_id, new_kommentar, new_erledigt, updated_by='reader')
+            # TreeView aktualisieren
+            values = list(self.tree.item(item)["values"])
+            values[27] = new_kommentar if new_kommentar else ""     # Kommentar-Spalte
+            values[28] = "1" if new_erledigt else ""                # Erledigt-Spalte
+            self.tree.item(item, values=values)
+            # Tags aktualisieren
+            current_tags = list(self.tree.item(item)["tags"])
+            if not new_erledigt:
+                if "erledigt" not in current_tags:
+                    current_tags.append("erledigt")
+            else:
+                if "erledigt" in current_tags:
+                    current_tags.remove("erledigt")
+            self.tree.item(item, tags=current_tags)
+            dialog.destroy()
+
+        ttk.Button(btn_frame, text="Speichern", command=save_comment).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Abbrechen", command=dialog.destroy).pack(side=tk.LEFT, padx=5)
+        text_widget.bind("<Control-Return>", lambda e: save_comment())
+        dialog.bind("<Escape>", lambda e: dialog.destroy())
 
     def _show_tree_menu(self, event):
         item = self.tree.identify_row(event.y)
