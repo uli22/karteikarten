@@ -828,6 +828,7 @@ class KarteikartenReader:
                 kirchenbuchtext = safe(26)
                 gramps = safe(27)
                 erledigt_val = safe(29)
+                kommentar = safe(28)  # Index 28 = kommentar
                 jahr = safe(1)
                 datum = safe(2)
                 is_valid_date = self._is_valid_date(datum, jahr)
@@ -841,7 +842,8 @@ class KarteikartenReader:
                     tags.append("has_gramps")
                 if not is_valid_date and datum:
                     tags.append("invalid_date")
-                if erledigt_val != "1":
+                # Rot nur wenn Kommentar vorhanden UND nicht erledigt
+                if kommentar and erledigt_val != "1":
                     tags.append("erledigt")
 
                 self.tree.insert("", tk.END, values=values, tags=tuple(tags))
@@ -1238,9 +1240,10 @@ class KarteikartenReader:
             values[27] = new_kommentar if new_kommentar else ""     # Kommentar-Spalte
             values[28] = "1" if new_erledigt else ""                # Erledigt-Spalte
             self.tree.item(item, values=values)
-            # Tags aktualisieren
+            # Tags aktualisieren (rot nur wenn Kommentar vorhanden UND nicht erledigt)
             current_tags = list(self.tree.item(item)["tags"])
-            if not new_erledigt:
+            has_comment = bool(new_kommentar)
+            if has_comment and not new_erledigt:
                 if "erledigt" not in current_tags:
                     current_tags.append("erledigt")
             else:
