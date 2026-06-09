@@ -72,6 +72,7 @@ _SYNC_FIELDS = [
     "mutter_vorname", "datum_geburt",
     "notiz", "fid", "gramps",
     "fid_reader", "fid_erkennung",
+    "kommentar", "erledigt",
     "version", "updated_by", "aktualisiert_am",
 ]
 
@@ -175,12 +176,28 @@ class MySQLConnection:
                 gramps VARCHAR(32),
                 fid_reader VARCHAR(256),
                 fid_erkennung VARCHAR(256),
+                kommentar TEXT,
+                erledigt TINYINT DEFAULT 0,
                 version INT DEFAULT 1,
                 updated_by VARCHAR(64),
                 aktualisiert_am DATETIME,
                 erstellt_am DATETIME DEFAULT CURRENT_TIMESTAMP
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_general_ci
         """)
+        # Migration: fehlende Spalten nachträglich hinzufügen
+        cur.execute("SHOW COLUMNS FROM karteikarten")
+        existing_cols = {row['Field'] for row in cur.fetchall()}
+        mysql_migrations = [
+            ('kommentar', 'TEXT'),
+            ('erledigt', 'TINYINT DEFAULT 0'),
+        ]
+        for col_name, col_type in mysql_migrations:
+            if col_name not in existing_cols:
+                try:
+                    cur.execute(f"ALTER TABLE karteikarten ADD COLUMN {col_name} {col_type}")
+                except Exception:
+                    pass  # Spalte existiert möglicherweise doch
+        self._conn.commit()
         cur.execute("""
             CREATE TABLE IF NOT EXISTS sync_state (
                 state_key VARCHAR(64) NOT NULL PRIMARY KEY,

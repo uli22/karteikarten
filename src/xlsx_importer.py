@@ -129,7 +129,10 @@ def build_match_keys(value) -> set:
     base_no_inf = re.sub(r"_inf$", "", base, flags=re.IGNORECASE)
     base_no_erf = re.sub(r"_erf$", "", base, flags=re.IGNORECASE)
     base_no_inf_erf = re.sub(r"_erf$", "", base_no_inf, flags=re.IGNORECASE)
-    for candidate in (raw, base, base_no_inf, base_no_erf, base_no_inf_erf):
+    # Zusätzliche Normalisierung: Leerzeichen um Bindestriche entfernen
+    # Dadurch matchen auch abweichende Schreibweisen wie "1670-1633" vs "1670 - 1633"
+    base_compact = re.sub(r"\s*-\s*", "-", base)
+    for candidate in (raw, base, base_no_inf, base_no_erf, base_no_inf_erf, base_compact):
         key = normalize_key(candidate)
         if key:
             keys.add(key)
@@ -195,6 +198,7 @@ def run_xlsx_import(
     errors = 0
     total_rows = max(ws.max_row - 1, 0)
     created_at = "2026-01-16 00:00:00"
+    all_updated_ids: list[int] = []  # IDs der tatsächlich aktualisierten Datensätze
 
     for row_index, row in enumerate(ws.iter_rows(min_row=2, values_only=True), start=1):
         if row_progress_callback:
@@ -289,13 +293,16 @@ def run_xlsx_import(
                     ),
                 )
             updated += len(matched_ids)
+            all_updated_ids.extend(matched_ids)
         except Exception:
             errors += 1
 
     db.conn.commit()
 
-    all_record_ids = [rid for ids in key_to_ids.values() for rid in ids]
-    for record_id in all_record_ids:
+    # Nur die IDs markieren, die tatsächlich aktualisiert wurden (nicht alle DB-IDs!)
+    all_updated_ids = list(dict.fromkeys(all_updated_ids))
+
+    for record_id in all_updated_ids:
         try:
             db.mark_record_for_sync(record_id)
         except Exception:
