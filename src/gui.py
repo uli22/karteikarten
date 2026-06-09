@@ -3410,6 +3410,7 @@ class KarteikartenGUI:
                 notiz_werte.append(notiz)
                 kirchenbuchtext = safe(26)  # Index 26 = kirchenbuchtext
                 gramps = safe(27)  # Index 27 = gramps
+                kommentar = safe(28)  # Index 28 = kommentar
                 erledigt_val = safe(29)  # Index 29 = erledigt
                 try:
                     jahr_str = str(jahr_raw).strip() if jahr_raw is not None else ''
@@ -3428,7 +3429,8 @@ class KarteikartenGUI:
                     tags.append('has_gramps')
                 if not date_valid and datum:
                     tags.append('invalid_date')
-                if erledigt_val != '1':
+                # Rot nur wenn Kommentar vorhanden UND nicht erledigt
+                if kommentar and erledigt_val != '1':
                     tags.append('erledigt')
 
                 self.tree.insert('', tk.END, values=values, tags=tuple(tags))
