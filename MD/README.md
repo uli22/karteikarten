@@ -1,0 +1,177 @@
+# Wetzlar Karteikartenerkennung
+
+Automatische Handschrifterkennung (OCR) für historische Kirchenbuchkarteien aus Wetzlar.
+
+## Beschreibung
+
+Dieses Projekt nutzt modernste OCR-Technologie (EasyOCR), um handgeschriebenen Text auf gescannten Karteikarten zu erkennen. Es wurde speziell für die Verarbeitung der Wetzlar Kirchenbuchkartei entwickelt.
+
+### Features
+
+- 📸 **Karteikarten-Viewer**: Anzeige von gescannten Karteikarten
+- 🔍 **OCR-Engine**: Automatische Handschrifterkennung mit EasyOCR
+- 🇩🇪 **Deutsche Sprache**: Optimiert für deutsche Handschrift
+- 💾 **Export**: Speichern der erkannten Texte als TXT-Dateien
+- ⌨️ **Navigation**: Einfaches Durchblättern durch die Karteikarten
+
+## Installation
+
+### Voraussetzungen
+
+- Python 3.10 oder höher
+- uv (Python Package Manager)
+
+### Installation mit uv
+
+1. Repository klonen oder öffnen
+2. Dependencies installieren:
+
+```bash
+# uv installiert automatisch alle Abhängigkeiten
+uv sync
+```
+
+### Tesseract OCR (optional)
+
+Falls Sie Tesseract OCR statt EasyOCR nutzen möchten:
+
+1. Tesseract herunterladen: https://github.com/UB-Mannheim/tesseract/wiki
+2. Installieren und deutsche Sprachdaten auswählen
+3. In `src/ocr_engine.py` den Parameter `use_easyocr=False` setzen
+
+## Verwendung
+
+### Anwendung starten
+
+```bash
+# Mit uv
+uv run main.py
+
+# Oder mit Python (nach aktivierung der venv)
+python main.py
+```
+
+### Konfiguration
+
+Die Pfade können in [main.py](main.py) angepasst werden:
+
+```python
+base_path = r"E:\Karteikarten\nextcloud"  # Pfad zu Ihren Karteikarten
+start_file = "0008 Hb"  # Startdatei-Pattern
+```
+
+### Bedienung
+
+1. **Navigation**: Nutzen Sie die "Vorherige" und "Nächste" Buttons
+2. **OCR durchführen**: Klicken Sie auf "🔍 Text erkennen"
+3. **Text bearbeiten**: Der erkannte Text kann im rechten Bereich bearbeitet werden
+4. **Speichern**: Mit "💾 Text speichern" den Text exportieren
+
+## Weitergabe (Verteilung als EXE)
+
+### Wetzlar Erkennung
+
+| Datei | Pflicht | Bemerkung |
+|---|---|---|
+| `WetzlarErkennung.exe` | ✅ | Kompiliert via `build.bat` |
+| `config.json` | ✅ | Pfade, Online-Sync-Einstellungen |
+| `vornamen_maennlich.json` | ✅ | Männliche Vornamen-Liste (Erweiterung der eingebauten Liste) |
+| `vornamen_weiblich.json` | ✅ | Weibliche Vornamen-Liste (Erweiterung der eingebauten Liste) |
+| `berufe.json` | ✅ | Berufsbezeichnungen-Liste (Erweiterung der eingebauten Liste) |
+| `stand_mapping.json` | ✅ | Mapping für Standesbezeichnungen |
+| `ocr_corrections.json` | ✅ | OCR-Korrekturregeln (Buchstaben-/Wortfehler) |
+| `Wetzlar_Starten.bat` | optional | Starter-Verknüpfung |
+| `karteikarten.db` | bei Erstinstallation | SQLite-Datenbank (wird neu angelegt, falls nicht vorhanden) |
+
+### Wetzlar Reader
+
+| Datei | Pflicht | Bemerkung |
+|---|---|---|
+| `WetzlarReader.exe` | ✅ | Kompiliert via `build_reader.bat` |
+| `config_reader.json` | ✅ | Pfade, Online-Sync-Einstellungen (`"source": "reader"`) |
+| `ocr_corrections.json` | ✅ | OCR-Korrekturregeln (wird auch vom Reader verwendet) |
+| `Reader_Starten.bat` | optional | Starter-Verknüpfung |
+
+> **Hinweis:** `config.json` und `config_reader.json` enthalten lokale Pfade (`media_drive`, `image_base_path`, `db_path`) und müssen auf dem Zielrechner angepasst werden. API-Schlüssel und Zugangsdaten für Online-Sync sind ebenfalls dort hinterlegt.
+>
+> **Sicherheit:** Im Release-Build (`dist/`) wird seit v0.4.4 die **`config_reader.template.json`** statt der echten `config_reader.json` ausgeliefert – ohne Zugangsdaten. Der Nutzer überträgt seine eigenen Einstellungen in die `config_reader.json` neben der EXE. `api.txt` und `config_reader.json` sind in `.gitignore` aufgenommen und landen nicht im Repository.
+
+> Die EXE-Dateien sind **Standalone** (alle Python-Abhängigkeiten eingebettet) – keine separate Python-Installation nötig.
+
+---
+
+## Projektstruktur
+
+```
+wetzlar-karteikartenerkennung/
+├── src/
+│   ├── __init__.py          # Package Initialisierung
+│   ├── gui.py               # Grafische Benutzeroberfläche (Erkennung)
+│   ├── reader_gui.py        # Grafische Benutzeroberfläche (Reader)
+│   ├── extractor.py         # Extraktions-Logik (Heirat, Begräbnis)
+│   ├── text_postprocessor.py# Textkorrektur-Funktionen
+│   ├── ocr_engine.py        # OCR-Engine (EasyOCR/Tesseract)
+│   ├── database.py          # SQLite-Datenbankzugriff
+│   └── config.py            # Konfigurationsverwaltung
+├── main.py                  # Einstiegspunkt Erkennung
+├── reader_main.py           # Einstiegspunkt Reader
+├── config.json              # Konfiguration Erkennung
+├── config_reader.json       # Konfiguration Reader (lokal, in .gitignore)
+├── config_reader.template.json # Template für Build (ohne Zugangsdaten)
+├── MD/
+│   └── README.md            # Diese Datei
+├── build.bat                # EXE-Build Erkennung
+├── build_reader.bat         # EXE-Build Reader
+└── pyproject.toml           # Projekt-Konfiguration
+```
+
+## Technologien
+
+- **Python 3.13+**: Programmiersprache
+- **uv**: Moderner Python Package Manager
+- **EasyOCR**: Deep Learning basierte OCR für Handschrift
+- **Tesseract**: Alternative OCR-Engine
+- **Pillow**: Bildverarbeitung
+- **tkinter**: GUI-Framework
+
+## Hinweise
+
+### EasyOCR
+
+- Beim ersten Start lädt EasyOCR die deutschen Sprachmodelle herunter (~50 MB)
+- Die Erkennung ist relativ langsam, aber präzise bei Handschrift
+- Für bessere Performance kann GPU-Unterstützung aktiviert werden (siehe EasyOCR Dokumentation)
+
+### Genauigkeit
+
+Die OCR-Genauigkeit hängt ab von:
+- Qualität der Scans
+- Klarheit der Handschrift
+- Kontrast und Beleuchtung
+- Bildauflösung
+
+Für historische Handschriften kann manuelle Nachbearbeitung erforderlich sein.
+
+## Entwicklung
+
+### Dependencies hinzufügen
+
+```bash
+uv add <package-name>
+```
+
+### Virtual Environment
+
+```bash
+# Aktivieren
+.venv\Scripts\activate  # Windows
+source .venv/bin/activate  # Linux/Mac
+```
+
+## Lizenz
+
+Dieses Projekt wurde für die Verarbeitung historischer Kirchenbuchkarteien entwickelt.
+
+## Kontakt
+
+Für Fragen oder Probleme erstellen Sie bitte ein Issue im Repository.
