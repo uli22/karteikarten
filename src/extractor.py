@@ -184,7 +184,7 @@ def extract_marriage_fields(text: str) -> dict:
         'nummer': None,
     }
 
-    zitation_pattern = r"^\s*(ev\.?\s*Kb\.?\s*Wetzlar)\s*([⚰∞\u26B0])\s*(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?\s*[Pp]\.?\s*(\d+)\.?\s*,?\s*Nr\.?\s*(\d+)\.?\s*"
+    zitation_pattern = r"^\s*((?:ev|ref)\.?\s*Kb\.?\s*Wetzlar)\s*([⚰∞\u26B0])\s*(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?\s*[Pp]\.?\s*(\d+)\.?\s*,?\s*Nr\.?\s*(\d+)\.?\s*"
 
     print(f"DEBUG Heirat: Eingabe-Text = {repr(text[:150])}")
     m = re.match(zitation_pattern, text, re.IGNORECASE)
@@ -658,7 +658,7 @@ def extract_burial_fields(text: str) -> dict:
         'nummer': None
     }
 
-    zitation_pattern = r"^(ev\.\s*Kb\.\s*Wetzlar)?[ .]*[⚰\u26B0]?[ .]*(\d{4}[ .]?\d{2}[ .]?\d{2})[ .]*p\.?[ .]?(\d+)[ .]*(Nr\.?|No\.?)[ .]?(\d+)[ .]*"
+    zitation_pattern = r"^((?:ev|ref)\.\s*Kb\.\s*Wetzlar)?[ .]*[⚰\u26B0]?[ .]*(\d{4}[ .]?\d{2}[ .]?\d{2})[ .]*p\.?[ .]?(\d+)[ .]*(Nr\.?|No\.?)[ .]?(\d+)[ .]*"
     stopwords = ["Text", "Tex", "Tex.", "begraben", "begr.", "begr ", "Begr.", "Begr "]
 
     stop_idx = len(text)
@@ -1651,7 +1651,7 @@ def extract_baptism_fields(text: str) -> dict:
 
     # --- 1. Zitation parsen ---
     zitation_pattern = (
-        r"^\s*ev\.?\s*Kb\.?\s*\w+\s*\*\s*"
+        r"^\s*(?:ev|ref)\.?\s*Kb\.?\s*\w+\s*\*\s*"
         r"(\d{4})[\.\s]*(\d{1,2})[\.\s]*(\d{1,2})\.?\s*"
         r"[Pp]\.?\s*(\d+)\.?\s*,?\s*Nr\.?\s*(\d+)\.?\s*"
     )

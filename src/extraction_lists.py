@@ -217,6 +217,27 @@ _SOURCES_TEMPLATE = [
         "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbGb 1811-1820 KbKb 1813-1820 lutherisch\\",
         "media_type": "kirchenbuchseiten",
         "media_ID": "EKiR_408_005_Gb"
+    },
+    {
+        "source": "WETZLAR KbGb 1719-1801 reformiert",
+        "id": None,  # TODO: ID vergeben
+        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbGb 1719-1801 reformiert",
+        "media_type": "kirchenbuchseiten",
+        "media_ID": "EKiR_408_042_Gb"
+    },
+    {
+        "source": "WETZLAR KbHb 1719-1800 reformiert",
+        "id": None,  # TODO: ID vergeben
+        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbHb 1719-1800 reformiert",
+        "media_type": "kirchenbuchseiten",
+        "media_ID": "EKiR_408_042_Hb"
+    },
+    {
+        "source": "WETZLAR KbHb 1801-1833 reformiert",
+        "id": None,  # TODO: ID vergeben
+        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbHb 1801-1833 reformiert",
+        "media_type": "kirchenbuchseiten",
+        "media_ID": "EKiR_408_043_Hb"
     }
 ]
 

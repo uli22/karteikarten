@@ -689,7 +689,8 @@ class KarteikartenGUI:
                 f"Jahr: {jahr or 'nicht gefunden'}\n"
                 f"Seite: {seite or 'nicht gefunden'}\n\n"
                 f"Bitte stellen Sie sicher, dass der Text die Zitation enthält,\n"
-                f"z.B.: 'ev. Kb. Wetzlar ⚰ 1687.05.13. p. 99 Nr. 1'"
+                f"z.B.: 'ev. Kb. Wetzlar ⚰ 1687.05.13. p. 99 Nr. 1' oder\n"
+                f"       'ref. Kb. Wetzlar ⚰ 1687.05.13. p. 99 Nr. 1'"
             )
             return
         
@@ -747,6 +748,17 @@ class KarteikartenGUI:
             )
             return
         
+        # Bei mehreren Treffern: Konfession aus OCR-Text (ev./ref.) priorisieren
+        if text and len(passende_quellen) > 1:
+            if text.startswith("ref."):
+                ref_quellen = [q for q in passende_quellen if "reformiert" in q["source"].lower()]
+                if ref_quellen:
+                    passende_quellen = ref_quellen
+            elif text.startswith("ev."):
+                ev_quellen = [q for q in passende_quellen if "lutherisch" in q["source"].lower()]
+                if ev_quellen:
+                    passende_quellen = ev_quellen
+
         # Verwende erste passende Quelle
         quelle = passende_quellen[0]
         media_id = quelle["media_ID"]
@@ -1112,7 +1124,7 @@ class KarteikartenGUI:
         
         ttk.Label(special_chars_frame, text="Schnelleingabe:").pack(side=tk.LEFT, padx=(0, 5))
         
-        # Buttons in gewünschter Reihenfolge: ev. Kb. Wetzlar - ∞ Heirat - p. - Nr.
+        # Buttons in gewünschter Reihenfolge: ev./ref. Kb. Wetzlar - ∞ Heirat - p. - Nr.
         kb_btn = ttk.Button(
             special_chars_frame,
             text="ev. Kb. Wetzlar",
@@ -1120,6 +1132,14 @@ class KarteikartenGUI:
             command=lambda: self.text_display.insert(tk.INSERT, "ev. Kb. Wetzlar ")
         )
         kb_btn.pack(side=tk.LEFT, padx=2)
+
+        ref_kb_btn = ttk.Button(
+            special_chars_frame,
+            text="ref. Kb. Wetzlar",
+            width=15,
+            command=lambda: self.text_display.insert(tk.INSERT, "ref. Kb. Wetzlar ")
+        )
+        ref_kb_btn.pack(side=tk.LEFT, padx=2)
 
         infinity_btn = ttk.Button(
             special_chars_frame, 
@@ -1701,7 +1721,7 @@ class KarteikartenGUI:
         
         ttk.Button(button_row3, text="∞ Wetzlar 00→∞", command=self._fix_wetzlar_infinity_selected).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row3, text="∞ 16.1→161", command=self._fix_infinity_year_selected).pack(side=tk.LEFT, padx=3)
-        ttk.Button(button_row3, text="+ ev. Kb. Wetzlar", command=self._fix_header_prefix_selected).pack(side=tk.LEFT, padx=3)
+        ttk.Button(button_row3, text="+ ev./ref. Kb. Wetzlar", command=self._fix_header_prefix_selected).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row3, text="+ ⚰ Begräbnis", command=self._insert_burial_symbol_selected).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row3, text="+ ∞ Hochzeit", command=self._insert_marriage_symbol_selected).pack(side=tk.LEFT, padx=3)
         ttk.Button(button_row3, text="ev. Kb. □ 1 → ⚰ 1", command=self._replace_ev_kb_wetzlar_special_selected).pack(side=tk.LEFT, padx=3)
@@ -2607,7 +2627,7 @@ class KarteikartenGUI:
 
     def _format_citation_selected(self):
         self._apply_text_transform_selected(fn=format_citation, title="Zitation formatieren",
-            description="Format: 'ev. Kb. Wetzlar ⚰ YYYY.MM.DD. p. X Nr. Y'",
+            description="Format: 'ev./ref. Kb. Wetzlar ⚰ YYYY.MM.DD. p. X Nr. Y'",
             ocr_methode="format_citation")
 
     def _fix_p_number_selected(self):
@@ -2702,6 +2722,18 @@ class KarteikartenGUI:
             )
             return
         
+        # Bei mehreren Treffern: Konfession aus OCR-Text (ev./ref.) priorisieren
+        if len(values) > 26 and len(passende_quellen) > 1:
+            db_text = str(values[26])
+            if db_text.startswith("ref."):
+                ref_quellen = [q for q in passende_quellen if "reformiert" in q["source"].lower()]
+                if ref_quellen:
+                    passende_quellen = ref_quellen
+            elif db_text.startswith("ev."):
+                ev_quellen = [q for q in passende_quellen if "lutherisch" in q["source"].lower()]
+                if ev_quellen:
+                    passende_quellen = ev_quellen
+
         # Verwende erste passende Quelle
         quelle = passende_quellen[0]
         media_id = quelle["media_ID"]
@@ -3535,12 +3567,12 @@ class KarteikartenGUI:
         """Zeigt nur Datensätze an, die NICHT dem exakten formatierten Zitations-Muster entsprechen."""
 
         # STRIKTES Pattern für KORREKT formatierte Zitation
-        # Format: "ev. Kb. Wetzlar [⚰∞] YYYY.MM.DD. p. X Nr. Y "
+        # Format: "ev. Kb. Wetzlar [⚰∞] YYYY.MM.DD. p. X Nr. Y " oder "ref. Kb. Wetzlar ..."
         # - Kleinbuchstaben "p." (nicht "P.")
         # - Genau ein Leerzeichen zwischen Elementen
         # - Kein Komma vor "Nr."
-        # - Punkt nach "ev", "Kb", "DD", aber NICHT nach "Wetzlar"
-        valid_pattern = r"^ev\. Kb\. Wetzlar [⚰∞\u26B0] \d{4}\.\d{2}\.\d{2}\. p\. \d+ Nr\. \d+ "
+        # - Punkt nach "ev"/"ref", "Kb", "DD", aber NICHT nach "Wetzlar"
+        valid_pattern = r"^(?:ev|ref)\. Kb\. Wetzlar [⚰∞\u26B0] \d{4}\.\d{2}\.\d{2}\. p\. \d+ Nr\. \d+ "
         
         # Sammle alle Items, die NICHT dem exakten Muster entsprechen
         invalid_items = []
@@ -3564,9 +3596,9 @@ class KarteikartenGUI:
                         # Analysiere wo die Abweichung ist
                         abweichungen = []
                         
-                        # Erwartetes Format: "ev. Kb. Wetzlar [⚰∞] YYYY.MM.DD. p. X Nr. Y "
-                        if not text.startswith("ev. Kb. Wetzlar "):
-                            if text.startswith("ev. Kb. Wetzlar."):
+                        # Erwartetes Format: "ev./ref. Kb. Wetzlar [⚰∞] YYYY.MM.DD. p. X Nr. Y "
+                        if not (text.startswith("ev. Kb. Wetzlar ") or text.startswith("ref. Kb. Wetzlar ")):
+                            if text.startswith("ev. Kb. Wetzlar.") or text.startswith("ref. Kb. Wetzlar."):
                                 abweichungen.append("Punkt nach 'Wetzlar'")
                             elif "Wetzlar" in text[:30]:
                                 idx = text.index("Wetzlar") + 7
@@ -3621,7 +3653,8 @@ class KarteikartenGUI:
                 f"{len(invalid_items)} Datensätze haben KEINE korrekte Formatierung.\n"
                 f"({valid_count} sind korrekt formatiert)\n\n"
                 f"Korrektes Format:\n"
-                f"'ev. Kb. Wetzlar ⚰ YYYY.MM.DD. p. X Nr. Y ...'\n\n"
+                f"'ev. Kb. Wetzlar ⚰ YYYY.MM.DD. p. X Nr. Y ...' oder\n"
+                f"'ref. Kb. Wetzlar ⚰ YYYY.MM.DD. p. X Nr. Y ...'\n\n"
                 f"Häufige Fehler:\n"
                 f"- Großbuchstaben 'P.' statt 'p.'\n"
                 f"- Komma vor 'Nr.': 'p. 18, Nr. 3'\n"
@@ -5517,7 +5550,7 @@ class KarteikartenGUI:
     
     
     def _fix_header_prefix_selected(self):
-        self._apply_text_transform_selected(fn=fix_header_prefix, title="ev. Kb. Wetzlar Korrektur",
+        self._apply_text_transform_selected(fn=fix_header_prefix, title="ev./ref. Kb. Wetzlar Korrektur",
             description="Alles bis zur ersten Ziffer wird durch 'ev. Kb. Wetzlar' ersetzt.",
             ocr_methode="header_prefix_fix")
     
