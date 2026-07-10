@@ -92,14 +92,34 @@ def expand_abbreviated_first_names(value: Optional[str], gender: str = 'unknown'
     return ' '.join(expanded_tokens)
 
 
-def extract_kirchenbuch_titel(dateiname: str) -> str:
-    """Extrahiert "Hb 1695-1718" aus Dateinamen wie "3282 Hb 1717 - 1695-1718 - F....jpg"."""
+def extract_kirchenbuch_titel(dateiname: str, gemeinde: str = '') -> str:
+    """Extrahiert den Kirchenbuch-Titel aus Dateinamen und optionaler Gemeinde.
+
+    Beispiele:
+      "3282 Hb 1717 - 1695-1718 - F....jpg" -> "Hb 1695-1718"
+      "0549 Hb 1722 - ..." -> "Hb 1722"
+      "0549 Hb 1722 - ..." + gemeinde="ref. Kb. Wetzlar" -> "Hb 1722 ref"
+    """
     if not dateiname:
         return ''
-    match = re.search(r"\b([A-Z][a-z])\s+\d{4}\s+-\s*(\d{4}-\d{4})", str(dateiname))
-    if not match:
-        return ''
-    return f"{match.group(1)} {match.group(2)}"
+    s = str(dateiname)
+
+    # Muster 1: "3282 Hb 1717 - 1695-1718 - ..." -> "Hb 1695-1718"
+    match = re.search(r"\b([A-Z][a-z])\s+\d{4}\s+-\s*(\d{4}-\d{4})", s)
+    if match:
+        titel = f"{match.group(1)} {match.group(2)}"
+    else:
+        # Muster 2: "0549 Hb 1722 - ..." -> "Hb 1722"
+        match = re.search(r"\b([A-Z][a-z])\s+(\d{4})\b", s)
+        if not match:
+            return ''
+        titel = f"{match.group(1)} {match.group(2)}"
+
+    # "ref" anhängen, wenn Gemeinde auf "ref." beginnt
+    if gemeinde and gemeinde.lower().startswith('ref'):
+        titel += " ref"
+
+    return titel
 
 
 def is_valid_date(datum: str, jahr: object = None) -> bool:

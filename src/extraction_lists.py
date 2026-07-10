@@ -238,6 +238,13 @@ _SOURCES_TEMPLATE = [
         "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbHb 1801-1833 reformiert",
         "media_type": "kirchenbuchseiten",
         "media_ID": "EKiR_408_043_Hb"
+    },
+        {
+        "source": "WETZLAR KbSb 1719-1801 reformiert",
+        "id": None,  # TODO: ID vergeben
+        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbSb 1719-1801 reformiert",
+        "media_type": "kirchenbuchseiten",
+        "media_ID": "EKiR_408_042_Sb"
     }
 ]
 

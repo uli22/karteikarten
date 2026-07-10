@@ -793,7 +793,7 @@ class KarteikartenReader:
             if kirchenbuch_filter and kirchenbuch_filter != "Alle":
                 rows = [
                     row for row in rows
-                    if extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
+                    if extract_kirchenbuch_titel(row[23], row[7] or '') == kirchenbuch_filter
                 ]
 
             # Filter: inf-Texte ausblenden
@@ -863,11 +863,11 @@ class KarteikartenReader:
             if not self.year_filter.get():
                 self.year_filter.current(0)
 
-            cursor.execute("SELECT DISTINCT dateiname FROM karteikarten WHERE dateiname IS NOT NULL AND dateiname != ''")
+            cursor.execute("SELECT DISTINCT dateiname, kirchengemeinde FROM karteikarten WHERE dateiname IS NOT NULL AND dateiname != ''")
             kb_values = sorted({
                 titel
-                for (dateiname,) in cursor.fetchall()
-                for titel in [extract_kirchenbuch_titel(dateiname)]
+                for (dateiname, gemeinde) in cursor.fetchall()
+                for titel in [extract_kirchenbuch_titel(dateiname, gemeinde or '')]
                 if titel
             })
             current_kb = self.kirchenbuch_filter.get()
@@ -1334,7 +1334,7 @@ class KarteikartenReader:
         item = selection[0]
         record_id = self.tree.item(item)["values"][0]
         cursor = self.db.conn.cursor()
-        cursor.execute("SELECT dateipfad, dateiname FROM karteikarten WHERE id = ?", (record_id,))
+        cursor.execute("SELECT dateipfad, dateiname, seite FROM karteikarten WHERE id = ?", (record_id,))
         row = cursor.fetchone()
         if not row or not row[0]:
             messagebox.showwarning("Kein Bild", "Für diesen Eintrag ist kein Karteikarten-Bild gespeichert.")
@@ -1346,7 +1346,12 @@ class KarteikartenReader:
         if not pfad.exists():
             messagebox.showerror("Datei nicht gefunden", f"Karteikarte nicht gefunden:\n{pfad}")
             return
-        self._open_image_viewer(str(pfad))
+        seite_val = row[2]
+        try:
+            seite_int = int(seite_val) if seite_val is not None else None
+        except (ValueError, TypeError):
+            seite_int = None
+        self._open_image_viewer(str(pfad), seite=seite_int)
 
     def _show_selected_kirchenbuch(self):
         """Zeigt das zugehörige Kirchenbuchbild (nutzt SOURCES-Konfiguration)."""
@@ -1457,7 +1462,7 @@ class KarteikartenReader:
                 + "\n".join(t.name for t in treffer),
             )
 
-        self._open_image_viewer(str(treffer[0]))
+        self._open_image_viewer(str(treffer[0]), seite=seite_int)
 
     def _resolve_relocated_path(self, original_path: Path, base_path: str) -> Path:
         """Versucht einen gespeicherten Altpfad unter einem neuen Basisordner wiederzufinden."""
@@ -1480,14 +1485,50 @@ class KarteikartenReader:
 
         return base / original_path.name
 
-    def _open_image_viewer(self, pfad: str):
+    def _open_in_irfanview(self, pfad):
+        """Öffnet eine Bilddatei in IrfanView."""
+        import shutil
+        import subprocess
+
+        image_path = Path(pfad)
+        if not image_path.exists():
+            messagebox.showerror("Datei nicht gefunden", f"Die Bilddatei wurde nicht gefunden:\n{image_path}")
+            return
+
+        candidates = []
+        for cmd in ("i_view64.exe", "i_view32.exe", "i_view64", "i_view32"):
+            resolved = shutil.which(cmd)
+            if resolved:
+                candidates.append(Path(resolved))
+        for path in (
+            Path(r"C:\Program Files\IrfanView\i_view64.exe"),
+            Path(r"C:\Program Files (x86)\IrfanView\i_view32.exe"),
+        ):
+            if path.exists() and path not in candidates:
+                candidates.append(path)
+
+        if not candidates:
+            messagebox.showerror(
+                "IrfanView nicht gefunden",
+                "IrfanView wurde nicht gefunden.\n\n"
+                "Bitte installieren Sie IrfanView oder stellen Sie sicher, dass\n"
+                "i_view64.exe / i_view32.exe im PATH verfügbar ist."
+            )
+            return
+
+        try:
+            subprocess.Popen([str(candidates[0]), str(image_path)], shell=False)
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Konnte IrfanView nicht starten:\n{e}")
+
+    def _open_image_viewer(self, pfad: str, seite=None):
         """Öffnet ein Fenster zur Bildanzeige mit Zoom und Panning."""
         viewer = tk.Toplevel(self.root)
         viewer.title(f"Bildanzeige: {Path(pfad).name}")
         viewer.geometry("1200x900")
 
         img = PILImage.open(pfad)
-        zoom = 1.0
+        is_odd = seite is not None and seite % 2 == 1
 
         canvas_frame = ttk.Frame(viewer)
         canvas_frame.pack(fill=tk.BOTH, expand=True)
@@ -1512,6 +1553,8 @@ class KarteikartenReader:
             canvas.delete("all")
             canvas.create_image(0, 0, anchor=tk.NW, image=_state["tk_img"])
             canvas.config(scrollregion=(0, 0, w, h))
+            if is_odd:
+                canvas.xview_moveto(1.0)
 
         def zoom_in():
             _state["zoom"] *= 1.2
@@ -1521,12 +1564,16 @@ class KarteikartenReader:
             _state["zoom"] /= 1.2
             show_img()
 
+        def open_in_irfanview():
+            self._open_in_irfanview(pfad)
+
         show_img()
 
         btn_frame = ttk.Frame(viewer)
         btn_frame.pack(fill=tk.X)
         ttk.Button(btn_frame, text="Zoom +", command=zoom_in).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Zoom -", command=zoom_out).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="\U0001F5BC IrfanView", command=open_in_irfanview).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Schließen", command=viewer.destroy).pack(side=tk.RIGHT, padx=5)
 
         canvas.bind("<MouseWheel>", lambda e: zoom_in() if e.delta > 0 else zoom_out())

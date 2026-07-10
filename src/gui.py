@@ -837,7 +837,7 @@ class KarteikartenGUI:
             )
         
         pfad = treffer[0]
-        self._open_image_viewer(str(pfad))
+        self._open_image_viewer(str(pfad), seite=seite)
 
     def _open_current_card_in_irfanview(self):
         """Öffnet die aktuell angezeigte Karteikarte in IrfanView."""
@@ -862,6 +862,42 @@ class KarteikartenGUI:
                 candidates.append(Path(resolved))
 
         # 2) Typische Installationspfade prüfen
+        for path in (
+            Path(r"C:\Program Files\IrfanView\i_view64.exe"),
+            Path(r"C:\Program Files (x86)\IrfanView\i_view32.exe"),
+        ):
+            if path.exists() and path not in candidates:
+                candidates.append(path)
+
+        if not candidates:
+            messagebox.showerror(
+                "IrfanView nicht gefunden",
+                "IrfanView wurde nicht gefunden.\n\n"
+                "Bitte installieren Sie IrfanView oder stellen Sie sicher, dass\n"
+                "i_view64.exe / i_view32.exe im PATH verfügbar ist."
+            )
+            return
+
+        try:
+            subprocess.Popen([str(candidates[0]), str(image_path)], shell=False)
+        except Exception as e:
+            messagebox.showerror("Fehler", f"Konnte IrfanView nicht starten:\n{e}")
+
+    def _open_in_irfanview(self, pfad):
+        """Öffnet eine Bilddatei in IrfanView."""
+        import shutil
+        import subprocess
+
+        image_path = Path(pfad)
+        if not image_path.exists():
+            messagebox.showerror("Datei nicht gefunden", f"Die Bilddatei wurde nicht gefunden:\n{image_path}")
+            return
+
+        candidates = []
+        for cmd in ("i_view64.exe", "i_view32.exe", "i_view64", "i_view32"):
+            resolved = shutil.which(cmd)
+            if resolved:
+                candidates.append(Path(resolved))
         for path in (
             Path(r"C:\Program Files\IrfanView\i_view64.exe"),
             Path(r"C:\Program Files (x86)\IrfanView\i_view32.exe"),
@@ -2648,6 +2684,7 @@ class KarteikartenGUI:
         typ = values[4]  # Typ
         jahr = values[1]  # Jahr
         seite = values[5]  # Seite
+        print(f"[DEBUG _show_selected_image] values[5] (roh) = {repr(seite)}, Typ={type(seite).__name__}")
 
         from pathlib import Path
 
@@ -2664,6 +2701,7 @@ class KarteikartenGUI:
         except Exception:
             messagebox.showerror("Ungültige Seite", f"Die Seite '{seite}' ist ungültig.")
             return
+        print(f"[DEBUG _show_selected_image] seite_int = {seite_int}, ungerade = {seite_int % 2 == 1}")
 
         # Finde passende Quelle aus SOURCES
         # Kriterien: media_type = "kirchenbuchseiten" und Jahr im Bereich der source
@@ -2847,15 +2885,30 @@ class KarteikartenGUI:
             )
         
         pfad = treffer[0]
-        self._open_image_viewer(str(pfad))
+        self._open_image_viewer(str(pfad), seite=seite_int)
 
 
-    def _open_image_viewer(self, pfad):
-        """Öffnet ein Fenster zur Bildanzeige mit Navigation, Zoom und Verschieben."""
+    def _open_image_viewer(self, pfad, seite=None):
+        """Öffnet ein Fenster zur Bildanzeige mit Navigation, Zoom und Verschieben.
+        
+        Args:
+            pfad: Pfad zur Bilddatei
+            seite: Seitenzahl (aus DB). Ungerade Seiten werden rechtsbündig angezeigt.
+                   Falls None, wird die Seitenzahl aus dem Dateinamen extrahiert.
+        """
         from pathlib import Path
 
         import PIL.Image
         import PIL.ImageTk
+
+        # Seitenzahl aus Parameter oder Dateinamen (Fallback)
+        if seite is None:
+            seite_match = re.search(r'S_(\d+)', Path(pfad).name)
+            if seite_match:
+                try:
+                    seite = int(seite_match.group(1))
+                except ValueError:
+                    pass
 
         viewer = tk.Toplevel(self.root)
         viewer.title(f"Bildanzeige: {Path(pfad).name}")
@@ -2883,6 +2936,10 @@ class KarteikartenGUI:
         tk_img = None
         img_id = None
 
+        # Ungerade Seiten: zum rechten Rand scrollen, gerade Seiten: linksbündig (NW)
+        is_odd = seite is not None and seite % 2 == 1
+        print(f"[VIEWER] Datei: {Path(pfad).name}, Seite={seite}, ungerade={is_odd}")
+
         def show_img():
             nonlocal img, zoom, tk_img, img_id
             w, h = int(img.width * zoom), int(img.height * zoom)
@@ -2891,6 +2948,9 @@ class KarteikartenGUI:
             canvas.delete("all")
             img_id = canvas.create_image(0, 0, anchor=tk.NW, image=tk_img)
             canvas.config(scrollregion=(0, 0, w, h))
+            # Bei ungeraden Seiten zum rechten Rand scrollen
+            if is_odd:
+                canvas.xview_moveto(1.0)
 
         def zoom_in():
             nonlocal zoom
@@ -2908,6 +2968,7 @@ class KarteikartenGUI:
         btn_frame.pack(fill=tk.X)
         ttk.Button(btn_frame, text="Zoom +", command=zoom_in).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Zoom -", command=zoom_out).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="🖼️ IrfanView", command=lambda: self._open_in_irfanview(pfad)).pack(side=tk.LEFT, padx=5)
         ttk.Button(btn_frame, text="Schließen", command=viewer.destroy).pack(side=tk.RIGHT, padx=5)
 
         # Mausrad für Zoom
@@ -3377,7 +3438,7 @@ class KarteikartenGUI:
             if kirchenbuch_filter and kirchenbuch_filter != 'Alle':
                 rows = [
                     row for row in rows
-                    if extract_kirchenbuch_titel(row[23]) == kirchenbuch_filter
+                    if extract_kirchenbuch_titel(row[23], row[7] or '') == kirchenbuch_filter
                 ]
 
             # Filter: inf-Texte ausblenden
@@ -3482,11 +3543,11 @@ class KarteikartenGUI:
             if not self.year_filter.get():
                 self.year_filter.current(0)
 
-            cursor.execute("SELECT DISTINCT dateiname FROM karteikarten WHERE dateiname IS NOT NULL AND dateiname != ''")
+            cursor.execute("SELECT DISTINCT dateiname, kirchengemeinde FROM karteikarten WHERE dateiname IS NOT NULL AND dateiname != ''")
             kb_values = sorted({
                 titel
-                for (dateiname,) in cursor.fetchall()
-                for titel in [extract_kirchenbuch_titel(dateiname)]
+                for (dateiname, gemeinde) in cursor.fetchall()
+                for titel in [extract_kirchenbuch_titel(dateiname, gemeinde or '')]
                 if titel
             })
             current_kb = self.kirchenbuch_filter.get()

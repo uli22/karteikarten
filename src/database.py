@@ -287,8 +287,8 @@ class KarteikartenDB:
             'nummer': None
         }
         
-        # Kirchengemeinde (z.B. "ev. Kb. Wetzlar")
-        kb_match = re.search(r'(ev\.\s*Kb\.\s*\w+)', text, re.IGNORECASE)
+        # Kirchengemeinde (z.B. "ev. Kb. Wetzlar" oder "ref. Kb. Wetzlar")
+        kb_match = re.search(r'((?:ev|ref)\.\s*Kb\.\s*\w+)', text, re.IGNORECASE)
         if kb_match:
             result['kirchengemeinde'] = kb_match.group(1).strip()
         
