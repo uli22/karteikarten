@@ -23,7 +23,7 @@ from .extractor import extract_kirchenbuch_titel
 from .gedcom_exporter import GedcomExporter
 from .online_sync import OnlineSyncService
 
-VERSION = "0.4.5"
+VERSION = "0.4.7"
 
 
 class KarteikartenReader:
@@ -108,13 +108,6 @@ class KarteikartenReader:
     # ------------------------------------------------------------------
 
     def _create_widgets(self):
-        # Menüleiste
-        menubar = tk.Menu(self.root)
-        help_menu = tk.Menu(menubar, tearoff=0)
-        help_menu.add_command(label="Über…", command=self._show_about)
-        menubar.add_cascade(label="Hilfe", menu=help_menu)
-        self.root.config(menu=menubar)
-
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
 
@@ -878,7 +871,15 @@ class KarteikartenReader:
                 self.kirchenbuch_filter.current(0)
 
         except Exception as e:
-            messagebox.showerror("Fehler", f"Fehler beim Laden der Daten:\n{str(e)}")
+            import traceback as _tb
+            from urllib import error as _urlerror
+            _reason = repr(e.reason) if isinstance(e, _urlerror.URLError) and hasattr(e, 'reason') else 'N/A'
+            messagebox.showerror("Fehler",
+                f"Fehler beim Laden der Daten:\n"
+                f"Typ: {type(e)}\n"
+                f"repr: {repr(e)}\n"
+                f"Reason: {_reason}\n\n"
+                f"Traceback:\n{_tb.format_exc()}")
 
     def _is_valid_date(self, datum: str, jahr) -> bool:
         from .extractor import is_valid_date
@@ -2218,6 +2219,30 @@ class KarteikartenReader:
                 messagebox.showwarning("Ungültige URL", "Der API-Endpoint ist ungültig.\nBitte vollständige URL angeben, z.B.\nhttps://wze.de.cool/lima_sync_endpoint.php")
                 return
             try:
+                # === SSL-Diagnose (vor dem eigentlichen Request) ===
+                import socket as _socket
+                import ssl as _ssl
+                import traceback as _traceback
+                hostname = urlsplit(url).netloc
+                _ssl_diag_lines = []
+                try:
+                    _ctx = _ssl.create_default_context()
+                    with _ctx.wrap_socket(_socket.socket(), server_hostname=hostname) as _s:
+                        _s.settimeout(10)
+                        _s.connect((hostname, 443))
+                        _cert = _s.getpeercert()
+                        _ssl_diag_lines.append(f"SSL-Zertifikat für {hostname}:")
+                        _ssl_diag_lines.append(f"  Subject: {_cert.get('subject', '?')}")
+                        _ssl_diag_lines.append(f"  Issuer:  {_cert.get('issuer', '?')}")
+                        _ssl_diag_lines.append(f"  notBefore: {_cert.get('notBefore', '?')}")
+                        _ssl_diag_lines.append(f"  notAfter:  {_cert.get('notAfter', '?')}")
+                        _ssl_diag_lines.append(f"  SAN: {_cert.get('subjectAltName', '?')}")
+                except Exception:
+                    _ssl_diag_lines.append(f"SSL-Diagnose FEHLGESCHLAGEN für {hostname}:")
+                    _ssl_diag_lines.append(_traceback.format_exc())
+                _ssl_diag = "\n".join(_ssl_diag_lines)
+                # === Ende SSL-Diagnose ===
+
                 from urllib import error, request
                 from urllib.parse import urlencode
                 json_str = json.dumps({"action": "ping", "api_key": self._sync_api_key_var.get()}, ensure_ascii=False)
@@ -2228,11 +2253,32 @@ class KarteikartenReader:
                 data = json.loads(raw)
                 if not isinstance(data, dict) or data.get("ok") is False:
                     raise RuntimeError(str(data.get("error") if isinstance(data, dict) else "Ungültige API-Antwort"))
-                messagebox.showinfo("Verbindung OK", f"API-Endpunkt ist erreichbar.\nServer-Zeit: {data.get('server_time', '?')}")
+                messagebox.showinfo("Verbindung OK",
+                    f"API-Endpunkt ist erreichbar.\nServer-Zeit: {data.get('server_time', '?')}\n\n{_ssl_diag}")
             except error.URLError as exc:
-                messagebox.showerror("Verbindungsfehler", f"API nicht erreichbar: {exc}")
+                _tb = _traceback.format_exc()
+                _reason = repr(exc.reason) if hasattr(exc, 'reason') else 'N/A'
+                _ssl_hint = ""
+                if isinstance(exc.reason, _ssl.SSLCertVerificationError):
+                    _ssl_hint = (
+                        "\n⚠️ SSL-Zertifikatsprüfung fehlgeschlagen!\n"
+                        "Mögliche Ursache: Antivirus (z.B. Norton), Proxy oder veraltete Zertifikate.\n"
+                    )
+                messagebox.showerror("Verbindungsfehler",
+                    f"API nicht erreichbar: {exc}\n"
+                    f"Typ: {type(exc)}\n"
+                    f"repr: {repr(exc)}\n"
+                    f"Reason: {_reason}{_ssl_hint}\n"
+                    f"{_ssl_diag}\n\n"
+                    f"Traceback:\n{_tb}")
             except Exception as exc:
-                messagebox.showerror("Verbindungsfehler", str(exc))
+                _tb = _traceback.format_exc()
+                messagebox.showerror("Verbindungsfehler",
+                    f"{exc}\n"
+                    f"Typ: {type(exc)}\n"
+                    f"repr: {repr(exc)}\n\n"
+                    f"{_ssl_diag}\n\n"
+                    f"Traceback:\n{_tb}")
             return
 
         try:
