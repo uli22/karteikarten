@@ -28,6 +28,9 @@ config.json
 config_reader.json
 credentials/
 client_secret*.json
+
+# Input data (local only)
+input/
 api.txt
 
 # Track template-but ignore all other JSON files (credentials, exports etc.)
@@ -57,11 +60,10 @@ WetzlarReader.spec
 *.txt
 !README.txt
 !readme.txt
-!Bedienung.md
-!instructions.md
 
 # Lokale Analyse- und Test-Skripte (nicht committen)
 Tests/
+/_*
 
 # Vertrauliche Dokumente (nie committen)
 Beschluss*
