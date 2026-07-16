@@ -5,6 +5,7 @@ Keine Änderungen an src/gui.py oder anderen bestehenden Dateien.
 """
 
 import json
+import os
 import re
 import sys
 import tkinter as tk
@@ -23,7 +24,7 @@ from .extractor import extract_kirchenbuch_titel
 from .gedcom_exporter import GedcomExporter
 from .online_sync import OnlineSyncService
 
-VERSION = "0.4.7"
+VERSION = "0.4.8"
 
 
 class KarteikartenReader:
@@ -2207,6 +2208,31 @@ class KarteikartenReader:
 
         _threading.Thread(target=_run, daemon=True, name="FullSync").start()
 
+    def _show_copyable_message(self, title: str, message: str):
+        """Zeigt eine Meldung in einem Fenster mit kopierbarem Text an."""
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.geometry("700x500")
+        win.transient(self.root)
+        win.grab_set()
+
+        txt = tk.Text(win, wrap=tk.WORD, font=("Consolas", 10))
+        txt.pack(fill=tk.BOTH, expand=True, padx=10, pady=(10, 5))
+        txt.insert("1.0", message)
+        txt.config(state=tk.DISABLED)
+
+        btn_frame = ttk.Frame(win)
+        btn_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(btn_frame, text="📋 Alles kopieren", command=lambda: self._copy_to_clipboard(message)).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Schließen", command=win.destroy).pack(side=tk.RIGHT, padx=5)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+    def _copy_to_clipboard(self, text: str):
+        """Kopiert Text in die Zwischenablage."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
+
     def _test_sync_connection(self):
         mode = (self._sync_mode_var.get() or "mysql").strip().lower()
         if mode == "api":
@@ -2223,10 +2249,19 @@ class KarteikartenReader:
                 import socket as _socket
                 import ssl as _ssl
                 import traceback as _traceback
+
+                import certifi as _certifi
+
                 hostname = urlsplit(url).netloc
-                _ssl_diag_lines = []
+                _ssl_diag_lines = [
+                    f"OpenSSL: {_ssl.OPENSSL_VERSION}",
+                    f"Default verify paths: {_ssl.get_default_verify_paths()}",
+                    f"SSL_CERT_FILE = {os.environ.get('SSL_CERT_FILE', 'N/A')}",
+                    f"SSL_CERT_DIR  = {os.environ.get('SSL_CERT_DIR', 'N/A')}",
+                    f"certifi CA-Bundle: {_certifi.where()}",
+                ]
                 try:
-                    _ctx = _ssl.create_default_context()
+                    _ctx = _ssl.create_default_context(cafile=_certifi.where())
                     with _ctx.wrap_socket(_socket.socket(), server_hostname=hostname) as _s:
                         _s.settimeout(10)
                         _s.connect((hostname, 443))
@@ -2243,37 +2278,43 @@ class KarteikartenReader:
                 _ssl_diag = "\n".join(_ssl_diag_lines)
                 # === Ende SSL-Diagnose ===
 
-                from urllib import error, request
-                from urllib.parse import urlencode
+                import requests as _requests
                 json_str = json.dumps({"action": "ping", "api_key": self._sync_api_key_var.get()}, ensure_ascii=False)
-                payload = urlencode({"payload": json_str}).encode("utf-8")
-                req = request.Request(url, data=payload, headers={"Content-Type": "application/x-www-form-urlencoded"}, method="POST")
-                with request.urlopen(req, timeout=10) as resp:
-                    raw = resp.read().decode("utf-8", errors="replace")
-                data = json.loads(raw)
+                _resp = _requests.post(
+                    url,
+                    data={"payload": json_str},
+                    timeout=10,
+                    verify=_certifi.where(),
+                )
+                _resp.raise_for_status()
+                data = _resp.json()
                 if not isinstance(data, dict) or data.get("ok") is False:
                     raise RuntimeError(str(data.get("error") if isinstance(data, dict) else "Ungültige API-Antwort"))
-                messagebox.showinfo("Verbindung OK",
+                self._show_copyable_message("Verbindung OK",
                     f"API-Endpunkt ist erreichbar.\nServer-Zeit: {data.get('server_time', '?')}\n\n{_ssl_diag}")
-            except error.URLError as exc:
+            except _requests.exceptions.SSLError as exc:
                 _tb = _traceback.format_exc()
-                _reason = repr(exc.reason) if hasattr(exc, 'reason') else 'N/A'
-                _ssl_hint = ""
-                if isinstance(exc.reason, _ssl.SSLCertVerificationError):
-                    _ssl_hint = (
-                        "\n⚠️ SSL-Zertifikatsprüfung fehlgeschlagen!\n"
-                        "Mögliche Ursache: Antivirus (z.B. Norton), Proxy oder veraltete Zertifikate.\n"
-                    )
-                messagebox.showerror("Verbindungsfehler",
+                _ssl_hint = (
+                    "\n⚠️ SSL-Zertifikatsprüfung fehlgeschlagen!\n"
+                    "Mögliche Ursache: Antivirus (z.B. Norton), Proxy oder veraltete Zertifikate.\n"
+                )
+                self._show_copyable_message("Verbindungsfehler",
+                    f"SSL-Fehler: {exc}\n"
+                    f"Typ: {type(exc)}\n"
+                    f"repr: {repr(exc)}{_ssl_hint}\n"
+                    f"{_ssl_diag}\n\n"
+                    f"Traceback:\n{_tb}")
+            except _requests.exceptions.RequestException as exc:
+                _tb = _traceback.format_exc()
+                self._show_copyable_message("Verbindungsfehler",
                     f"API nicht erreichbar: {exc}\n"
                     f"Typ: {type(exc)}\n"
                     f"repr: {repr(exc)}\n"
-                    f"Reason: {_reason}{_ssl_hint}\n"
                     f"{_ssl_diag}\n\n"
                     f"Traceback:\n{_tb}")
             except Exception as exc:
                 _tb = _traceback.format_exc()
-                messagebox.showerror("Verbindungsfehler",
+                self._show_copyable_message("Verbindungsfehler",
                     f"{exc}\n"
                     f"Typ: {type(exc)}\n"
                     f"repr: {repr(exc)}\n\n"

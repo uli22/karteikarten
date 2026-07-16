@@ -13,8 +13,10 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
-from urllib import error, request
 from urllib.parse import urlsplit, urlunsplit
+
+import certifi
+import requests
 
 from .config import get_config
 from .database import KarteikartenDB
@@ -561,23 +563,27 @@ class OnlineSyncService:
     def _api_call(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         # Sende als application/x-www-form-urlencoded mit JSON im Feld "payload".
         # Zuverlässiger als raw JSON body auf Lima-City Shared Hosting (php://input oft leer).
-        from urllib.parse import urlencode
         json_str = json.dumps(payload, ensure_ascii=False)
-        body = urlencode({"payload": json_str}).encode("utf-8")
-        req = request.Request(
-            self._endpoint_url,
-            data=body,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
         try:
-            with request.urlopen(req, timeout=20) as resp:
-                raw = resp.read().decode("utf-8", errors="replace")
-        except error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="replace") if hasattr(exc, "read") else str(exc)
-            raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
-        except error.URLError as exc:
-            raise RuntimeError(f"URL-Fehler: {exc.reason}") from exc
+            _resp = requests.post(
+                self._endpoint_url,
+                data={"payload": json_str},
+                timeout=20,
+                verify=certifi.where(),
+            )
+            _resp.raise_for_status()
+            raw = _resp.text
+        except requests.exceptions.SSLError as exc:
+            raise RuntimeError(f"SSL-Fehler: {exc}") from exc
+        except requests.exceptions.ConnectionError as exc:
+            raise RuntimeError(f"Verbindungsfehler: {exc}") from exc
+        except requests.exceptions.Timeout as exc:
+            raise RuntimeError(f"Timeout: {exc}") from exc
+        except requests.exceptions.HTTPError as exc:
+            detail = exc.response.text if exc.response is not None else str(exc)
+            raise RuntimeError(f"HTTP {exc.response.status_code if exc.response is not None else '?'}: {detail}") from exc
+        except requests.exceptions.RequestException as exc:
+            raise RuntimeError(f"Request-Fehler: {exc}") from exc
 
         data = json.loads(raw)
         if not isinstance(data, dict):

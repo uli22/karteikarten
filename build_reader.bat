@@ -35,6 +35,10 @@ if exist "%ICON_PATH%" (
 )
 
 echo.
+echo Aktualisiere certifi (CA-Bundle fuer SSL)...
+.venv-build\Scripts\python.exe -m pip install --upgrade certifi --quiet
+echo.
+
 echo Starte Build-Prozess...
 echo.
 
