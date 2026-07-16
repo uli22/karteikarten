@@ -34,6 +34,9 @@ input/
 
 # SQL scripts (local only)
 sql/
+
+# Test/development scripts (local only)
+test/
 api.txt
 
 # Track template-but ignore all other JSON files (credentials, exports etc.)
