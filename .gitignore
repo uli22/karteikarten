@@ -33,8 +33,10 @@ client_secret*.json
 # Input data (local only)
 input/
 
-# SQL scripts (local only)
-sql/
+# SQL scripts (local only, templates excluded)
+sql/*
+!sql/*.template.php
+!sql/*.template.sql
 
 # Test/development scripts (local only)
 Tests/
