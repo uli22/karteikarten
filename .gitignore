@@ -31,6 +31,9 @@ client_secret*.json
 
 # Input data (local only)
 input/
+
+# SQL scripts (local only)
+sql/
 api.txt
 
 # Track template-but ignore all other JSON files (credentials, exports etc.)
