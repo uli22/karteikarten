@@ -24,10 +24,8 @@ wheels/
 *.sqlite3
 
 # Configuration & Credentials (sensitive data)
-config.json
-config_reader.json
-!config.template.json
-!config_reader.template.json
+/config.json
+/config_reader.json
 credentials/
 client_secret*.json
 
