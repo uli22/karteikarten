@@ -38,6 +38,9 @@ sql/*
 !sql/*.template.php
 !sql/*.template.sql
 
+# SSL certificates (local only)
+*.pem
+
 # Test/development scripts (local only)
 Tests/
 api.txt
