@@ -1683,11 +1683,11 @@ class KarteikartenGUI:
         style = ttk.Style()
         style.configure("Treeview", rowheight=30)
         
+        # Tag für Zeilen mit Kirchenbuchtext (höchste Priorität)
+        self.tree.tag_configure('has_kirchenbuchtext', background='#e6c300')
+        
         # Tag für Zeilen mit Notiz (grün)
         self.tree.tag_configure('has_notiz', background='#d4edda')
-        
-        # Tag für Zeilen mit Kirchenbuchtext (hellgrün)
-        self.tree.tag_configure('has_kirchenbuchtext', background='#c3f0ca')
         
         # Tag für Zeilen mit Gramps (blau)
         self.tree.tag_configure('has_gramps', background='#cfe2ff')
@@ -3514,10 +3514,11 @@ class KarteikartenGUI:
 
                 # Tags setzen
                 tags = []
-                if notiz:
-                    tags.append('has_notiz')
+                # Höchste Priorität: Kirchenbuchtext (als erstes gesetzt)
                 if kirchenbuchtext:
                     tags.append('has_kirchenbuchtext')
+                if notiz:
+                    tags.append('has_notiz')
                 if gramps:
                     tags.append('has_gramps')
                 if not date_valid and datum:
@@ -3556,6 +3557,16 @@ class KarteikartenGUI:
                 self.kirchenbuch_filter.set(current_kb)
             else:
                 self.kirchenbuch_filter.current(0)
+                
+            # Zuletzt bearbeiteten Datensatz wieder selektieren und sichtbar machen
+            if self.current_db_record_id:
+                self._select_and_see_item(self.current_db_record_id)
+                
+            # Sortierung wiederherstellen (nach Seite/Nr. falls aktiv)
+            if self._last_sorted_column == "__page_number__":
+                self._sort_by_page_and_number()
+            elif self._last_sorted_column:
+                self._sort_column(self._last_sorted_column)
                 
         except Exception as e:
             messagebox.showerror("Fehler", f"Fehler beim Laden der Daten:\n{str(e)}")
@@ -3623,6 +3634,7 @@ class KarteikartenGUI:
                 self.tree.heading(column, text=clean_heading)
         # Update Status
         self.db_status_label.config(text=f"{len(data)} Datensätze - sortiert nach Film/Seite/Nr.")
+        self._last_sorted_column = "__page_number__"  # Marker für Seite/Nr.-Sortierung
     
     def _filter_invalid_citations(self):
         """Zeigt nur Datensätze an, die NICHT dem exakten formatierten Zitations-Muster entsprechen."""
@@ -3943,6 +3955,19 @@ class KarteikartenGUI:
         if hasattr(self, 'ocr_tab') and selected == str(self.ocr_tab):
             if self.current_db_record_id:
                 self._load_ocr_fields_from_db(self.current_db_record_id)
+        elif hasattr(self, 'db_tab') and selected == str(self.db_tab):
+            # Zurück zum DB-Tab: zuletzt bearbeiteten Datensatz selektieren
+            if self.current_db_record_id:
+                self._select_and_see_item(self.current_db_record_id)
+
+    def _select_and_see_item(self, record_id):
+        """Selektiert einen Datensatz in der Treeview und scrollt ihn sichtbar."""
+        for item in self.tree.get_children():
+            values = self.tree.item(item, 'values')
+            if values and values[0] == record_id:
+                self.tree.selection_set(item)
+                self.tree.see(item)
+                break
     
     def _show_selected_card(self):
         """Zeigt die ausgewählte Karteikarte im OCR-Tab."""

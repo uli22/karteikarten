@@ -24,7 +24,7 @@ from .extractor import extract_kirchenbuch_titel
 from .gedcom_exporter import GedcomExporter
 from .online_sync import OnlineSyncService
 
-VERSION = "0.4.8"
+VERSION = "0.4.9"
 
 
 class KarteikartenReader:
@@ -376,8 +376,8 @@ class KarteikartenReader:
 
         style = ttk.Style()
         style.configure("Treeview", rowheight=30)
+        self.tree.tag_configure("has_kirchenbuchtext", background="#e6c300")
         self.tree.tag_configure("has_notiz", background="#d4edda")
-        self.tree.tag_configure("has_kirchenbuchtext", background="#c3f0ca")
         self.tree.tag_configure("has_gramps", background="#cfe2ff")
         self.tree.tag_configure("invalid_date", foreground="#dc3545", font=("Arial", 9, "bold"))
         self.tree.tag_configure("erledigt", background="#f8d7da")  # rot für erledigt
@@ -828,10 +828,11 @@ class KarteikartenReader:
                 is_valid_date = self._is_valid_date(datum, jahr)
 
                 tags = []
-                if notiz:
-                    tags.append("has_notiz")
+                # Höchste Priorität: Kirchenbuchtext (als erstes gesetzt)
                 if kirchenbuchtext:
                     tags.append("has_kirchenbuchtext")
+                if notiz:
+                    tags.append("has_notiz")
                 if gramps:
                     tags.append("has_gramps")
                 if not is_valid_date and datum:

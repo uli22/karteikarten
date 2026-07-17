@@ -68,3 +68,15 @@
 - `reader_gui.py`: Verbindungstest nutzt `requests.post()` mit `verify=certifi.where()`
 - `pyproject.toml`: `certifi>=2025.0.0` und `requests>=2.32.0` als Abhängigkeiten
 - Build-Größe: 34,6 MB
+
+---
+
+## Neuerungen im Reader v0.4.9
+
+### 🎨 Verbesserte Farbmarkierung
+- `has_kirchenbuchtext`: Farbe auf kontrastreiches Dunkelgelb (`#e6c300`) geändert
+- `has_kirchenbuchtext` hat jetzt höchste Priorität (überschreibt alle anderen Tags)
+- Bessere Unterscheidbarkeit zwischen F-ID (grün), Gramps (blau) und Kirchenbuchtext (gelb)
+
+### 📖 Kirchenbuch-Quellen
+- `Wetzlar KbHb 1608-1693 lutherisch` korrigiert (Jahresbereichsanpassung für Heiraten ab 1607)

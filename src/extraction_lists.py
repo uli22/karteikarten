@@ -168,9 +168,9 @@ _SOURCES_TEMPLATE = [
         "media_ID": "EKiR_408_002_Gb"
     },
     {
-        "source": "Wetzlar KbHb 1608-1693 lutherisch",
+        "source": "Wetzlar KbHb 1607-1693 lutherisch",
         "id": "S35",
-        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbHb 1608-1693 lutherisch\\",
+        "media_path": "E:\\Wetzlar Kirchenbücher - NAS jpg\\WETZLAR KbHb 1607-1693 lutherisch\\",
         "media_type": "kirchenbuchseiten",
         "media_ID": "EKiR_408_020_Hb"
     },
