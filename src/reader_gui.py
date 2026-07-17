@@ -24,7 +24,7 @@ from .extractor import extract_kirchenbuch_titel
 from .gedcom_exporter import GedcomExporter
 from .online_sync import OnlineSyncService
 
-VERSION = "0.4.9"
+VERSION = "0.4.10"
 
 
 class KarteikartenReader:
@@ -1486,7 +1486,37 @@ class KarteikartenReader:
             if candidate.exists():
                 return candidate
 
-        return base / original_path.name
+        # Fallback: nur Dateiname anhängen
+        fallback = base / original_path.name
+        if fallback.exists():
+            return fallback
+
+        # Erweiterte Suche: Ersetze kurze Typ-Ordner (Hb, Gb, Sb)
+        # durch den langen Ordnernamen vom anderen Rechner.
+        # Bsp: \Hb\datei.jpg -> \Wetzlar Kirchenbuchkartei Hb 1735-1746\datei.jpg
+        # Der Jahresbereich wird aus dem Dateinamen extrahiert (robuster als Parent-Ordner).
+        typ_map = {"Hb": "Hb", "Gb": "Gb", "Sb": "Sb"}
+        for i, part in enumerate(parts):
+            if part in typ_map and i > 0:
+                # Jahresbereich aus Dateinamen extrahieren
+                # Format: "0097 Sb 1746 - 1746-1761 - F102779706.jpg"
+                jahr_match = re.search(r"(\d{4}-\d{4})", original_path.name)
+                if jahr_match:
+                    jahre = jahr_match.group(1)
+                    langer_ordner = f"Wetzlar Kirchenbuchkartei {part} {jahre}"
+                    # Ersetze kurzen Ordner durch langen + korrigiere Parent-Jahresbereich
+                    neue_parts = list(parts)
+                    neue_parts[i] = langer_ordner
+                    # Korrigiere auch den Parent-Ordner: alten Jahresbereich durch neuen ersetzen
+                    if i >= 1:
+                        neue_parts[i - 1] = re.sub(r"\d{4}-\d{4}", jahre, neue_parts[i - 1])
+                    for start_idx in range(1, len(neue_parts)):
+                        candidate = base / Path(*neue_parts[start_idx:])
+                        if candidate.exists():
+                            return candidate
+                break  # Nur den ersten Typ-Ordner ersetzen
+
+        return fallback
 
     def _open_in_irfanview(self, pfad):
         """Öffnet eine Bilddatei in IrfanView."""

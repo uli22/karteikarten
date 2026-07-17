@@ -80,3 +80,16 @@
 
 ### 📖 Kirchenbuch-Quellen
 - `Wetzlar KbHb 1608-1693 lutherisch` korrigiert (Jahresbereichsanpassung für Heiraten ab 1607)
+
+---
+
+## Neuerungen im Reader v0.4.10
+
+### 🔍 Verbesserte Bildersuche bei umgezogenen Ordnern
+- `_resolve_relocated_path()` erweitert: erkennt kurze Typ-Ordner (`Hb`, `Gb`, `Sb`) und ersetzt sie durch den langen Ordnernamen (`Wetzlar Kirchenbuchkartei Hb 1735-1746`)
+- Parent-Jahresbereich wird automatisch aus dem Dateinamen korrigiert (falls in der DB falsch)
+- Fallback-Suche: wenn alle Kandidaten fehlschlagen, wird nach dem Dateinamen im Basisordner gesucht
+- Dadurch werden Karteikarten auch auf Rechnern mit anderer Ordnerstruktur gefunden
+
+### 📖 Kirchenbuch-Quellen
+- `Wetzlar KbHb 1608-1693 lutherisch` korrigiert (Jahresbereichsanpassung für Heiraten ab 1607)
